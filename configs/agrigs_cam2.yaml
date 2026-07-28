@@ -1,0 +1,104 @@
+# AgriGS-SLAM demo dataset, cam_1 (rear-facing corridor view, measured 152 deg off motion), poses = their published
+# ground truth (ORACLE pose condition -- this is the cameras-given-poses arm
+# of the LiDAR-necessity study). Their protocol: train pass for training,
+# separate reverse-direction val pass for novel-view evaluation.
+
+paths:
+  bags: []                       # no bags; the ingest-agrigs stage builds the segment
+  ublox_msgs_dir: ~/agrorob_ws/src/ublox_dgnss/ublox_ubx_msgs/msg
+  workdir: ~/agromap4d_work/agrigs_cam2
+
+agrigs:
+  dataset_dir: ~/agromap4d_work/agrigs_demo
+  camera: cam_2
+  intrinsic: [737.81004, 737.95291, 975.08049, 569.79751]       # their repo config (cam_2)
+  distortion: [-0.007018, 0.000347, -0.001131, -0.000008, 0.0]
+
+topics: {left_image: "", right_image: "", left_info: "", fix: "", relpos: "", imu: ""}
+
+pose:
+  source: trajectory_file       # unused (segment pre-built), kept for config completeness
+  trajectory_file: ""
+  clockcheck_topic: ""
+  time_offset_s: 0.0
+  antenna_forward_m: 0.0
+  min_carr_soln: 0
+  yaw_smooth_window: 1
+  cam_forward_m: 0.0
+  cam_left_m: 0.0
+  cam_up_m: 0.0
+  pitch_down_deg: 0.0
+  yaw_offset_deg: 0.0
+  center_up_m: 0.0
+  left_eye_forward_m: 0.0
+  left_eye_left_m: 0.0
+  baseline_m: 0.12
+  use_imu_tilt: false
+  imu_lp_window_s: 1.0
+
+segment:
+  search_t_start_s: 0.0
+  min_straight_s: 0.0
+  heading_std_max_deg: 0.0
+  speed_range_ms: [0.0, 99.0]
+  length_s: 0.0
+  frame_stride: 1
+
+depth:
+  backend: provided             # their ZED depth, converted at ingest
+  min_z_m: 0.8
+  max_z_m: 18.0                 # orchard scale
+  sgbm: {num_disparities: 128, block_size: 5, uniqueness_ratio: 10, speckle_window: 100, speckle_range: 2}
+
+cloud:
+  pixel_stride: 6
+  voxel_m: 0.02
+  max_points: 4000000
+
+train:
+  run_name: tile_agrigs_cam2
+  max_gaussians: 1500000
+  iterations: 30000
+  batch_size: 1
+  ssim_lambda: 0.2
+  depth_lambda: 0.1
+  opacity_reg: 0.01
+  scale_reg: 0.01
+  holdout_every: 8              # unused: manifest comes from their train/val split
+  eval_every: 1000
+  sh_degree: 1
+  init_opacity: 0.1
+  init_scale_mult: 1.5
+  mask_dilate_px: 25
+  min_scale_m: 0.001
+  max_scale_m: 0.30
+  max_anisotropy: 8.0
+  export_prune_opacity: 0.05
+  export_crop: true
+  rasterize_mode: antialiased
+  refine_stop_frac: 0.8
+  means_lr_final_mult: 0.1
+  color_finetune_frac: 0.0
+  use_right_camera: false       # no stereo pair in this dataset arm
+  pose_opt:
+    enabled: false
+    start_iter: 1000
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+    max_trans_m: 0.03
+    max_rot_deg: 0.5
+    trans_penalty: 1.0e-2
+    rot_penalty: 1.0e-3
+  exposure_opt:
+    enabled: true
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  eval_pose_align_steps: 200
+  eval_pose_align_lr: 2.0e-3
+  lr:
+    means: 1.6e-4
+    scales: 5.0e-3
+    quats: 1.0e-3
+    opacities: 5.0e-2
+    sh0: 2.5e-3
+    shN: 1.25e-4

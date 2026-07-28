@@ -98,7 +98,10 @@ def cmd_clockcheck(cfg):
 
 
 def cmd_select(cfg):
-    """Find the first straight, quality-gated, in-motion window."""
+    """Find the first straight, quality-gated, in-motion window -- or take an
+    explicit `segment.window_s: [t0_rel, t1_rel]` verbatim (e.g. a headland
+    turn, which the straightness search rejects by design). The explicit path
+    still enforces the RTK carrier gate; heading stats are recorded as-is."""
     _, source = make_pose_source(cfg)
     track = source.track
     s = cfg.segment
@@ -109,27 +112,45 @@ def cmd_select(cfg):
     speed = np.linalg.norm(np.diff(track.enu_xyz[:, :2], axis=0), axis=1) \
         / np.diff(track.fix_t)
 
-    win = float(s.length_s)
-    v_lo, v_hi = (float(v) for v in s.speed_range_ms)
-    best = None
-    for start in np.arange(float(s.search_t_start_s), t_rel[-1] - win, 10.0):
-        mask = (t_rel >= start) & (t_rel <= start + win)
+    explicit = getattr(s, "window_s", None)
+    if explicit:
+        start, t_end = (float(v) for v in explicit)
+        win = t_end - start
+        mask = (t_rel >= start) & (t_rel <= t_end)
         if mask.sum() < 10:
-            continue
-        if track.relpos_carr[mask].min() < cfg.pose.min_carr_soln:
-            continue
-        vmask = (fix_rel[:-1] >= start) & (fix_rel[:-1] <= start + win)
+            raise RuntimeError(f"explicit window {start:.0f}-{t_end:.0f}s "
+                               "contains almost no heading samples")
+        carr_min = int(track.relpos_carr[mask].min())
+        if carr_min < cfg.pose.min_carr_soln:
+            n_bad = int((track.relpos_carr[mask] < cfg.pose.min_carr_soln).sum())
+            raise RuntimeError(
+                f"explicit window has {n_bad} epochs below carr_soln "
+                f"{cfg.pose.min_carr_soln} (min {carr_min}); pick a clean window")
+        vmask = (fix_rel[:-1] >= start) & (fix_rel[:-1] <= t_end)
+        std = float(np.degrees(np.std(yaw_s[mask])))
         v_mean = float(np.mean(speed[vmask]))
-        if not (v_lo <= v_mean <= v_hi):
-            continue  # parked or turning robot, not straight-line driving
-        std = np.degrees(np.std(yaw_s[mask]))
-        if std <= s.heading_std_max_deg:
-            best = (start, std, v_mean)
-            break
-    if best is None:
-        raise RuntimeError("no straight quality-gated window found; loosen "
-                           "segment.heading_std_max_deg / speed_range_ms")
-    start, std, v_mean = best
+    else:
+        win = float(s.length_s)
+        v_lo, v_hi = (float(v) for v in s.speed_range_ms)
+        best = None
+        for start in np.arange(float(s.search_t_start_s), t_rel[-1] - win, 10.0):
+            mask = (t_rel >= start) & (t_rel <= start + win)
+            if mask.sum() < 10:
+                continue
+            if track.relpos_carr[mask].min() < cfg.pose.min_carr_soln:
+                continue
+            vmask = (fix_rel[:-1] >= start) & (fix_rel[:-1] <= start + win)
+            v_mean = float(np.mean(speed[vmask]))
+            if not (v_lo <= v_mean <= v_hi):
+                continue  # parked or turning robot, not straight-line driving
+            std = np.degrees(np.std(yaw_s[mask]))
+            if std <= s.heading_std_max_deg:
+                best = (start, std, v_mean)
+                break
+        if best is None:
+            raise RuntimeError("no straight quality-gated window found; loosen "
+                               "segment.heading_std_max_deg / speed_range_ms")
+        start, std, v_mean = best
     t0 = track.fix_t[0] + start
     seg = _seg_dir(cfg)
     seg.mkdir(parents=True, exist_ok=True)
@@ -264,10 +285,23 @@ def cmd_cloud(cfg):
           f"{hi[0]-lo[0]:.1f} x {hi[1]-lo[1]:.1f} x {hi[2]-lo[2]:.1f} m")
 
 
-def cmd_evalonly(cfg):
+def cmd_ingest_agrigs(cfg):
+    """Build a segment from the AgriGS-SLAM demo dataset (see ingest_agrigs)."""
+    from .ingest_agrigs import ingest, verify
+    a = cfg.agrigs
+    seg = _seg_dir(cfg)
+    ingest(Path(a.dataset_dir).expanduser(), a.camera,
+           [float(v) for v in a.intrinsic], [float(v) for v in a.distortion],
+           seg, float(cfg.depth.min_z_m), float(cfg.depth.max_z_m))
+    verify(seg, cfg.paths.workdir / "pose_convention_check.jpg")
+
+
+def cmd_evalonly(cfg, split="val", max_frames=0):
     """Re-score a finished run's checkpoint with the CURRENT metrics, without
     retraining. Lets old and new checkpoints be compared under identical
-    metrics (e.g. after adding LPIPS). Writes metrics_evalonly.json."""
+    metrics (e.g. after adding LPIPS). `split` picks the manifest ids to score
+    (train-view scores are the fit ceiling AgriGS-style papers report);
+    `max_frames` > 0 subsamples evenly. Writes metrics_evalonly[_split].json."""
     import torch
     from .train import evaluate
 
@@ -285,14 +319,20 @@ def cmd_evalonly(cfg):
     k_mat = torch.tensor([[intr["fx"], 0, intr["cx"]],
                           [0, intr["fy"], intr["cy"]],
                           [0, 0, 1]], dtype=torch.float32, device=device)
-    eval_ids = load_or_create_manifest(seg, cfg.train.holdout_every)["val"]
+    eval_ids = load_or_create_manifest(seg, cfg.train.holdout_every)[split]
+    if not eval_ids:
+        raise RuntimeError(f"manifest split '{split}' is empty")
+    if max_frames and len(eval_ids) > max_frames:
+        idx = np.linspace(0, len(eval_ids) - 1, max_frames).astype(int)
+        eval_ids = [eval_ids[i] for i in idx]
     # sh degree from the checkpoint, not the config (older runs differ)
     sh_deg = int(np.sqrt(params["shN"].shape[1] + 1)) - 1
     cfg.train.sh_degree = sh_deg
     m = evaluate(params, c2ws, k_mat, intr["width"], intr["height"], seg,
                  run_dir, eval_ids, cfg, device, step=0, final=False)
-    (run_dir / "metrics_evalonly.json").write_text(json.dumps(m, indent=2))
-    print(f"{cfg.train.run_name}: " + "  ".join(
+    suffix = "" if split == "val" else f"_{split}"
+    (run_dir / f"metrics_evalonly{suffix}.json").write_text(json.dumps(m, indent=2))
+    print(f"{cfg.train.run_name} [{split}, n={len(eval_ids)}]: " + "  ".join(
         f"{k} {v:.3f}" for k, v in m.items() if isinstance(v, float)))
 
 
@@ -342,12 +382,18 @@ def main():
     stages = {"clockcheck": cmd_clockcheck, "select": cmd_select,
               "extract": cmd_extract, "depth": cmd_depth,
               "cloud": cmd_cloud, "train": cmd_train,
-              "evalonly": cmd_evalonly, "diagnose": cmd_diagnose}
+              "evalonly": cmd_evalonly, "diagnose": cmd_diagnose,
+              "ingest-agrigs": cmd_ingest_agrigs}
     ap = argparse.ArgumentParser(prog="rtk_splat")
     ap.add_argument("stage", choices=list(stages) + ["all"])
     ap.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
     ap.add_argument("--run", default=None,
                     help="override train.run_name (evalonly/diagnose)")
+    ap.add_argument("--split", default="val", choices=["val", "train", "test"],
+                    help="manifest split to score (evalonly only)")
+    ap.add_argument("--max-frames", type=int, default=0,
+                    help="evenly subsample the split to this many frames "
+                         "(evalonly only; 0 = all)")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if args.run:
@@ -357,6 +403,8 @@ def main():
         for name in ("select", "extract", "depth", "cloud", "train"):
             print(f"=== {name} ===", flush=True)
             stages[name](cfg)
+    elif args.stage == "evalonly":
+        cmd_evalonly(cfg, args.split, args.max_frames)
     else:
         stages[args.stage](cfg)
 
