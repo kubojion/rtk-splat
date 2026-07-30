@@ -141,9 +141,11 @@ def read_stereo_frames(bags: list[Path], topics, typestore, t0: float,
                        t1: float, stride: int):
     """Yield every `stride`-th stereo pair with header stamp in [t0, t1].
 
-    Left and right share the ZED trigger, so they are paired by header stamp
-    bucketed at half a frame period. Pending dicts are pruned so memory stays
-    bounded regardless of window length.
+    This adapter currently assumes both image topics share the bag containing
+    the left stream and use the project's 15 Hz ZED trigger. They are paired by
+    header stamp bucketed at half a frame period. Pending dicts are pruned so
+    memory stays bounded regardless of window length. Other camera rates or
+    split image bags need a dataset adapter rather than a silent guess here.
     """
     pending_left: dict[int, tuple[float, bytes]] = {}
     pending_right: dict[int, tuple[float, bytes]] = {}

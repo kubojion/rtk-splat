@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from rtk_splat.colmap_stereo import (
+    _completion_record,
     _validate_rectified_stereo,
     aligned_viewmat,
     colmap_commands,
@@ -147,6 +148,26 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(mapper[mapper.index("--Mapper.ba_use_gpu") + 1], "0")
         self.assertTrue(all(isinstance(arg, str)
                             for _, command in commands for arg in command))
+
+    def test_completion_marker_fingerprints_command_and_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = Path(tmp)
+            (sidecar / "colmap").mkdir()
+            (sidecar / "sidecar_config.json").write_text('{"a": 1}')
+            (sidecar / "frame_manifest.json").write_text('{"frames": []}')
+            (sidecar / "colmap" / "rig_config.json").write_text('{"rig": 1}')
+            first = _completion_record(
+                sidecar, "mapper", ["colmap", "mapper"], "COLMAP 4.1.1"
+            )
+            second = _completion_record(
+                sidecar, "mapper", ["colmap", "mapper"], "COLMAP 4.1.1"
+            )
+            self.assertEqual(first, second)
+            (sidecar / "sidecar_config.json").write_text('{"a": 2}')
+            changed = _completion_record(
+                sidecar, "mapper", ["colmap", "mapper"], "COLMAP 4.1.1"
+            )
+            self.assertNotEqual(first, changed)
 
 
 if __name__ == "__main__":

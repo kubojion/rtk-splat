@@ -29,6 +29,7 @@ from .poses import LocalEnu, PosedFrame, pose_frames, viewmat_from
 def _attach_enu(track: RtkTrack):
     enu = LocalEnu(track.fix_lat[0], track.fix_lon[0], track.fix_alt[0])
     track.enu_xyz = enu.to_enu(track.fix_lat, track.fix_lon, track.fix_alt)
+    track.enu = enu
     track.origin = {"lat0": track.fix_lat[0], "lon0": track.fix_lon[0],
                     "alt0": track.fix_alt[0]}
     return track
@@ -42,6 +43,7 @@ class RtkDualAntenna:
         self.track = _attach_enu(
             read_rtk_track(cfg.paths.bags, cfg.topics, typestore))
         self.origin = self.track.origin
+        self.enu = self.track.enu
 
     def pose_frames(self, stamps, tilts=None):
         return pose_frames(self.track, stamps, self.cfg.pose, tilts)
@@ -74,6 +76,7 @@ class GnssCourse:
         tr.relpos_carr = np.where(speed > self.MIN_COURSE_SPEED_MS, 2, 0)
         self.track = tr
         self.origin = tr.origin
+        self.enu = tr.enu
 
     def pose_frames(self, stamps, tilts=None):
         return pose_frames(self.track, stamps, self.cfg.pose, tilts)
@@ -94,15 +97,22 @@ class TrajectoryFile:
         if data.ndim != 2 or data.shape[1] != 8:
             raise RuntimeError(f"{path}: expected TUM rows 't x y z qx qy qz qw'")
         self.t = data[:, 0]
+        if len(self.t) < 2 or not np.all(np.diff(self.t) > 0):
+            raise RuntimeError(f"{path}: timestamps must be strictly increasing")
+        if not np.isfinite(data).all():
+            raise RuntimeError(f"{path}: trajectory contains NaN/Inf")
         self.xyz = data[:, 1:4]
         self.rots = Rotation.from_quat(data[:, 4:8])
         self._slerp = Slerp(self.t, self.rots)
         self.origin = {"trajectory_file": str(path)}
+        self.enu = None
         # minimal track surface for the selection stage
         yaw = self.rots.as_euler("ZYX")[:, 0]
         self.track = RtkTrack(
             fix_t=self.t, fix_lat=np.zeros_like(self.t),
             fix_lon=np.zeros_like(self.t), fix_alt=self.xyz[:, 2],
+            fix_status=np.full(len(self.t), -1, dtype=int),
+            fix_cov_max=np.full(len(self.t), np.nan),
             relpos_t=self.t, relpos_yaw=np.unwrap(yaw),
             relpos_carr=np.full(len(self.t), 2))
         self.track.enu_xyz = self.xyz
@@ -133,5 +143,10 @@ def make_pose_source(cfg):
         raise RuntimeError(f"unknown pose.source '{name}'; "
                            f"choose from {sorted(_SOURCES)}")
     with_ublox = name == "rtk_dual_antenna"
-    typestore = build_typestore(cfg.paths.ublox_msgs_dir if with_ublox else None)
+    if with_ublox and not hasattr(cfg.paths, "ublox_msgs_dir"):
+        raise ValueError(
+            "pose.source=rtk_dual_antenna requires paths.ublox_msgs_dir"
+        )
+    ublox_dir = cfg.paths.ublox_msgs_dir if with_ublox else None
+    typestore = build_typestore(ublox_dir)
     return typestore, _SOURCES[name](cfg, typestore)

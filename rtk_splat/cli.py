@@ -8,10 +8,11 @@ Stages (each writes its artifact; each re-runs independently):
   stereo-prepare  build a calibrated, zero-copy COLMAP rig workspace
   stereo-solve    run the long stereo visual bundle adjustment
   stereo-export   robustly georegister and publish the refined pose sidecar
+  integrity-audit read-only bounded RTK/stereo TF and clock calibration audit
   cloud       fuse depth into a voxel-downsampled world-frame init cloud
   train       optimize the Gaussian tile + eval on held-out frames
 
-Usage: python -m rtk_splat.cli <stage> [--config config.yaml]
+Usage: python -m rtk_splat.cli <stage> --config <config.yaml>
 """
 
 import argparse
@@ -22,7 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .bagio import (build_typestore, read_camera_info,
+from .bagio import (build_typestore, read_camera_calibration, read_camera_info,
                     read_fix_with_reception, read_imu, read_stereo_frames)
 from .cloud import backproject, to_world, voxel_downsample
 from .configio import load_config
@@ -179,6 +180,11 @@ def cmd_extract(cfg):
     seg = _seg_dir(cfg)
     window = json.loads((seg / "window.json").read_text())
     intr = read_camera_info(cfg.paths.bags, cfg.topics, typestore)
+    right_intr = None
+    if hasattr(cfg.topics, "right_info"):
+        right_intr = read_camera_calibration(
+            cfg.paths.bags, cfg.topics.right_info, typestore
+        )
     print(f"camera_info: {intr}")
 
     (seg / "images").mkdir(parents=True, exist_ok=True)
@@ -224,12 +230,15 @@ def cmd_extract(cfg):
     np.save(seg / "stereo_dt_s.npy", np.asarray(stereo_dt))
     tr = source.track
     quality = None
-    if hasattr(tr, "fix_status"):
-        m = (tr.fix_t >= window["t0"]) & (tr.fix_t <= window["t1"])
+    if hasattr(tr, "fix_status") and hasattr(tr, "fix_cov_max"):
+        m = ((tr.fix_t >= window["t0"]) & (tr.fix_t <= window["t1"])
+             & np.isfinite(tr.fix_cov_max))
+    else:
+        m = np.zeros(len(tr.fix_t), dtype=bool)
+    if m.any():
         quality = {"fix_status_min": int(tr.fix_status[m].min()),
                    "fix_cov_max_m2": float(tr.fix_cov_max[m].max()),
                    "fix_cov_median_m2": float(np.median(tr.fix_cov_max[m]))}
-    crs = source.origin if not hasattr(source, "track") else None
     meta = {"intrinsics": intr, "world_origin": source.origin,
             "crs": getattr(getattr(source, "enu", None), "crs", lambda: None)(),
             "gnss_quality": quality,
@@ -242,6 +251,8 @@ def cmd_extract(cfg):
             "dropped_unposeable": len(frames) - n_kept,
             "path_length_m": float(np.linalg.norm(
                 np.diff(np.stack(centers), axis=0), axis=1).sum())}
+    if right_intr is not None:
+        meta["stereo_calibration"] = {"left": intr, "right": right_intr}
     (seg / "segment_meta.json").write_text(json.dumps(meta, indent=2))
     (seg / "manifest.json").unlink(missing_ok=True)  # split follows re-extract
     manifest = load_or_create_manifest(seg, cfg.train.holdout_every)
@@ -254,6 +265,12 @@ def cmd_extract(cfg):
 
 def cmd_depth(cfg):
     seg = _seg_dir(cfg)
+    backend = str(getattr(cfg.depth, "backend", "sgbm")).lower()
+    if backend != "sgbm":
+        raise ValueError(
+            f"depth.backend={backend!r} is not implemented; use 'sgbm' or "
+            "provide depth artifacts through a dataset adapter"
+        )
     meta = json.loads((seg / "segment_meta.json").read_text())
     intr = meta["intrinsics"]
     (seg / "depth").mkdir(exist_ok=True)
@@ -414,6 +431,21 @@ def cmd_stereo_export(cfg):
     export(_seg_dir(cfg), cfg)
 
 
+def cmd_integrity_audit(cfg):
+    """Explicit diagnostic stage; never part of ``all`` or normal training."""
+    from .calibration_sidecar import run_integrity_audit
+    artifact, result = run_integrity_audit(_seg_dir(cfg), cfg)
+    accepted = result["final_retained_prior_safe"]["calibration_accepted"]
+    print(f"metric-integrity audit -> {artifact}")
+    print(f"calibration accepted: {accepted}")
+    for name, parameter in result["parameters"].items():
+        verdict = "TRUSTED" if parameter["trusted"] else "RETAINED PRIOR"
+        print(
+            f"  {name}: {verdict}; candidate "
+            f"{parameter['candidate_correction']:+.8g}, retained "
+            f"{parameter['retained_correction']:+.8g}")
+
+
 def main():
     stages = {"clockcheck": cmd_clockcheck, "select": cmd_select,
               "extract": cmd_extract, "depth": cmd_depth,
@@ -422,10 +454,12 @@ def main():
               "stereo-prepare": cmd_stereo_prepare,
               "stereo-solve": cmd_stereo_solve,
               "stereo-export": cmd_stereo_export,
+              "integrity-audit": cmd_integrity_audit,
               "ingest-agrigs": cmd_ingest_agrigs}
     ap = argparse.ArgumentParser(prog="rtk_splat")
     ap.add_argument("stage", choices=list(stages) + ["all"])
-    ap.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
+    ap.add_argument("--config", required=True,
+                    help="YAML configuration (no machine-specific default)")
     ap.add_argument("--run", default=None,
                     help="override train.run_name (evalonly/diagnose)")
     ap.add_argument("--pose-artifact", default=None,

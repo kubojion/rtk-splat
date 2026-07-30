@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "experiment_id": "headland_stereo_ba_2026-07-29",
+  "recorded_at": "2026-07-30T19:00:00+02:00",
+  "provenance": {
+    "run_started": "2026-07-29T18:20:23+02:00",
+    "run_completed": "2026-07-30T09:36:33+02:00",
+    "elapsed_seconds": 54970,
+    "git_head_at_run": "643b5d237767beb59afe7605188e546c370d95cf",
+    "source_snapshot_commit": "3f86826c151ffffab8932e6211bbe933108a9983",
+    "source_snapshot_tree": "840eb4d0e239b17c7ee733b57cd5197ac2fdd520",
+    "source_snapshot_created_after_run": true,
+    "source_state_note": "The stereo implementation was uncommitted during the run. Commit 3f86826 is the first post-run source snapshot and matches the relevant pre-run file content; it is not claimed as a clean run-time checkout.",
+    "effective_overrides": {
+      "pose.artifact": "colmap_stereo",
+      "train.run_name": "tile_turn3_stereo_ba"
+    },
+    "source_snapshot_sha256": {
+      "configs/field_turn2.yaml": "e30037edc4d7b1e076845e256eb09148d8aab2943563e137b8d4c28ddd7ccfbf",
+      "stereo_ba_overnight.sh": "f76c6fe6081231be951be0ff78bd4bab33d884c8b09aa49a79683443b24b1d8d",
+      "rtk_splat/bagio.py": "ccfe33b3b1f2b1136e595c2df5f21a7d672a0862b47c9678681e5e121b840380",
+      "rtk_splat/cli.py": "dc0be00d7598715e7baf3ef45db9899340b5365b3e62b6d65af49e9205b35266",
+      "rtk_splat/colmap_stereo.py": "1d32877d97a8feb01b62bcbb0e314e1f02dc283581bc44bceb96081bdb0b83e0",
+      "rtk_splat/pose_artifacts.py": "e3fed94ea694ea1473ed6436cbea705cdd49d290a4ad7e1fc46ef98c8dc742da",
+      "rtk_splat/train.py": "8c6309a7c4ad87780ce793f1fef5f7ca9c471566c114cedc35f67382e5ca9f90"
+    }
+  },
+  "artifact_layout": {
+    "recorded_workdir": "/home/jion_kubo/agromap4d_work/field_turn",
+    "pose_artifact": "colmap_stereo",
+    "run_name": "tile_turn3_stereo_ba"
+  },
+  "input": {
+    "recording": "0703-nav2-follow-field1-row3-6-2-5-1-4-raw-localization-inputs-zed",
+    "storage_note": "The bag path may be a symlink to the Buffalo SSD.",
+    "mcap_size_bytes": 151865571551,
+    "metadata_yaml_sha256": "2c1faf1fb70fc577d43119a7cf58c727d06b6ef21c1e35b27c8a0cc29958a94c",
+    "duration_ns": 4639753728474,
+    "start_time_ns": 1783069457680955142,
+    "message_count": 2822528
+  },
+  "expected": {
+    "segment": {
+      "n_frames": 1344,
+      "n_stereo_images": 2688,
+      "n_depth_files": 1344,
+      "image_filename_size_inventory_sha256": "e7fe93e4b847e40d20646d47e5248ea134fd1ab3a4aa03e4e698ff4d00277393",
+      "depth_filename_size_inventory_sha256": "06d5e8d043da4ae35f8a5542169b714023943dfa74ee4746451f3afe031d5969"
+    },
+    "pose": {
+      "n_registered_left": 1344,
+      "n_registered_total_images": 2688,
+      "pose_fingerprint": "701d917fdef9b5092499debaeedfa9d24852c1bd461b4816cc476af0b37234af",
+      "scale": 0.9857944885226491,
+      "scale_range": [
+        0.98,
+        1.02
+      ],
+      "rtk_residual_median_m": 0.05109676322183859,
+      "rtk_residual_p95_m": 0.10718440664734041,
+      "rtk_residual_max_m": 0.13800144788744603,
+      "n_alignment_inliers": 1344
+    },
+    "metrics": {
+      "n_eval": 168,
+      "psnr": 11.670437023753212,
+      "psnr_masked": 24.444888046809606,
+      "psnr_near": 23.619381495884486,
+      "psnr_masked_cc": 25.847966818582442,
+      "lpips": 0.3231988935953095,
+      "lpips_cc": 0.31866925883860814,
+      "ssim": 0.5944193653052762,
+      "psnr_masked_aligned": 24.438251847312564,
+      "n_gaussians_optimized": 2500000,
+      "n_gaussians_exported": 1634951
+    },
+    "acceptance_gates": {
+      "psnr_masked_min": 24.1,
+      "psnr_masked_cc_min": 25.5,
+      "lpips_cc_max": 0.34,
+      "ssim_min": 0.58
+    }
+  },
+  "colmap": {
+    "identity": "COLMAP 4.1.1 (Commit Unknown on Unknown with CUDA)",
+    "database_size_bytes": 5984497664,
+    "database_user_version": 4010100,
+    "n_cameras": 2,
+    "n_images": 2688,
+    "n_rigs": 1,
+    "n_frames": 1344,
+    "n_keypoints": 26383020,
+    "n_match_pairs": 53058,
+    "n_matches": 118028952,
+    "n_verified_pairs": 53058,
+    "n_verified_inliers": 117542525,
+    "n_points3d": 791291,
+    "n_observations": 18213372,
+    "mean_track_length": 23.017287,
+    "mean_observations_per_image": 6775.808,
+    "mean_reprojection_error_px": 0.818159,
+    "runtime_minutes": {
+      "feature_extractor": 62.668,
+      "sequential_matcher": 9.572,
+      "rig_verification": 8.422,
+      "mapper": 581.175
+    }
+  },
+  "compact_files": [
+    {
+      "path": "segment/window.json",
+      "sha256": "463aef48e34a990ce11dfc295f1ecafdcd20141adcc8bbe3a96cf0bc3b8b3de1"
+    },
+    {
+      "path": "segment/segment_meta.json",
+      "sha256": "a8a18880983f1cd6cc0b8ed01b5a93581f70bd37e662bb0ad27ad91ddd187316"
+    },
+    {
+      "path": "segment/manifest.json",
+      "sha256": "a2634f969b5b6d2de96f0b796a18c0f1f315ee97ad684a30f0583db96e75309d"
+    },
+    {
+      "path": "segment/viewmats.npy",
+      "sha256": "2c5c843d894ddc7ab804cae08a5de58c91621b7044bc5054e9496ab98189bc35"
+    },
+    {
+      "path": "segment/cam_centers.npy",
+      "sha256": "b341113b9ff37ba4101a1871d9a8b6834b53708d51badc95c648532ec83856c0"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/commands.json",
+      "sha256": "cb7938a8786d5aa9978708be31d7963f3749f5a0b3e342687555ec3f215d989e"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/sidecar_config.json",
+      "sha256": "0e4308caea32365108ef4fae6aba11dcdfbe62e3b5818449a17e8a4937aca923"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/quality.json",
+      "sha256": "cb6685ef58d1ae18c6aab4659a7ee1fdad254eaf0c8e989fbc75900982fca60e"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/viewmats.npy",
+      "sha256": "5247eb98b9a07423b86f28ca470c3a82d4baf23b9d3a1c38b7e5c33a2b96b18d"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/cam_centers.npy",
+      "sha256": "778d9f33555d4a9b3cff767a756f8aacb9b35ba9fa3cfe8ae6fceea976ebb180"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/registered.npy",
+      "sha256": "a38f4112af2db5c7f2c6aa51bea0799bdef94db4a96e6b01fc4eca8aa48bb528"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/frame_ids.npy",
+      "sha256": "78aa85491e252d70c224527f38ae295ae73bc9a85229707a6c6e13a76a6c5fee"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/frame_manifest.json",
+      "sha256": "b5fa200af9a67c2f62436f6659bb642fdd3a595dd6cfc54747318da06c7d961a"
+    },
+    {
+      "path": "runs/tile_turn3_stereo_ba/metrics.json",
+      "sha256": "8c4563f37943a4d09ceb52dba74f6e970f37a1f0959e6cbbfa42d2c6bdc04174"
+    },
+    {
+      "path": "runs/tile_turn3_stereo_ba/metrics_evalonly_train.json",
+      "sha256": "e21b6b5ba196ad9ddc45c0d3544ae9c6c6b1a11be719372b3e55534b7cecc657"
+    }
+  ],
+  "large_artifacts": [
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/colmap/database.db",
+      "size_bytes": 5984497664
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_stereo/init_cloud.npz",
+      "size_bytes": 56050767,
+      "sha256": "24ce2dacef448ed1997fcaa5ba1f014d9f795b3b0e024ac034424ecdf1954484"
+    },
+    {
+      "path": "runs/tile_turn3_stereo_ba/params.pt",
+      "size_bytes": 230002110,
+      "sha256": "35bcfb9443002fe789ccae7232a3add9e115d240266c9f205e2a6a7d94ffaa57"
+    },
+    {
+      "path": "runs/tile_turn3_stereo_ba/splat.ply",
+      "size_bytes": 150416071,
+      "sha256": "1579b738c07521aeae408e4d17405195cab0d63885dbbd2c2d17726e65598393"
+    }
+  ],
+  "observed_environment": {
+    "python": "3.10.20",
+    "torch": "2.4.1+cu121",
+    "gsplat": "1.5.3+pt24cu121",
+    "numpy": "2.2.6",
+    "scipy": "1.15.3",
+    "opencv": "5.0.0",
+    "pyyaml": "6.0.3",
+    "torchmetrics": "1.9.0",
+    "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU, 8 GiB",
+    "driver": "580.173.02",
+    "cpu": "AMD Ryzen 9 5900HX",
+    "note": "Observed environment only; this is not yet a fully locked binary environment."
+  }
+}

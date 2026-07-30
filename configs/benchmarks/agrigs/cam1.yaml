@@ -1,0 +1,74 @@
+# AgriGS-SLAM demo dataset, cam_1 (front horizontal), poses = their published
+# ground truth (ORACLE pose condition -- this is the cameras-given-poses arm
+# of the LiDAR-necessity study). Their protocol: train pass for training,
+# separate reverse-direction val pass for novel-view evaluation.
+
+paths:
+  workdir: ~/agromap4d_work/agrigs_cam1
+
+agrigs:
+  dataset_dir: ~/agromap4d_work/agrigs_demo
+  camera: cam_1
+  intrinsic: [723.464039, 724.229741, 978.331058, 575.320146]   # their repo config
+  distortion: [-0.007391, -0.000259, -0.001083, -0.000425, 0.0]
+
+pose:
+  artifact: rtk                 # importer publishes the provided metric poses
+  baseline_m: 0.12
+
+depth:
+  backend: provided             # their ZED depth, converted at ingest
+  min_z_m: 0.8
+  max_z_m: 18.0                 # orchard scale
+
+cloud:
+  pixel_stride: 6
+  voxel_m: 0.02
+  max_points: 4000000
+
+train:
+  run_name: tile_agrigs_cam1
+  max_gaussians: 1500000
+  iterations: 30000
+  ssim_lambda: 0.2
+  depth_lambda: 0.1
+  opacity_reg: 0.01
+  scale_reg: 0.01
+  holdout_every: 8              # unused: manifest comes from their train/val split
+  eval_every: 1000
+  sh_degree: 1
+  init_opacity: 0.1
+  init_scale_mult: 1.5
+  mask_dilate_px: 25
+  min_scale_m: 0.001
+  max_scale_m: 0.30
+  max_anisotropy: 8.0
+  export_prune_opacity: 0.05
+  export_crop: true
+  rasterize_mode: antialiased
+  refine_stop_frac: 0.8
+  means_lr_final_mult: 0.1
+  color_finetune_frac: 0.0
+  use_right_camera: false       # no stereo pair in this dataset arm
+  pose_opt:
+    enabled: false
+    start_iter: 1000
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+    max_trans_m: 0.03
+    max_rot_deg: 0.5
+    trans_penalty: 1.0e-2
+    rot_penalty: 1.0e-3
+  exposure_opt:
+    enabled: true
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  eval_pose_align_steps: 200
+  eval_pose_align_lr: 2.0e-3
+  lr:
+    means: 1.6e-4
+    scales: 5.0e-3
+    quats: 1.0e-3
+    opacities: 5.0e-2
+    sh0: 2.5e-3
+    shN: 1.25e-4

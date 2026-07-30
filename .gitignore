@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*~
+.DS_Store
+
+# Local data and generated RTK-Splat artifacts
+*.bag
+*.db
+*.db-shm
+*.db-wal
+*.mcap
+*.log
+*.pt
+*.ply
+*.npz
+*.npy
+agromap4d_work/
+work/
+runs/
+segment/

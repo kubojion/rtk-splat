@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtk-splat"
+version = "0.1.0"
+description = "Georeferenced Gaussian Splatting from calibrated stereo imagery and metric positioning"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python-headless>=4.8",
+  "pymap3d>=3.0",
+  "PyYAML>=6.0",
+  "rosbags>=0.10",
+  "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "gsplat>=1.5",
+  "torch>=2.4",
+  "torchmetrics[image]>=1.4",
+]
+diagnostics = ["matplotlib>=3.7"]
+test = ["pytest>=7.4"]
+
+[project.scripts]
+rtk-splat = "rtk_splat.cli:main"
+rtk-splat-verify = "rtk_splat.verify_golden:main"
+
+[tool.setuptools.packages.find]
+include = ["rtk_splat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

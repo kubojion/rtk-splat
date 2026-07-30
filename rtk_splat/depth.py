@@ -1,8 +1,8 @@
-"""Stereo depth for rectified ZED pairs.
+"""Built-in OpenCV SGBM depth for calibrated rectified stereo pairs.
 
-E1 backend: OpenCV SGBM (no model weights, validates the geometry pipeline
-end to end). A learned backend (Selective-IGEV) is a planned drop-in with the
-same signature; it is NOT implemented here until E1 passes.
+Learned depth is not selected through this module. A future backend or dataset
+adapter must publish the same metric depth/validity artifacts and pass a
+controlled benchmark before it becomes an active configuration option.
 """
 
 import cv2

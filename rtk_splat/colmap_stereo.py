@@ -10,6 +10,7 @@ Nothing here overwrites ``segment/viewmats.npy``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -84,6 +85,37 @@ def _validate_rectified_stereo(left: dict, right: dict,
     return measured
 
 
+def _load_stereo_calibration(meta: dict, cfg, typestore) \
+        -> tuple[dict, dict]:
+    """Prefer portable segment metadata and support old segments as fallback.
+
+    New dataset adapters should store both rectified camera calibrations in
+    ``segment_meta.json``. Reading CameraInfo from the original bag remains
+    available solely so existing extracted segments stay reproducible.
+    """
+    stereo = meta.get("stereo_calibration")
+    if stereo is not None:
+        if not isinstance(stereo, dict) or not {"left", "right"} <= set(stereo):
+            raise ValueError(
+                "segment_meta.stereo_calibration must contain left and right"
+            )
+        return stereo["left"], stereo["right"]
+    if not hasattr(cfg, "topics") or not hasattr(cfg.topics, "right_info"):
+        raise ValueError(
+            "portable stereo calibration is missing from segment_meta.json "
+            "and topics.right_info is unavailable"
+        )
+    if not cfg.paths.bags:
+        raise ValueError(
+            "portable stereo calibration is missing from segment_meta.json "
+            "and no legacy input bag is configured"
+        )
+    return (
+        read_camera_calibration(cfg.paths.bags, cfg.topics.left_info, typestore),
+        read_camera_calibration(cfg.paths.bags, cfg.topics.right_info, typestore),
+    )
+
+
 def _ensure_symlink(link: Path, target: Path) -> None:
     if link.is_symlink():
         if link.resolve() != target.resolve():
@@ -92,6 +124,40 @@ def _ensure_symlink(link: Path, target: Path) -> None:
     if link.exists():
         raise FileExistsError(f"refusing to replace existing {link}")
     link.symlink_to(target.resolve())
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _completion_record(
+    sidecar: Path,
+    step: str,
+    argv: list[str],
+    colmap_identity: str,
+) -> dict:
+    """Inputs that make a resumable COLMAP completion marker trustworthy."""
+    return {
+        "schema_version": 1,
+        "step": step,
+        "argv": argv,
+        "colmap_identity": colmap_identity,
+        "inputs_sha256": {
+            "sidecar_config.json": _sha256_file(
+                sidecar / "sidecar_config.json"
+            ),
+            "frame_manifest.json": _sha256_file(
+                sidecar / "frame_manifest.json"
+            ),
+            "colmap/rig_config.json": _sha256_file(
+                sidecar / "colmap" / "rig_config.json"
+            ),
+        },
+    }
 
 
 def prepare(seg_dir: Path, cfg, typestore) -> Path:
@@ -105,12 +171,7 @@ def prepare(seg_dir: Path, cfg, typestore) -> Path:
 
     meta = json.loads((seg_dir / "segment_meta.json").read_text())
     n_frames = int(meta["n_frames"])
-    if not hasattr(cfg.topics, "right_info"):
-        raise ValueError("topics.right_info is required by stereo-prepare")
-    left = read_camera_calibration(cfg.paths.bags, cfg.topics.left_info,
-                                   typestore)
-    right = read_camera_calibration(cfg.paths.bags, cfg.topics.right_info,
-                                    typestore)
+    left, right = _load_stereo_calibration(meta, cfg, typestore)
     baseline = _validate_rectified_stereo(
         left, right, float(cfg.pose.baseline_m))
 
@@ -230,12 +291,40 @@ def solve(seg_dir: Path, cfg) -> None:
         version = subprocess.run([executable, "-h"], stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True,
                                  check=False).stdout.splitlines()[:2]
-        log.write("\nCOLMAP identity: " + " | ".join(version) + "\n")
+        colmap_identity = " | ".join(version)
+        log.write("\nCOLMAP identity: " + colmap_identity + "\n")
         log.flush()
         for name, argv in commands:
             done = work / f".{name}.done"
+            completion = _completion_record(
+                sidecar, name, argv, colmap_identity
+            )
             if done.exists():
-                print(f"COLMAP {name}: already complete")
+                marker = done.read_text()
+                if marker.strip() == "ok":
+                    # Artifacts produced before schema 1 cannot be verified
+                    # retroactively. Preserve their resumability, but make the
+                    # weaker evidence visible rather than pretending it was
+                    # fingerprinted.
+                    print(
+                        f"COLMAP {name}: already complete "
+                        "(legacy unverified marker)"
+                    )
+                    continue
+                try:
+                    recorded = json.loads(marker)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"invalid completion marker {done}; use a new "
+                        "pose.artifact name"
+                    ) from exc
+                if recorded != completion:
+                    raise RuntimeError(
+                        f"COLMAP {name} inputs or command changed after the "
+                        f"step completed; refusing stale resume from {done}. "
+                        "Use a new pose.artifact name."
+                    )
+                print(f"COLMAP {name}: already complete (verified marker)")
                 continue
             print(f"COLMAP {name}: starting", flush=True)
             log.write("\n$ " + " ".join(argv) + "\n")
@@ -246,7 +335,8 @@ def solve(seg_dir: Path, cfg) -> None:
                 raise RuntimeError(
                     f"COLMAP {name} failed with exit {result.returncode}; "
                     f"see {log_path}")
-            done.write_text("ok\n")
+            done.write_text(json.dumps(completion, indent=2, sort_keys=True)
+                            + "\n")
             print(f"COLMAP {name}: complete", flush=True)
 
         text_root = work / "models_text"
