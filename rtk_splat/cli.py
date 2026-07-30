@@ -5,6 +5,9 @@ Stages (each writes its artifact; each re-runs independently):
   select      find a straight in-motion time window from the pose track
   extract     save stereo jpegs + per-frame camera poses for the window
   depth       stereo depth per pair (SGBM)
+  stereo-prepare  build a calibrated, zero-copy COLMAP rig workspace
+  stereo-solve    run the long stereo visual bundle adjustment
+  stereo-export   robustly georegister and publish the refined pose sidecar
   cloud       fuse depth into a voxel-downsampled world-frame init cloud
   train       optimize the Gaussian tile + eval on held-out frames
 
@@ -19,12 +22,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .bagio import (read_camera_info, read_fix_with_reception, read_imu,
-                    read_stereo_frames)
+from .bagio import (build_typestore, read_camera_info,
+                    read_fix_with_reception, read_imu, read_stereo_frames)
 from .cloud import backproject, to_world, voxel_downsample
 from .configio import load_config
 from .manifest import load_or_create_manifest
 from .depth import depth_from_pair, make_sgbm
+from .pose_artifacts import (cloud_path, load_pose_artifact,
+                             pose_artifact_name, pose_fingerprint)
 from .pose_sources import make_pose_source
 from .poses import smooth_yaw, tilt_deviations
 
@@ -194,8 +199,10 @@ def cmd_extract(cfg):
 
     posed = source.pose_frames(pose_stamps, tilts)
 
-    viewmats, centers, n_kept = [], [], 0
-    for fr, pf in zip(frames, posed):
+    viewmats, centers, kept_cam_stamps, kept_pose_stamps, stereo_dt = \
+        [], [], [], [], []
+    n_kept = 0
+    for fr, pose_stamp, pf in zip(frames, pose_stamps, posed):
         if pf is None:
             continue
         i = n_kept
@@ -203,12 +210,18 @@ def cmd_extract(cfg):
         (seg / "images" / f"right_{i:06d}.jpg").write_bytes(fr.right_jpeg)
         viewmats.append(pf.viewmat)
         centers.append(pf.cam_center)
+        kept_cam_stamps.append(fr.t)
+        kept_pose_stamps.append(pose_stamp)
+        stereo_dt.append(fr.t_right - fr.t)
         n_kept += 1
     if n_kept < 50:
         raise RuntimeError(f"only {n_kept} posed frames; expected hundreds")
 
     np.save(seg / "viewmats.npy", np.stack(viewmats).astype(np.float32))
     np.save(seg / "cam_centers.npy", np.stack(centers).astype(np.float32))
+    np.save(seg / "camera_stamps.npy", np.asarray(kept_cam_stamps))
+    np.save(seg / "pose_stamps.npy", np.asarray(kept_pose_stamps))
+    np.save(seg / "stereo_dt_s.npy", np.asarray(stereo_dt))
     tr = source.track
     quality = None
     if hasattr(tr, "fix_status"):
@@ -224,6 +237,8 @@ def cmd_extract(cfg):
             "pose_source": cfg.pose.source,
             "time_offset_s": off,
             "imu_tilt": tilt_stats,
+            "stereo_sync_abs_max_ms":
+                float(np.max(np.abs(stereo_dt)) * 1000),
             "dropped_unposeable": len(frames) - n_kept,
             "path_length_m": float(np.linalg.norm(
                 np.diff(np.stack(centers), axis=0), axis=1).sum())}
@@ -261,7 +276,7 @@ def cmd_cloud(cfg):
     seg = _seg_dir(cfg)
     meta = json.loads((seg / "segment_meta.json").read_text())
     intr = meta["intrinsics"]
-    viewmats = np.load(seg / "viewmats.npy")
+    viewmats, _ = load_pose_artifact(seg, cfg)
     # LEAKAGE GUARD: initialization is built from TRAINING frames only --
     # val/test images and their depth must never touch the map.
     manifest = load_or_create_manifest(seg, cfg.train.holdout_every)
@@ -279,10 +294,15 @@ def cmd_cloud(cfg):
     print(f"fused {len(pts):,} raw points")
     pts, cols = voxel_downsample(pts, cols, cfg.cloud.voxel_m,
                                  cfg.cloud.max_points)
-    np.savez_compressed(seg / "init_cloud.npz", xyz=pts, rgb=cols)
+    out = cloud_path(seg, cfg)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, xyz=pts, rgb=cols,
+                        pose_fingerprint=np.asarray(
+                            pose_fingerprint(viewmats)))
     lo, hi = pts.min(axis=0), pts.max(axis=0)
-    print(f"init cloud: {len(pts):,} pts, extent "
-          f"{hi[0]-lo[0]:.1f} x {hi[1]-lo[1]:.1f} x {hi[2]-lo[2]:.1f} m")
+    print(f"init cloud [{pose_artifact_name(cfg)}]: {len(pts):,} pts, extent "
+          f"{hi[0]-lo[0]:.1f} x {hi[1]-lo[1]:.1f} x "
+          f"{hi[2]-lo[2]:.1f} m -> {out}")
 
 
 def cmd_ingest_agrigs(cfg):
@@ -313,7 +333,8 @@ def cmd_evalonly(cfg, split="val", max_frames=0):
     raw = torch.load(run_dir / "params.pt", map_location=device,
                      weights_only=True)
     params = {k: v for k, v in raw.items() if k != "pose_deltas_raw"}
-    viewmats = torch.tensor(np.load(seg / "viewmats.npy"),
+    viewmats_np, _ = load_pose_artifact(seg, cfg)
+    viewmats = torch.tensor(viewmats_np,
                             dtype=torch.float32, device=device)
     c2ws = torch.linalg.inv(viewmats)
     k_mat = torch.tensor([[intr["fx"], 0, intr["cx"]],
@@ -378,17 +399,37 @@ def cmd_train(cfg):
     print(f"final: {final}")
 
 
+def cmd_stereo_prepare(cfg):
+    from .colmap_stereo import prepare
+    prepare(_seg_dir(cfg), cfg, build_typestore(None))
+
+
+def cmd_stereo_solve(cfg):
+    from .colmap_stereo import solve
+    solve(_seg_dir(cfg), cfg)
+
+
+def cmd_stereo_export(cfg):
+    from .colmap_stereo import export
+    export(_seg_dir(cfg), cfg)
+
+
 def main():
     stages = {"clockcheck": cmd_clockcheck, "select": cmd_select,
               "extract": cmd_extract, "depth": cmd_depth,
               "cloud": cmd_cloud, "train": cmd_train,
               "evalonly": cmd_evalonly, "diagnose": cmd_diagnose,
+              "stereo-prepare": cmd_stereo_prepare,
+              "stereo-solve": cmd_stereo_solve,
+              "stereo-export": cmd_stereo_export,
               "ingest-agrigs": cmd_ingest_agrigs}
     ap = argparse.ArgumentParser(prog="rtk_splat")
     ap.add_argument("stage", choices=list(stages) + ["all"])
     ap.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
     ap.add_argument("--run", default=None,
                     help="override train.run_name (evalonly/diagnose)")
+    ap.add_argument("--pose-artifact", default=None,
+                    help="override pose.artifact (e.g. colmap_stereo)")
     ap.add_argument("--split", default="val", choices=["val", "train", "test"],
                     help="manifest split to score (evalonly only)")
     ap.add_argument("--max-frames", type=int, default=0,
@@ -398,6 +439,8 @@ def main():
     cfg = load_config(args.config)
     if args.run:
         cfg.train.run_name = args.run
+    if args.pose_artifact:
+        cfg.pose.artifact = args.pose_artifact
     cfg.paths.workdir.mkdir(parents=True, exist_ok=True)
     if args.stage == "all":
         for name in ("select", "extract", "depth", "cloud", "train"):

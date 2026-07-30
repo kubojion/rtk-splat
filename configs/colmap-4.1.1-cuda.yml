@@ -1,0 +1,12 @@
+name: colmap-rtk
+channels:
+  - conda-forge
+dependencies:
+  # Pin the tested CUDA build. The additional pins work around incomplete
+  # runtime dependencies in the current conda-forge COLMAP package.
+  - colmap=4.1.1=cuda_129ha585b08_1
+  - libfaiss=1.10.0=cuda129_openblas_hd5b4706_200
+  - openimageio=3.1.15.0
+  - libblas=3.11.0=*_openblas
+  - libcblas=3.11.0=*_openblas
+  - liblapack=3.11.0=*_openblas

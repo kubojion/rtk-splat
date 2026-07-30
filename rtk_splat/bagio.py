@@ -36,6 +36,7 @@ class FrameRecord:
     """One selected stereo frame: header stamp + jpeg payloads."""
 
     t: float
+    t_right: float
     left_jpeg: bytes
     right_jpeg: bytes
 
@@ -114,16 +115,26 @@ def read_rtk_track(bags: list[Path], topics, typestore,
     )
 
 
-def read_camera_info(bags: list[Path], topics, typestore) -> dict:
-    """First left camera_info message -> intrinsics dict."""
-    with Reader(bag_for_topic(bags, topics.left_info)) as reader:
-        conns = [c for c in reader.connections if c.topic == topics.left_info]
+def read_camera_calibration(bags: list[Path], topic: str, typestore) -> dict:
+    """First CameraInfo message, including the rectification matrices."""
+    with Reader(bag_for_topic(bags, topic)) as reader:
+        conns = [c for c in reader.connections if c.topic == topic]
         for conn, _, raw in reader.messages(connections=conns):
             msg = typestore.deserialize_cdr(raw, conn.msgtype)
             k = np.asarray(msg.k, dtype=float)
             return {"width": int(msg.width), "height": int(msg.height),
-                    "fx": k[0], "fy": k[4], "cx": k[2], "cy": k[5]}
-    raise RuntimeError(f"no camera_info on {topics.left_info}")
+                    "fx": float(k[0]), "fy": float(k[4]),
+                    "cx": float(k[2]), "cy": float(k[5]),
+                    "distortion_model": str(msg.distortion_model),
+                    "d": np.asarray(msg.d, dtype=float).tolist(),
+                    "r": np.asarray(msg.r, dtype=float).reshape(3, 3).tolist(),
+                    "p": np.asarray(msg.p, dtype=float).reshape(3, 4).tolist()}
+    raise RuntimeError(f"no camera_info on {topic}")
+
+
+def read_camera_info(bags: list[Path], topics, typestore) -> dict:
+    """First left camera_info message -> calibration/intrinsics dict."""
+    return read_camera_calibration(bags, topics.left_info, typestore)
 
 
 def read_stereo_frames(bags: list[Path], topics, typestore, t0: float,
@@ -135,7 +146,7 @@ def read_stereo_frames(bags: list[Path], topics, typestore, t0: float,
     bounded regardless of window length.
     """
     pending_left: dict[int, tuple[float, bytes]] = {}
-    pending_right: dict[int, bytes] = {}
+    pending_right: dict[int, tuple[float, bytes]] = {}
     kept = 0
     seen_left = 0
     with Reader(bag_for_topic(bags, topics.left_image)) as reader:
@@ -155,12 +166,13 @@ def read_stereo_frames(bags: list[Path], topics, typestore, t0: float,
                     continue
                 pending_left[key] = (t, msg.data.tobytes())
             else:
-                pending_right[key] = msg.data.tobytes()
+                pending_right[key] = (t, msg.data.tobytes())
             if key in pending_left and key in pending_right:
                 tl, left = pending_left.pop(key)
-                right = pending_right.pop(key)
+                tr, right = pending_right.pop(key)
                 kept += 1
-                yield FrameRecord(t=tl, left_jpeg=left, right_jpeg=right)
+                yield FrameRecord(t=tl, t_right=tr, left_jpeg=left,
+                                  right_jpeg=right)
             # prune anything older than ~2 s that never found its partner
             stale = key - 60
             for d in (pending_left, pending_right):

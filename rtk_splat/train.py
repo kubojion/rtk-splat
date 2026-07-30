@@ -36,6 +36,8 @@ from gsplat.strategy import MCMCStrategy
 from torchmetrics.functional import structural_similarity_index_measure as tm_ssim
 
 from .cameras import ExposureAdjust, PoseAdjust, align_eval_pose, right_c2w
+from .pose_artifacts import (cloud_path, load_pose_artifact,
+                             pose_artifact_name, verify_cloud_matches_poses)
 
 _LPIPS = None
 
@@ -166,7 +168,8 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     k_mat = torch.tensor([[intr["fx"], 0, intr["cx"]],
                           [0, intr["fy"], intr["cy"]],
                           [0, 0, 1]], dtype=torch.float32, device=device)
-    viewmats = torch.tensor(np.load(seg_dir / "viewmats.npy"),
+    viewmats_np, _ = load_pose_artifact(seg_dir, cfg)
+    viewmats = torch.tensor(viewmats_np,
                             dtype=torch.float32, device=device)
     c2ws = torch.linalg.inv(viewmats)
 
@@ -179,7 +182,11 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     if cfg.train.use_right_camera:
         train_views += [(i, "R") for i in train_pairs]
 
-    params = init_params(seg_dir / "init_cloud.npz", cfg, device)
+    init_cloud = cloud_path(seg_dir, cfg)
+    verify_cloud_matches_poses(
+        init_cloud, viewmats_np,
+        require_fingerprint=pose_artifact_name(cfg) != "rtk")
+    params = init_params(init_cloud, cfg, device)
     optimizers = make_optimizers(params, cfg)
     # Annealing (upstream practice we previously missed): stop MCMC
     # relocation at refine_stop_frac of training, and decay the means lr ~100x
@@ -330,7 +337,7 @@ def export_pruned(params, run_dir: Path, cfg, seg_dir: Path = None):
     Raw log/logit spaces -- exporter and viewers apply exp/sigmoid."""
     keep = torch.sigmoid(params["opacities"].detach()) > cfg.train.export_prune_opacity
     if cfg.train.export_crop and seg_dir is not None:
-        cloud = np.load(seg_dir / "init_cloud.npz")["xyz"]
+        cloud = np.load(cloud_path(seg_dir, cfg))["xyz"]
         lo = torch.tensor(np.percentile(cloud, 1, axis=0) - 1.0,
                           dtype=torch.float32, device=params["means"].device)
         hi = torch.tensor(np.percentile(cloud, 99, axis=0) + 1.0,

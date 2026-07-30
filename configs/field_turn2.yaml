@@ -18,11 +18,15 @@ topics:
   left_image: /zed/zed_node/left/color/rect/image/compressed
   right_image: /zed/zed_node/right/color/rect/image/compressed
   left_info: /zed/zed_node/left/color/rect/camera_info
+  right_info: /zed/zed_node/right/color/rect/camera_info
   fix: /ublox_moving_base/fix                # position antenna (matches validated crop-row pipeline)
   relpos: /ublox_rover/ubx_nav_rel_pos_ned   # dual-antenna heading (rtk_dual_antenna source only)
   imu: /zed/zed_node/imu/data                # fused orientation (tilt correction, optional)
 
 pose:
+  # Immutable pose selection. "rtk" keeps the original experiment; the
+  # stereo-BA overnight script overrides this with "colmap_stereo".
+  artifact: rtk
   # Pose source:
   #   rtk_dual_antenna -- GNSS fix + dual-antenna heading topic (this robot)
   #   gnss_course      -- GNSS fix only; yaw from the smoothed track direction
@@ -82,6 +86,19 @@ cloud:
   pixel_stride: 6               # back-project every Nth pixel
   voxel_m: 0.02
   max_points: 4000000
+
+colmap:
+  # Calibrated stereo visual BA sidecar. COLMAP is never invoked by `all`;
+  # prepare/solve/export are explicit stages. COLMAP_BIN can override this.
+  executable: colmap
+  max_image_size: -1
+  max_num_features: 8192
+  feature_num_threads: 8       # covariant DSP-SIFT is CPU; bound RAM on 30 GiB host
+  sequential_overlap: 10
+  alignment_max_error_m: 0.15
+  alignment_ransac_iterations: 5000
+  min_registered_fraction: 0.95
+  scale_range: [0.98, 1.02]
 
 train:
   run_name: tile_turn2
