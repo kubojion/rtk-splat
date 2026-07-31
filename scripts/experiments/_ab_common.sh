@@ -703,20 +703,49 @@ if report.get("n_images") != expected_images:
     raise SystemExit("feature extraction did not cover every stereo image")
 if min(report.get("n_keypoints", 0), report.get("n_descriptors", 0)) <= 0:
     raise SystemExit("feature extraction produced no usable features")
-command = report.get("command", [])
-options = dict(zip(command[2::2], command[3::2]))
-if options.get("--FeatureExtraction.use_gpu") != (
-    "1" if profile == "gpu" else "0"
+raw_commands = report.get("command", [])
+if raw_commands and all(isinstance(item, str) for item in raw_commands):
+    # Accept schema-v1 reports produced before extraction was split by sensor.
+    commands = [raw_commands]
+elif (
+    isinstance(raw_commands, list)
+    and raw_commands
+    and all(
+        isinstance(command, list)
+        and all(isinstance(item, str) for item in command)
+        for command in raw_commands
+    )
 ):
-    raise SystemExit("feature command does not match the declared profile")
-for option in (
+    commands = raw_commands
+else:
+    raise SystemExit("feature report has an invalid command structure")
+
+expected_gpu = "1" if profile == "gpu" else "0"
+profile_options = (
     "--SiftExtraction.estimate_affine_shape",
     "--SiftExtraction.domain_size_pooling",
-):
-    if profile == "gpu" and option in options:
-        raise SystemExit(f"GPU arm unexpectedly enables {option}")
-    if profile == "cpu_reference" and options.get(option) != "1":
-        raise SystemExit(f"CPU-reference arm does not enable {option}")
+)
+for index, command in enumerate(commands):
+    if len(command) < 4 or command[1] != "feature_extractor":
+        raise SystemExit(f"feature command {index} is malformed")
+    arguments = command[2:]
+    if len(arguments) % 2:
+        raise SystemExit(f"feature command {index} has an unpaired option")
+    options = dict(zip(arguments[0::2], arguments[1::2]))
+    if options.get("--FeatureExtraction.use_gpu") != expected_gpu:
+        raise SystemExit(
+            f"feature command {index} does not match profile {profile!r}"
+        )
+    for option in profile_options:
+        if profile == "gpu" and option in options:
+            raise SystemExit(
+                f"GPU feature command {index} unexpectedly enables {option}"
+            )
+        if profile == "cpu_reference" and options.get(option) != "1":
+            raise SystemExit(
+                f"CPU-reference feature command {index} does not enable "
+                f"{option}"
+            )
 PY
 }
 

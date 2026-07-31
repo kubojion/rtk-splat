@@ -232,7 +232,7 @@ it verifies real-data planning and artifact publication only.
 Phases 5--7—RTK-factor submaps, CitrusFarm support, and rendering-quality
 changes—are outside this implementation.
 
-After integration, the complete repository suite passes **155 tests**. The
+After integration, the committed repository suite passes **157 tests**. The
 dataset-neutral core contains **1,932 lines**, below the enforced 2,000-line
 budget.
 
