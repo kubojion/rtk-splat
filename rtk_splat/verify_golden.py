@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -30,6 +32,29 @@ def _last_metrics(path: Path) -> dict:
     if not isinstance(value, list) or not value:
         raise ValueError(f"{path}: expected a non-empty metrics history")
     return value[-1]
+
+
+def _quality_value(quality: dict[str, Any], dotted_path: str) -> Any:
+    """Read a manifest-declared value without assuming a mapper schema."""
+    value: Any = quality
+    for component in dotted_path.split("."):
+        if not isinstance(value, dict) or component not in value:
+            raise KeyError(
+                f"quality field {dotted_path!r} is missing at {component!r}"
+            )
+        value = value[component]
+    return value
+
+
+def _exact_number(actual: Any, expected: Any) -> bool:
+    """Compare persisted JSON scalars exactly, including finite floats."""
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return actual is expected
+    if not isinstance(actual, (int, float)) or not isinstance(
+        expected, (int, float)
+    ):
+        return actual == expected
+    return math.isfinite(float(actual)) and float(actual) == float(expected)
 
 
 def _check_min(
@@ -109,15 +134,31 @@ def verify(
             f"registered left frames: {registered}/{n_frames}",
         )
     )
-    alignment = quality["alignment"]
-    scale = float(alignment["scale"])
-    scale_lo, scale_hi = expected["pose"]["scale_range"]
-    checks.append(
-        (
-            scale_lo <= scale <= scale_hi,
-            f"metric scale: {scale:.9g} (range {scale_lo}-{scale_hi})",
+    for scale_check in expected["pose"]["scale_checks"]:
+        scale_name = scale_check["name"]
+        scale_path = scale_check["quality_path"]
+        try:
+            scale = float(_quality_value(quality, scale_path))
+        except (KeyError, TypeError, ValueError) as exc:
+            checks.append((False, f"{scale_name} field {scale_path}: {exc}"))
+            continue
+        scale_lo, scale_hi = scale_check["range"]
+        checks.append(
+            (
+                scale_lo <= scale <= scale_hi,
+                f"{scale_name} ({scale_path}): {scale:.9g} "
+                f"(range {scale_lo}-{scale_hi})",
+            )
         )
-    )
+        if mode == "exact":
+            expected_scale = scale_check["expected"]
+            checks.append(
+                (
+                    _exact_number(scale, expected_scale),
+                    f"exact {scale_name}: {scale:.17g} "
+                    f"(expected {float(expected_scale):.17g})",
+                )
+            )
 
     viewmats = np.load(pose_path, mmap_mode="r")
     fingerprint = pose_fingerprint(viewmats)
@@ -127,6 +168,14 @@ def verify(
             f"pose fingerprint: {fingerprint}",
         )
     )
+    if mode == "exact":
+        expected_fingerprint = expected["pose"]["pose_fingerprint"]
+        checks.append(
+            (
+                fingerprint == expected_fingerprint,
+                f"golden pose fingerprint: {fingerprint}",
+            )
+        )
     with np.load(cloud_path) as cloud:
         stored = (
             str(cloud["pose_fingerprint"].item())
@@ -141,6 +190,20 @@ def verify(
     )
 
     metrics = _last_metrics(metrics_path)
+    if mode == "exact":
+        for field in expected["exact_metric_fields"]:
+            if field not in metrics:
+                checks.append((False, f"missing exact metric: {field}"))
+                continue
+            exact_expected = expected["metrics"][field]
+            exact_actual = metrics[field]
+            checks.append(
+                (
+                    _exact_number(exact_actual, exact_expected),
+                    f"exact metric {field}: {exact_actual!r} "
+                    f"(expected {exact_expected!r})",
+                )
+            )
     gates = expected["acceptance_gates"]
     _check_min(
         checks,

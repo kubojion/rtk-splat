@@ -1,6 +1,6 @@
 # RTK-Splat Progress
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 This is the current source of truth for this repository. Superseded plans are
 kept under `docs/archive/`.
@@ -53,6 +53,22 @@ source snapshot, not a falsely claimed clean run-time checkout. Exact hashes
 and artifact statistics are in
 [headland_stereo_ba.json](docs/experiments/golden/headland_stereo_ba.json).
 
+## Contract-v2 work: Phase 0 accepted baseline
+
+The two accepted headland results are now frozen independently:
+
+- Incremental stereo BA: pose fingerprint `701d917f...`, masked PSNR
+  **24.444888**, corrected masked PSNR **25.847967**.
+- Reduced Global Mapper: pose fingerprint `8129ff17...`, masked PSNR
+  **24.458305**, corrected masked PSNR **25.841772**.
+
+Their exact compact-file hashes, complete reported metrics, mapper-specific
+scale fields, and acceptance gates are recorded in
+`docs/experiments/golden/`. The read-only verifier passes **38/38** checks for
+the incremental result and **42/42** for the Global result. The full suite
+passes **55 tests**. A repository-only regression test freezes the key hashes
+and quality values without requiring the external work directory in CI.
+
 ## Metric-integrity audit
 
 The strict audit is non-destructive and is not consumed by training.
@@ -82,6 +98,32 @@ Held-out aggregate:
 The p95 position residual worsened by 2.8%, within the configured audit gate.
 That tradeoff remains visible. These are calibration recommendations, not
 enabled training parameters.
+
+The same strict audit was run against the reduced Global Mapper's raw metric
+trajectory on 2026-07-31. It used the same exact RTK fixes, covariance/status,
+dual-antenna vectors, rough physical TF, temporal holdouts, and fixed stereo
+scale as the incremental audit:
+
+| Raw metric trajectory | Diagnostic visual-to-ENU scale |
+|---|---:|
+| Incremental COLMAP | 0.996173 |
+| Reduced Global Mapper | 0.995212 |
+
+The two strict estimates differ by only **0.096 percentage points**. Directly
+aligning the two raw visual trajectories gives a relative scale of 0.998845,
+with 6.5 mm median trajectory disagreement. Global Mapper also preserved the
+encoded 0.119846250 m stereo rig baseline exactly. Therefore the earlier
+0.984637 Global diagnostic did not identify a 1.5% Global-BA scale failure: it
+was mostly confounded by the rough RTK-camera-centre alignment used by the
+exporter. The remaining shared 0.38--0.48% diagnostic discrepancy cannot be
+assigned specifically to the physical stereo baseline without an independent
+target-based stereo calibration.
+
+Only the antenna-baseline tangent correction was retained for the Global
+trajectory. Lever and clock corrections were not observable/stable enough and
+remain at their priors. The new diagnostic artifact is
+`rtk_stereo_metric_integrity_global_v1_strict`; it publishes no poses and is
+not consumed by training.
 
 ## Phase 1 repository cleanup
 
@@ -178,9 +220,23 @@ metrics, complete validation coverage, loadable finite checkpoint tensors,
 non-empty PLY geometry, and final iteration. The expected runtime is about
 4--5 hours because the completed pose/front end are reused.
 
-GS quality remains unmeasured until that continuation finishes. The historical
-incremental result is useful context, but a paper-grade backend attribution
-still needs a newly trained seed-matched incremental fixed-scale control.
+The complete Global Mapper GS continuation finished on 2026-07-31:
+
+| Metric | Incremental stereo BA | Reduced Global Mapper | Difference |
+|---|---:|---:|---:|
+| Masked PSNR | 24.4449 | 24.4583 | +0.0134 dB |
+| Corrected masked PSNR | 25.8480 | 25.8418 | -0.0062 dB |
+| SSIM | 0.5944 | 0.5904 | -0.0040 |
+| LPIPS | 0.3232 | 0.3227 | -0.0005 |
+
+These differences are practically a quality tie, not evidence of a quality
+gain. The important measured result is speed: the mapper stage fell from about
+581 minutes to 18.1 minutes while retaining all 1,344 frames and comparable GS
+quality. A fresh run on the already canonical headland segment would still
+need about 63 minutes of feature extraction, 19 minutes of matching, 18
+minutes of Global mapping, and about 4.2 hours of GS optimization. A
+paper-grade backend attribution still needs a newly trained, provenance-matched
+incremental fixed-scale control.
 
 ## Genericity status
 
@@ -209,6 +265,14 @@ Not yet verified:
 The last item is supported in code for new metadata but still needs an
 end-to-end adapter test before being claimed.
 
+Read-only inspection of the mounted CitrusFarm sequence found ROS 1 split bags,
+7,592 synchronized 10 Hz ZED2i stereo pairs, recorded depth/confidence, and
+single-receiver fixed RTK over 12 min 39 s. Global stereo SfM is conceptually
+compatible, but the present adapter cannot decode that dataset through YAML
+alone: it still needs ROS 1/ROS 2 autodetection, ordered split-bag streaming,
+raw/compressed image decoding, timestamp synchronization, optional recorded
+depth, and a covariance-aware single-RTK mode.
+
 ## Known scientific limitations
 
 - Validation views participated in SfM pose estimation.
@@ -222,15 +286,20 @@ end-to-end adapter test before being claimed.
 
 ## Next implementation phase
 
-1. Run the prepared full 65,000-iteration Global Mapper GS arm and compare its
-   held-out metrics and renders.
-2. Train a seed-matched incremental fixed-SE(3) control before attributing a GS
-   difference to the pose backend.
-3. Repeat the winning backend on the hangar-to-field sequence.
-4. Implement and contract-test one external dataset adapter, with CitrusFarm as
-   the leading candidate.
-5. Use these measurements to choose between RTK-anchored chunking and a custom
-   RTK-constrained sliding-window/global optimizer.
+1. Split stereo feature extraction/matching into a mapper-neutral front-end
+   artifact so Global Mapper can be the primary new-field backend without
+   first running incremental COLMAP. Retain incremental mapping as a tested
+   fallback and reference.
+2. Replace fixed frame stride and fixed-index matching with adaptive
+   distance/rotation/quality keyframes and an RTK-guided temporal/spatial match
+   graph.
+3. Add bounded overlapping submaps and covariance-aware RTK constraints so a
+   77-minute field is never one unbounded SfM or GS optimization.
+4. Implement and contract-test the generic ROS 1/ROS 2 dataset adapter, then
+   use CitrusFarm as the first external, single-RTK, faster-motion acceptance
+   test.
+5. Train a provenance-matched incremental fixed-SE(3) control and repeat the
+   selected production path on the hangar-to-field sequence.
 
 The first speed target is to preserve quality within 0.3 dB while materially
 reducing pose-estimation time. A further 3.8 dB pose-only gain is not assumed.

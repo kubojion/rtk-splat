@@ -1,0 +1,256 @@
+{
+  "schema_version": 2,
+  "experiment_id": "headland_global_mapper_2026-07-31",
+  "recorded_at": "2026-07-31T12:00:00+02:00",
+  "provenance": {
+    "pose_run_started": "2026-07-30T20:13:18+02:00",
+    "pose_run_completed": "2026-07-30T20:33:35+02:00",
+    "pose_elapsed_seconds": 1217,
+    "gs_run_started": "2026-07-31T00:29:53+02:00",
+    "gs_run_completed": "2026-07-31T04:36:27+02:00",
+    "gs_elapsed_seconds": 14794,
+    "git_head_at_run": "d834bc89307dcd338d9827a0066c363618840c4f",
+    "source_snapshot_commit": "9cab44235017dd2b5f7049c3e605cfea7efb988f",
+    "source_snapshot_tree": "44ec59ddd2ab1702fb271d9e89bb200990e00cce",
+    "source_snapshot_created_after_run": true,
+    "source_state_note": "The Global Mapper implementation was uncommitted during the pose and GS runs. Commit 9cab442 is the first post-run source snapshot; recorded implementation/config hashes match that snapshot.",
+    "effective_overrides": {
+      "pose.artifact": "colmap_global_headland_reduced_v1",
+      "train.run_name": "tile_turn4_global_mapper_reduced_v1"
+    },
+    "source_snapshot_sha256": {
+      "configs/reproductions/headland_stereo_ba.yaml": "e490da1305e87ea078a5bf340be92e75e88327af521eb6646ce5e78e5245124a",
+      "scripts/reproduce/headland_global_mapper.sh": "b8dc7fb893ee8b4b345bd2c71a856b6c297a250e211d86d7cfa7bf7bca1652fa",
+      "scripts/reproduce/headland_global_gs_overnight.sh": "acbd3ad604f8f0f6f89ce8136abec9c9855bad4f52680cebaa0cf4d0fb69bc2a",
+      "rtk_splat/colmap_global.py": "a02eb09d7bab15da08e375e355fb776ad1ab60334a43f31e1033ca2995c953a5",
+      "rtk_splat/pose_artifacts.py": "e3fed94ea694ea1473ed6436cbea705cdd49d290a4ad7e1fc46ef98c8dc742da",
+      "rtk_splat/train.py": "e54a67879a69d1d0169117f0238fd96f5dc959084d1dc51e92b60eeaedeb6c49"
+    }
+  },
+  "artifact_layout": {
+    "recorded_workdir": "/home/jion_kubo/agromap4d_work/field_turn",
+    "pose_artifact": "colmap_global_headland_reduced_v1",
+    "run_name": "tile_turn4_global_mapper_reduced_v1"
+  },
+  "input": {
+    "recording": "0703-nav2-follow-field1-row3-6-2-5-1-4-raw-localization-inputs-zed",
+    "storage_note": "The bag path may be a symlink to the Buffalo SSD.",
+    "mcap_size_bytes": 151865571551,
+    "metadata_yaml_sha256": "2c1faf1fb70fc577d43119a7cf58c727d06b6ef21c1e35b27c8a0cc29958a94c",
+    "duration_ns": 4639753728474,
+    "start_time_ns": 1783069457680955142,
+    "message_count": 2822528
+  },
+  "expected": {
+    "segment": {
+      "n_frames": 1344,
+      "n_stereo_images": 2688,
+      "n_depth_files": 1344,
+      "image_filename_size_inventory_sha256": "e7fe93e4b847e40d20646d47e5248ea134fd1ab3a4aa03e4e698ff4d00277393",
+      "depth_filename_size_inventory_sha256": "06d5e8d043da4ae35f8a5542169b714023943dfa74ee4746451f3afe031d5969"
+    },
+    "pose": {
+      "n_registered_left": 1344,
+      "n_registered_total_images": 2688,
+      "pose_fingerprint": "8129ff17300a84061cb8df4eb9e0a707c4da63f943bff690f4e1a116150843c7",
+      "scale_checks": [
+        {
+          "name": "applied fixed metric scale",
+          "quality_path": "fixed_scale_alignment.scale_applied",
+          "expected": 1,
+          "range": [
+            1,
+            1
+          ]
+        },
+        {
+          "name": "diagnostic Sim(3) scale",
+          "quality_path": "sim3_diagnostic_only.scale",
+          "expected": 0.9846374983745549,
+          "range": [
+            0.98,
+            1.02
+          ]
+        }
+      ],
+      "fixed_scale_rtk_residual_median_m": 0.09799856561019286,
+      "fixed_scale_rtk_residual_p95_m": 0.27363985259691337,
+      "fixed_scale_rtk_residual_max_m": 0.31550624630465657,
+      "n_fixed_scale_alignment_inliers": 1026,
+      "sim3_diagnostic_residual_median_m": 0.054683131473708985,
+      "sim3_diagnostic_residual_p95_m": 0.1204166886072947,
+      "sim3_diagnostic_residual_max_m": 0.15458429066974513,
+      "n_sim3_diagnostic_inliers": 1340
+    },
+    "metrics": {
+      "n_eval": 168,
+      "psnr": 11.646301939373924,
+      "psnr_masked": 24.458305427006312,
+      "psnr_near": 23.6331726255871,
+      "psnr_masked_cc": 25.84177161398388,
+      "lpips": 0.32267472910739126,
+      "lpips_cc": 0.3196603652267229,
+      "ssim": 0.5904194045634497,
+      "psnr_masked_aligned": 24.475364242281234,
+      "step": 65000,
+      "n_gaussians": 2500000,
+      "loss": 0.03890036791563034,
+      "n_gaussians_exported": 1604498
+    },
+    "exact_metric_fields": [
+      "psnr",
+      "psnr_masked",
+      "psnr_near",
+      "psnr_masked_cc",
+      "lpips",
+      "lpips_cc",
+      "ssim",
+      "n_eval",
+      "psnr_masked_aligned",
+      "step",
+      "n_gaussians",
+      "loss"
+    ],
+    "acceptance_gates": {
+      "psnr_masked_min": 24.1,
+      "psnr_masked_cc_min": 25.5,
+      "lpips_cc_max": 0.34,
+      "ssim_min": 0.58
+    }
+  },
+  "colmap": {
+    "identity": "COLMAP 4.1.1 (Commit Unknown on Unknown with CUDA)",
+    "database_reused_from": "colmap_stereo",
+    "features_recomputed": false,
+    "matches_recomputed": false,
+    "database_size_bytes": 5984497664,
+    "database_sha256": "2ee617160682a97380956c6b32ed89d3b1e74a05d3845d7bd93c9cc50428dae3",
+    "database_user_version": 4010100,
+    "n_cameras": 2,
+    "n_images": 2688,
+    "n_rigs": 1,
+    "n_frames": 1344,
+    "n_keypoints": 26383020,
+    "n_match_pairs": 53058,
+    "n_verified_inliers": 117542525,
+    "n_points3d": 18662,
+    "n_observations": 2759770,
+    "mean_track_length": 147.881792,
+    "mean_observations_per_image": 1026.700149,
+    "mean_reprojection_error_px": 1.335192,
+    "runtime_minutes": {
+      "global_mapper": 18.056
+    },
+    "resource_usage": {
+      "peak_process_rss_bytes": 9463373824,
+      "minimum_system_available_bytes": 6342008832,
+      "minimum_disk_free_bytes": 132372111360
+    }
+  },
+  "compact_files": [
+    {
+      "path": "segment/window.json",
+      "sha256": "463aef48e34a990ce11dfc295f1ecafdcd20141adcc8bbe3a96cf0bc3b8b3de1"
+    },
+    {
+      "path": "segment/segment_meta.json",
+      "sha256": "a8a18880983f1cd6cc0b8ed01b5a93581f70bd37e662bb0ad27ad91ddd187316"
+    },
+    {
+      "path": "segment/manifest.json",
+      "sha256": "a2634f969b5b6d2de96f0b796a18c0f1f315ee97ad684a30f0583db96e75309d"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/commands.json",
+      "sha256": "9c5daac47f0d5a2604b0a5e356f24f83e27af8206a543e524ea75e3e3d8731b2"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/sidecar_config.json",
+      "sha256": "f73685d51b0ee66bdedaac5d787a8a638d09ace712f0917846f6f51aa27ef3e8"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/source.json",
+      "sha256": "8b5ba2df4bb2108c7b27ad8b27bb2f41d6a54794e6486d10c05236a99980551b"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/quality.json",
+      "sha256": "c7c1be42693c5d7e0620f37cb88175ecd17da8a7171ceef8c2a0b5af56095a73"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/viewmats.npy",
+      "sha256": "9efbb66d62af4e8c01d94f9d500be781c057318985dd6b99cdb4b9f1d14a70fa"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/cam_centers.npy",
+      "sha256": "d6f1f6e9fe627ba4a7bc3b1f76f9d3cba4420dc5d3f04ba3b4be147718095316"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/registered.npy",
+      "sha256": "a38f4112af2db5c7f2c6aa51bea0799bdef94db4a96e6b01fc4eca8aa48bb528"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/frame_ids.npy",
+      "sha256": "78aa85491e252d70c224527f38ae295ae73bc9a85229707a6c6e13a76a6c5fee"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/global/.global_mapper.done.json",
+      "sha256": "000109ac393fc9a61911464cf5b2225ead0f304d08896977bdde9d4e36cc718e"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/global/solve_result.json",
+      "sha256": "000109ac393fc9a61911464cf5b2225ead0f304d08896977bdde9d4e36cc718e"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/global/resource_usage.json",
+      "sha256": "ca6d0a10dce0ae761edd67b927972d8b741d9d9b4f80c8ba09938c1c8d5c666a"
+    },
+    {
+      "path": "runs/tile_turn4_global_mapper_reduced_v1/metrics.json",
+      "sha256": "85697bb1cb4bb307808a3c3d484c18d96563e0d4afd94161e300c86530f30883"
+    },
+    {
+      "path": "runs/tile_turn4_global_mapper_reduced_v1/metrics_evalonly_train.json",
+      "sha256": "0beec4b31e62730438ce7cff3b8276116d2829ee8b260368363c511fc8f3ace0"
+    },
+    {
+      "path": "runs/tile_turn4_global_mapper_reduced_v1/run_provenance.json",
+      "sha256": "543162bf696d23829b62706ca3ad0cfe80a341b04aa7f7d2c49c8b2c70d82e98"
+    }
+  ],
+  "large_artifacts": [
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/global/database.db",
+      "size_bytes": 5984497664,
+      "sha256": "2ee617160682a97380956c6b32ed89d3b1e74a05d3845d7bd93c9cc50428dae3"
+    },
+    {
+      "path": "segment/pose_artifacts/colmap_global_headland_reduced_v1/init_cloud.npz",
+      "size_bytes": 56048401,
+      "sha256": "84b5eacf4f0c1a6a364e5d35fcb2382f5713dd795633be4fa8d946558668eda7"
+    },
+    {
+      "path": "runs/tile_turn4_global_mapper_reduced_v1/params.pt",
+      "size_bytes": 230002110,
+      "sha256": "92f01ee30b1ee879d3d08dde4f2aec5f7ded4b8f4eab578d167b1964bcef2ecb"
+    },
+    {
+      "path": "runs/tile_turn4_global_mapper_reduced_v1/splat.ply",
+      "size_bytes": 147614395,
+      "sha256": "417aa932be2306c2c14fee8d221f386cf60a1ffdb10d20c9495f7ea40a2d7692"
+    }
+  ],
+  "observed_environment": {
+    "python": "3.10.20",
+    "torch": "2.4.1+cu121",
+    "gsplat": "1.5.3+pt24cu121",
+    "numpy": "2.2.6",
+    "scipy": "1.15.3",
+    "opencv": "5.0.0",
+    "pyyaml": "6.0.3",
+    "torchmetrics": "1.9.0",
+    "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU, 8 GiB",
+    "driver": "580.173.02",
+    "cpu": "AMD Ryzen 9 5900HX",
+    "note": "Observed environment only; this is not yet a fully locked binary environment."
+  }
+}

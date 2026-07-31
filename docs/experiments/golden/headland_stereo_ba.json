@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "experiment_id": "headland_stereo_ba_2026-07-29",
   "recorded_at": "2026-07-30T19:00:00+02:00",
   "provenance": {
@@ -51,10 +51,16 @@
       "n_registered_left": 1344,
       "n_registered_total_images": 2688,
       "pose_fingerprint": "701d917fdef9b5092499debaeedfa9d24852c1bd461b4816cc476af0b37234af",
-      "scale": 0.9857944885226491,
-      "scale_range": [
-        0.98,
-        1.02
+      "scale_checks": [
+        {
+          "name": "Sim(3) alignment scale",
+          "quality_path": "alignment.scale",
+          "expected": 0.9857944885226491,
+          "range": [
+            0.98,
+            1.02
+          ]
+        }
       ],
       "rtk_residual_median_m": 0.05109676322183859,
       "rtk_residual_p95_m": 0.10718440664734041,
@@ -71,9 +77,25 @@
       "lpips_cc": 0.31866925883860814,
       "ssim": 0.5944193653052762,
       "psnr_masked_aligned": 24.438251847312564,
-      "n_gaussians_optimized": 2500000,
+      "step": 65000,
+      "n_gaussians": 2500000,
+      "loss": 0.0415080189704895,
       "n_gaussians_exported": 1634951
     },
+    "exact_metric_fields": [
+      "psnr",
+      "psnr_masked",
+      "psnr_near",
+      "psnr_masked_cc",
+      "lpips",
+      "lpips_cc",
+      "ssim",
+      "n_eval",
+      "psnr_masked_aligned",
+      "step",
+      "n_gaussians",
+      "loss"
+    ],
     "acceptance_gates": {
       "psnr_masked_min": 24.1,
       "psnr_masked_cc_min": 25.5,
