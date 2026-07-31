@@ -1,190 +1,209 @@
-# Global Mapper pose backend
+# Mapper-Neutral Global and Incremental Backend
+
+## Current status
+
+The Phase 3/4 backend interface is implemented and unit-tested. It can consume
+a sealed contract-v2 frontend, solve a keyframe model, register all remaining
+stereo images, run quality gates, and publish a fixed-scale metric pose
+artifact. No fresh real-headland A/B has yet exercised this new interface.
+
+The measured Global Mapper result later in this document is a historical golden
+experiment. It established that a reduced Global solve could match the
+incremental reconstruction's GS quality much faster, but it reused the older
+incremental run's feature/match database. It does not prove the speed or quality
+of the new standalone frontend or adaptive keyframes.
 
 ## Purpose
 
-This backend is a controlled speed/quality A/B against the successful
-incremental COLMAP reconstruction. It uses COLMAP 4.1.1's integrated Global
-Mapper (the maintained GLOMAP implementation) while preserving the same:
+The current design separates correspondence construction from pose solving:
 
-- 2,688 rectified images;
-- two calibrated PINHOLE cameras;
-- 0.119846250 m stereo transform;
-- 26.38 million cached keypoints; and
-- 53,058 cached verified image pairs.
+- build images, stereo rig, features, RTK priors, and verified matches once;
+- seal that frontend as immutable evidence;
+- run Global as the primary mapper candidate;
+- retain incremental as an isolated fallback and scientific control; and
+- restore every non-keyframe left/right image before pose publication.
 
-It does not rerun feature extraction or matching, and it does not use an IMU.
-RTK remains the post-reconstruction geographic anchor.
+This removes the previous operational dependency in which Global could be
+tested only after a completed incremental reconstruction.
 
-## Non-destructive boundary
+## Non-destructive artifact boundary
 
-COLMAP opens databases in writable mode even when a pipeline only consumes
-their contents. `global-prepare` therefore:
+COLMAP opens databases in writable mode. A backend therefore never opens the
+sealed frontend database directly. `backend-prepare`:
 
-1. validates the completed source stereo sidecar;
-2. records the source database size, timestamps, schema, counts, and SHA-256;
-3. creates an independent full database copy under a new pose artifact;
-4. verifies the copy's SHA-256 and SQLite inventory; and
-5. rechecks the source after copying.
+1. rehashes the terminal seal, including finalized JSON/pair evidence, image
+   link targets and contents, and the database's committed view;
+2. creates a private backend workspace and transaction-consistent SQLite
+   snapshot, including committed WAL-only rows;
+3. verifies the snapshot hash, integrity check, schema, and table inventory;
+4. records the selected mapper and keyframe set; and
+5. leaves both the canonical segment and frontend unchanged.
 
-The Global Mapper process sees only the copy. Its images path is a read-only
-symlink to the existing image tree. It never opens the successful database.
+Global and incremental arms must use different backend names. Existing backend
+or pose destinations fail closed instead of being overwritten.
 
-## Explicit stages
+## Explicit workflow
 
-```bash
-python -m rtk_splat.cli global-prepare \
-  --config configs/reproductions/headland_stereo_ba.yaml \
-  --pose-artifact colmap_global_headland_reduced_v1
-
-python -m rtk_splat.cli global-solve \
-  --config configs/reproductions/headland_stereo_ba.yaml \
-  --pose-artifact colmap_global_headland_reduced_v1
-
-python -m rtk_splat.cli global-export \
-  --config configs/reproductions/headland_stereo_ba.yaml \
-  --pose-artifact colmap_global_headland_reduced_v1
-```
-
-These stages are never invoked by `all`.
-
-The guarded end-to-end headland A/B is:
+The installed `rtk-splat` command exposes the current stages:
 
 ```bash
-scripts/reproduce/headland_global_mapper.sh \
-  --python /path/to/rtk-splat/python \
-  --colmap /path/to/colmap-4.1.1
+rtk-splat frontend-build --config CONFIG.yaml \
+  --frontend-name all-gpu --keyframe-preset all --feature-profile gpu
+rtk-splat frontend-features --config CONFIG.yaml --frontend-name all-gpu
+rtk-splat frontend-rig --config CONFIG.yaml --frontend-name all-gpu
+rtk-splat frontend-priors --config CONFIG.yaml --frontend-name all-gpu
+rtk-splat frontend-match --config CONFIG.yaml --frontend-name all-gpu
+
+rtk-splat backend-prepare --config CONFIG.yaml \
+  --frontend-name all-gpu --backend global --backend-name all-gpu-global
+rtk-splat backend-solve --config CONFIG.yaml \
+  --backend-name all-gpu-global
+rtk-splat backend-register --config CONFIG.yaml \
+  --backend-name all-gpu-global
+rtk-splat backend-quality --config CONFIG.yaml \
+  --backend-name all-gpu-global
+rtk-splat backend-export --config CONFIG.yaml \
+  --backend-name all-gpu-global --pose-name all-gpu-global
 ```
 
-The default stops after the pose export. After reviewing that result, add
-`--resume --with-gs` to start cloud construction and the 65,000-iteration
-exploratory GS arm. It still starts only if the pose integrity checks pass.
+Commands are explicit by design. There is no `all` command, and normal
+cloud/training execution never launches a pose solver implicitly.
 
-For an unattended run, the guarded wrapper is:
+The Python API is:
 
-```bash
-scripts/reproduce/headland_global_gs_overnight.sh --check
-scripts/reproduce/headland_global_gs_overnight.sh
-```
+- `MapperConfig`;
+- `prepare_mapper_backend()`;
+- `run_mapper_solve()`;
+- `run_image_registration()`;
+- `run_quality_summary()`; and
+- `export_pose_artifact()`.
 
-It consumes only an accepted `colmap_global_headland_reduced_v1` pose. If that
-pose producer is still active, it waits; it never launches another COLMAP
-process. Before GS it verifies the complete 1,344-pair canonical segment,
-depth, split, AC power, host memory, disk, CUDA/VRAM idleness, and empty
-destination run name.
-It checks the final checkpoint tensors, PLY vertex count, provenance, finite
-metrics, complete validation split, and configured final iteration before
-reporting completion. Keep the terminal open, or run the wrapper inside
-`tmux`; sleep is inhibited, but the four-hour optimizer has no checkpoint
-resume.
+All are defined in `backends.mapper`.
 
-## Solver profiles
+## Solve and all-frame registration
 
-The initial experiment used the complete track set:
+`backend-solve` filters the private database to the selected keyframe images
+and runs either:
 
-- calibrated intrinsics are fixed;
-- the measured sensor-from-rig transform is fixed;
-- every per-frame rig pose remains optimizable;
-- global positioning and BA optimize positions and points;
-- three global BA rounds and retriangulation remain enabled;
-- Global Mapper uses eight CPU threads; and
-- GPU positioning/BA are disabled because this machine has 8 GiB VRAM.
+- COLMAP's integrated Global Mapper, the default candidate; or
+- COLMAP's incremental mapper, the optional fallback/control.
 
-That full-profile attempt is preserved under
-`colmap_global_headland_v1`. During Ceres global-position problem setup, RSS
-rose to 15.7 GiB and system available memory remained below 4 GiB. The safety
-monitor terminated it after 138 seconds; it produced no publishable pose.
+`backend-register` then uses the complete backend database and COLMAP image
+registrator to add non-keyframes. Publication requires the exact canonical
+left and right image name for every timestamp; a left-only, mismatched, or
+partially registered reconstruction fails.
 
-The separately named reduced profile retains all 53,058 verified pairs for
-rotation averaging, then asks COLMAP to keep the longest tracks until every
-image has more than 1,000 selected tracks, with a hard ceiling of 60,000
-tracks. A proxy using the completed incremental model reaches that coverage at
-53,866 tracks and 6.91 million observations, versus 18.21 million observations
-in the reference model. COLMAP's final retriangulation is disabled because it
-would delete the capped structure and rebuild it from the complete
-correspondence graph. The GS initialization remains independent: it is fused
-from stereo depth under the exported poses.
+Keyframes therefore bound the expensive solve without changing the final
+camera set available to cloud construction and GS supervision.
 
-The verified-pair graph is multiscale temporal
-(`Δframe = 0, 1, 2, 4, ..., 512`). It contains useful long-baseline links but
-no retrieval-based loop closures. No database pair is removed in this
-experiment.
+## RTK semantics
 
-### Measured reduced-profile result
+RTK has three distinct roles:
 
-The reduced solve completed in 1,083 seconds (18.1 minutes), with 8.8 GiB peak
-process RSS and 5.9 GiB minimum host memory available. It registered every one
-of the 1,344 frames / 2,688 images. The selected model has 18,662 points,
-2,759,770 observations, at least 749 observations in every image, and 1.335 px
-mean reprojection error.
+1. accepted position/heading evidence informs keyframe and match planning;
+2. filtered Cartesian position priors are inserted in the frontend database
+   and preserved in each backend snapshot; and
+3. trusted visual-camera/RTK correspondences determine the geographic
+   alignment at export.
 
-Fixed-scale export produced a 9.8 cm median and 27.4 cm p95 residual to the
-rough-TF RTK camera-centre track. A diagnostic-only Sim(3) fit reported scale
-0.984637; it was not applied. The published trajectory differs from the
-incremental fixed-scale control by 1.03 cm median / 3.33 cm p95 in position and
-0.121 deg median / 0.150 deg p95 in rotation.
+The integrated Global Mapper remains a **visual** solver. It does not optimize
+RTK residuals or covariance-weighted RTK factors inside bundle adjustment.
+Database-prior retention must not be presented as RTK-constrained Global BA.
 
-All structural gates passed, but the RTK and reprojection result targets did
-not. This authorizes an exploratory GS comparison; it does not establish a
-quality improvement. Reusing the identical completed front end, the mapper
-stage was about 32 times faster than the historical 581-minute incremental
-mapper stage.
+The exporter divides trusted priors into deterministic contiguous temporal
+blocks. It robustly estimates a fixed-scale SE(3) transform using alternating
+calibration blocks, then measures and gates residuals only on untouched
+holdout blocks. A Sim(3) fit uses calibration blocks only, is recorded as a
+scale diagnostic, and is never applied. This keeps calibrated stereo depth,
+rig baseline, trajectory, and initialization geometry in one metric scale
+without evaluating alignment on its own fitting samples.
 
-The host has no swap. Resource samples are written every two seconds and the
-solver is terminated if available memory remains below 4 GiB for two
-consecutive samples, or if free disk falls below 5 GiB. Full and reduced
-attempts always use distinct artifact names.
+## Resume and publication gates
 
-## Metric export
+Prepare, solve, register, quality, and export have separate verified markers.
+A stage resumes only when its inputs, command, configuration, and expected
+outputs still match.
 
-The stereo baseline is a metric constraint. The exporter therefore applies a
-robust fixed-scale SE(3) transform from the visual world to local ENU. It also
-fits a Sim(3), but records its scale only as a diagnostic and never applies it
-to the published poses.
+Before publishing `viewmats.npy` and `cam_centers.npy`, the backend checks:
 
-This matters because applying a free visual scale to poses while continuing to
-use metric stereo depth makes the two geometry sources inconsistent. The prior
-incremental result used the legacy bounded Sim(3) path and reported a scale of
-0.985794. Global Mapper explicitly restores the reconstruction to the original
-rig scale, so the new A/B directly tests whether the model is metric without
-that correction.
+- exact left/right registration for all canonical timestamps;
+- a physically admissible connected solve-frame graph before mapping;
+- unchanged calibrated camera and stereo-rig geometry;
+- finite poses and acceptable temporal continuity;
+- adequate registered observations;
+- at least three trustworthy camera-centre priors;
+- held-out fixed-scale RTK residual and inlier gates; and
+- complete quality and provenance records.
 
-## Integrity gates and result targets
+Failed candidates keep their logs, candidate poses, and diagnostics but do not
+publish a normal pose artifact consumable by cloud construction or training.
+The output artifact also records image IDs, exact timestamps, names, quality,
+and provenance.
 
-Standard `viewmats.npy` and `cam_centers.npy` are written only if the
-solver-integrity checks pass:
+## Historical measured headland control
 
-- exactly 1,344 registered frames and 2,688 registered images;
-- every frame contains the matching left and right image;
-- both intrinsics and the stereo transform remain unchanged;
-- every registered image retains at least 250 optimized 3D observations;
-- diagnostic scale remains in `[0.98, 1.02]`;
-- temporal translation/rotation steps stay below the measured continuity
-  limits.
+The historical experiment used 2,688 rectified images (1,344 stereo pairs),
+two calibrated PINHOLE cameras, a 0.119846250 m stereo transform, 26.38 million
+cached keypoints, and 53,058 cached verified pairs. It did not rerun feature
+extraction or matching and did not use an IMU.
 
-Mean reprojection error, total observation count, and track length are recorded
-against targets but are not publication gates: the reduced solver deliberately
-selects a different point set, so those aggregate output statistics are not
-paired pose-quality measurements.
+The first full-track Global attempt reached Ceres global-position setup, grew
+to **15.7 GiB** RSS, and held available memory below the configured **4 GiB**
+floor. The safety monitor terminated it after **138 s**; no pose was
+published.
 
-The desired fixed-scale RTK residual remains 6 cm median, 12 cm p95, and 15 cm
-maximum. It is reported as a result target, not a solver-integrity gate,
-because the current comparison fits and evaluates the same trajectory against
-a rough camera/antenna TF. A paper-grade accuracy claim requires the existing
-covariance/status evidence and held-out temporal blocks rather than using this
-post-fit number as ground truth.
+The separately named reduced profile retained all 53,058 verified pairs for
+rotation averaging and selected long tracks with a 60,000-track ceiling. It
+disabled final retriangulation because that operation would rebuild an
+unbounded point set from the full graph.
 
-Failed candidates retain `candidate_viewmats.npy`, diagnostics, logs, and
-quality records, but cannot be consumed by cloud construction or training.
+The reduced solve completed with:
 
-## Scientific interpretation
+- **1,083 s (18.1 min)** solve time;
+- **8.8 GiB** peak process RSS and **5.9 GiB** minimum host memory available;
+- **1,344/1,344 frames** and **2,688/2,688 images** registered;
+- 18,662 points and 2,759,770 observations;
+- at least 749 observations per image;
+- **1.335 px** mean reprojection error;
+- **9.8 cm median / 27.4 cm p95** fixed-scale RTK residual;
+- diagnostic Sim(3) scale **0.984637**, not applied; and
+- **1.03 cm / 0.121 deg** median difference from the incremental
+  fixed-scale control trajectory.
 
-This experiment can establish a substantially faster pose backend and may
-improve metric consistency. Its GS score against the historical result changes
-both mapper and alignment policy, so a winning candidate still requires an
-incremental-plus-fixed-SE(3) control with the same recorded training seed.
-Ideally the final paper reports several matched seeds and raw held-out metrics.
+Its completed 65,000-iteration GS comparison was:
 
-By itself Global Mapper is not the paper's method contribution:
-Global Mapper still optimizes visual reprojection and does not place RTK
-factors inside its BA. A successful result is the baseline for the next method
-step—RTK-anchored chunking or a custom RTK-constrained local/global optimizer.
+| Metric | Incremental stereo BA | Reduced Global | Difference |
+|---|---:|---:|---:|
+| Masked PSNR | 24.4449 | 24.4583 | +0.0134 dB |
+| Corrected masked PSNR | 25.8480 | 25.8418 | -0.0062 dB |
+| SSIM | 0.5944 | 0.5904 | -0.0040 |
+| LPIPS | 0.3232 | 0.3227 | -0.0005 |
+
+This is a practical quality tie. The mapper stage was about **32x faster** than
+the historical 581-minute incremental mapper stage because both arms reused
+the same completed frontend evidence. The experiment did not show a quality
+gain and is not evidence for the unrun adaptive-keyframe workflow.
+
+## Planned controlled A/B
+
+The next experiment must use a newly validated contract-v2 segment and the
+current sealed frontend:
+
+1. `gpu` versus `cpu_reference` features with every frame retained;
+2. pose-only `all`, `dense`, `balanced`, and `sparse` keyframe arms;
+3. Global primary and incremental fallback/control from verified snapshots;
+4. 100% all-frame stereo registration and no georegistration regression;
+5. pose/rendering proxies to select one candidate; and
+6. GS only for the baseline and selected candidate.
+
+The acceptance target is a material pose-runtime reduction, no structural or
+georeferencing regression, and no more than 0.2--0.3 dB masked-PSNR loss.
+Those outcomes remain hypotheses until the real A/B completes.
+
+## Scientific scope
+
+Global Mapper is an efficient backend, not the paper contribution by itself.
+The current implementation establishes clean evidence boundaries and a fair
+way to measure mapper/keyframe choices. Covariance-weighted RTK factors inside
+local BA, RTK-anchored submaps, CitrusFarm support, and rendering-quality
+experiments belong to later Phases 5--7 and are not implemented here.

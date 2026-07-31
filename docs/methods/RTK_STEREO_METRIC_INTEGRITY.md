@@ -5,15 +5,14 @@ trajectory against a primary RTK position antenna and the complete
 primary-to-secondary dual-antenna vector. It does not run COLMAP, Gaussian
 training, depth, or cloud generation, and it does not publish camera poses.
 
-Run it explicitly:
+This page records the already-completed v1 diagnostic experiment. Phase 1
+moved its implementation to the optional `diagnostics/` package and removed
+the old `rtk_splat.cli` compatibility path. There is therefore no active
+command that silently reruns this historical audit against a contract-v2
+segment. A future calibration experiment must get its own explicit v2
+diagnostic entry point and a new artifact name.
 
-```bash
-python3 -m rtk_splat.cli integrity-audit \
-  --config configs/reproductions/headland_stereo_ba.yaml
-```
-
-It is deliberately absent from the `all` stage. Outputs are written
-atomically to:
+The accepted historical output was written atomically to:
 
 ```text
 segment/calibration_artifacts/<calibration.output_artifact>/

@@ -626,7 +626,9 @@ def run_integrity_audit(segment_dir: Path, cfg) -> tuple[Path, dict]:
         relpos=str(cfg.topics.relpos),
         moving_base_pvt=audit.moving_base_pvt_topic,
     )
-    typestore = build_calibration_typestore(cfg.paths.ublox_msgs_dir)
+    typestore = build_calibration_typestore(
+        Path(cfg.paths.ublox_msgs_dir).expanduser()
+    )
     print(
         "integrity audit: bounded bag pass for exact stereo/RTK evidence",
         flush=True)

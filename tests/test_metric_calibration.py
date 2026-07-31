@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from rtk_splat.metric_calibration import (
+from diagnostics.metric_calibration import (
     CalibrationData,
     CalibrationProblem,
     LocalWgs84Enu,

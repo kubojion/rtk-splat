@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "migration": "headland-v1-to-contract-v2",
+  "recorded_at": "2026-07-31T12:34:43+02:00",
+  "source": "/home/jion_kubo/agromap4d_work/field_turn/segment",
+  "destination": "/home/jion_kubo/agromap4d_work/field_turn_contract_v2_normalized/segment",
+  "source_modified": false,
+  "publication": {
+    "mode": "atomic-new-directory",
+    "images": "directory-symlink-to-source",
+    "depth": "directory-symlink-to-source",
+    "jpeg_copies": 0
+  },
+  "observed_resources": {
+    "elapsed_seconds": 2.85,
+    "maximum_rss_mb": 66.5
+  },
+  "validation": {
+    "contract_version": 2,
+    "n_frames": 1344,
+    "split_counts": {
+      "train": 1176,
+      "val": 168,
+      "test": 0
+    },
+    "frame_timestamps": "strictly-increasing-int64-nanoseconds",
+    "raw_gnss_samples": 2273,
+    "raw_heading_samples": 2273,
+    "maximum_gnss_association_residual_ms": 119.102216,
+    "maximum_heading_association_residual_ms": 139.339462,
+    "fix_status_values": [
+      1
+    ],
+    "position_carrier_status_values": [
+      2
+    ],
+    "position_quality_values": [
+      "rtk_fixed"
+    ],
+    "valid_position_frames": 1344,
+    "valid_heading_frames": 1344,
+    "camera_frame_id": "zed_left_optical",
+    "extrinsic_translation_sigma_frame_id": "zed_left_optical",
+    "stereo_baseline_m": 0.11984625036568344,
+    "capabilities": {
+      "stereo": true,
+      "rgbd": false,
+      "single_rtk": false,
+      "dual_rtk": true,
+      "depth_recorded": false,
+      "depth_computed": true,
+      "imu_present": false,
+      "images_raw": false,
+      "images_rectified": true
+    }
+  },
+  "compact_file_sha256": {
+    "frames.npz": "80b7247463ac31efd1176f75ba756e9cf45f6ce2c6571f9c24c930873facefc9",
+    "calibration.json": "e8963e5354d922ba9c5dad54418a59404fb4b985156382886f7757fa534a22f0",
+    "segment_meta.json": "12a2dbdfe52572912aed4b411da3257a0880b85ae6cf954e6b16db72bf08415a",
+    "manifest.json": "6e4ca9eef73212aa84e3296f2c60d2bf5dbdcd04fee6d84560479fae9e7a39de",
+    "observations/gnss.npz": "c7aa1ee2b303f20fbdbf275431278cd76171b741dd8330d24ac1344cb6e79bbb",
+    "observations/heading.npz": "8fa320f3212b6d790fb841452a9b8d37f99fc65f6cccac72709a578f35411c91"
+  }
+}

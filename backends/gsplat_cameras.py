@@ -84,11 +84,16 @@ class ExposureAdjust(torch.nn.Module):
         self.raw.weight -= self.raw.weight.mean(dim=0, keepdim=True)
 
 
-def right_c2w(c2w_left: torch.Tensor, baseline_m: float) -> torch.Tensor:
-    """Rectified right eye sits at +baseline along the left OPTICAL x axis."""
-    shift = torch.eye(4, device=c2w_left.device, dtype=c2w_left.dtype)
-    shift[0, 3] = baseline_m
-    return c2w_left @ shift
+def right_c2w(
+    c2w_left: torch.Tensor, right_from_left: torch.Tensor
+) -> torch.Tensor:
+    """Apply the calibrated right-from-left rigid transform to a world pose."""
+    transform = torch.as_tensor(
+        right_from_left, device=c2w_left.device, dtype=c2w_left.dtype
+    )
+    if transform.shape != (4, 4):
+        raise ValueError("right_from_left must have shape (4, 4)")
+    return c2w_left @ torch.linalg.inv(transform)
 
 
 @torch.no_grad()

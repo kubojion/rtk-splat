@@ -2,61 +2,97 @@
 
 RTK-Splat is an offline research pipeline for georeferenced 3D Gaussian
 Splatting from calibrated stereo imagery and an external metric position
-source.
+source. The mapping core is dataset-neutral: adapters publish one immutable
+contract-v2 segment, a sealed visual frontend is reused by independent pose
+backends, and Gaussian training consumes an explicitly named pose artifact.
 
-The current reference method uses stereo visual bundle adjustment for locally
-consistent camera poses and RTK-GNSS for the global geographic anchor. It uses
-neither LiDAR nor an IMU. IMU tilt and dual-antenna heading are optional pose
-inputs, not assumptions of the Gaussian mapper.
+LiDAR and IMU are not required. IMU evidence and dual-antenna heading are
+optional contract capabilities; the current headland reference uses stereo
+images and RTK-GNSS.
 
-## Current result
+## What is measured and what is new
 
-The July 2026 headland experiment registered all 1,344 stereo frames and
-improved masked PSNR from 20.610 dB with raw RTK poses to 24.445 dB with
-stereo-BA poses.
+Two July 2026 headland results are frozen as golden history.
 
-| Metric | Raw RTK poses | Stereo-BA poses |
+| Metric | Raw RTK poses | Incremental stereo BA |
 |---|---:|---:|
-| Masked PSNR | 20.610 | **24.445** |
-| Color-corrected masked PSNR | 21.152 | **25.848** |
-| SSIM | 0.321 | **0.594** |
-| Color-corrected LPIPS | 0.533 | **0.319** |
+| Masked PSNR | 20.6097 | **24.4449** |
+| Corrected masked PSNR | 21.1519 | **25.8480** |
+| SSIM | 0.3209 | **0.5944** |
+| Corrected LPIPS | 0.5333 | **0.3187** |
 
-This establishes a large reconstruction-quality improvement on one difficult
-headland sequence. It does not yet establish survey-grade absolute accuracy,
-cross-dataset generalization, or state of the art.
+The reduced Global Mapper control then retained every frame and matched the
+incremental GS quality while reducing the historical mapper stage from about
+581 minutes to 18.1 minutes:
 
-See [PROGRESS.md](PROGRESS.md) for the exact status and
-[the golden manifest](docs/experiments/golden/headland_stereo_ba.json) for
-machine-readable provenance.
+| Metric | Incremental stereo BA | Reduced Global Mapper | Difference |
+|---|---:|---:|---:|
+| Masked PSNR | 24.4449 | 24.4583 | +0.0134 dB |
+| Corrected masked PSNR | 25.8480 | 25.8418 | -0.0062 dB |
+| SSIM | 0.5944 | 0.5904 | -0.0040 |
+| LPIPS | 0.3232 | 0.3227 | -0.0005 |
+
+These are results on one 1,344-frame headland sequence, not evidence of
+cross-dataset generalization or state of the art. Exact hashes, unrounded
+metrics, environment records, and provenance are in
+[the golden manifests](docs/experiments/golden/).
+
+The current repository has since implemented and unit-tested a cleaner
+contract-v2 path:
+
+- Phase 0: the two measured golden results are frozen and regression checked.
+- Phase 1: contract v2, isolated adapters, adapter conformance tests, two-level
+  robot/sequence configuration, and the one-time v1 migration utility are
+  implemented.
+- Phase 2: independent target-based stereo calibration was deliberately
+  skipped.
+- Phase 3: a sealed mapper-neutral COLMAP frontend and isolated Global or
+  incremental backends are implemented.
+- Phase 4: adaptive solve keyframes and RTK-guided bounded matching are
+  implemented.
+
+The normalized 1,344-frame headland contract-v2 migration is complete and
+hash-recorded. Phases 3 and 4 are prepared and covered by synthetic/unit tests,
+but the GPU-versus-CPU feature A/B and the
+all/dense/balanced/sparse keyframe A/B have not yet been run through COLMAP and
+GS from that segment. Do not confuse the historical Global result above with
+validation of the new frontend.
+RTK-anchored submaps, CitrusFarm support, and rendering-quality experiments
+(Phases 5--7) remain out of scope for this implementation.
 
 ## Architecture
 
 ```text
-dataset adapter
-    ↓
-canonical stereo segment
-    ↓
-explicit pose artifact
-    ↓
-depth + metric initialization cloud
-    ↓
-Gaussian training + evaluation
+dataset-specific source
+        ↓  adapter
+immutable contract-v2 segment
+        ↓
+sealed frontend: symlinked images + rig + features + verified matches + priors
+        ↓                         ↓
+Global Mapper (primary)      incremental mapper (fallback/reference)
+        └──────────────┬──────────┘
+                       ↓  image_registrator adds every non-keyframe
+fixed-scale ENU pose artifact
+        ↓
+pose-matched cloud → GS train → evaluate
 ```
 
-The boundary is deliberate:
+The core package under `rtk_splat/` imports no ROS, bag, dataset, backend, or
+workflow module. ROS 2 ZED/u-blox and AgriGS are adapters under `adapters/`.
+CitrusFarm is not supported until a ROS 1/split-bag adapter passes the same
+contract tests.
 
-- Adapters translate ROS bags, folders, or published datasets into one
-  canonical segment.
-- Pose backends create named, immutable pose artifacts.
-- The mapping core consumes images, calibration, poses, depth, and manifests.
-  It does not need ROS topic names, u-blox messages, or one robot's TF.
-- Audits diagnose calibration and metric integrity but never silently modify
-  normal training.
+RTK use is intentionally explicit. Covariance, status, timestamps, and
+optional full dual-antenna baselines are preserved in contract v2. Trusted
+Cartesian camera-centre priors are inserted into the reusable frontend
+database and retained as evidence. The current `global_mapper` solve itself is
+visual: it does **not** optimize RTK residual factors in Global Mapper bundle
+adjustment. After visual solving and all-frame registration, the exporter fits
+the fixed-scale SE(3) alignment on alternating contiguous calibration blocks
+and gates georeferencing on untouched temporal blocks. A Sim(3) scale is fit
+on calibration blocks only, reported as a diagnostic, and never applied.
 
-The existing ROS 2/u-blox reader and AgriGS importer are adapters. CitrusFarm
-support is not claimed until its adapter and contract tests are implemented.
-The exact interface is in
+See [PIPELINE.md](docs/architecture/PIPELINE.md) and
 [DATA_CONTRACT.md](docs/architecture/DATA_CONTRACT.md).
 
 ## Install
@@ -67,144 +103,186 @@ Install the CPU-side pipeline and tests:
 python -m pip install -e '.[test,diagnostics]'
 ```
 
-Training additionally requires a CUDA-compatible PyTorch and gsplat build:
+ROS 2 bag ingestion is optional:
+
+```bash
+python -m pip install -e '.[ros2]'
+```
+
+Training additionally requires a compatible CUDA, PyTorch, and gsplat setup:
 
 ```bash
 python -m pip install -e '.[gpu]'
 ```
 
-CUDA/PyTorch/gsplat compatibility is platform-specific. The observed golden
-environment is recorded in the golden manifest; the repository does not
-pretend that one generic `pip` command reproduces those binaries exactly.
+The observed golden environment is recorded separately. A generic `pip`
+command cannot guarantee the same CUDA/COLMAP binaries.
 
-## Commands
+## Workflow commands
 
-Every command requires an explicit configuration:
-
-```bash
-python -m rtk_splat.cli -h
-python -m rtk_splat.cli all \
-  --config configs/reproductions/field_row_rtk.yaml
-```
-
-`all` runs selection, extraction, SGBM depth, cloud construction, and GS
-training. It does not invoke COLMAP or the metric-integrity audit.
-
-Check the headland stereo-BA reproduction without writing anything:
+There is no `all` command. Long stages are explicit, independently rerunnable,
+and write separate artifacts. Every invocation requires a configuration:
 
 ```bash
-scripts/reproduce/headland_stereo_ba.sh --check \
-  --python /path/to/rtk-splat/python \
-  --colmap /path/to/colmap
+rtk-splat -h
+rtk-splat validate --config configs/sequences/headland.example.yaml
 ```
 
-The full script chooses new artifact names by default and refuses to overwrite
-an existing pose artifact or GS run. It expects selection, extraction, and
-depth to be complete already.
+From a source checkout, `python -m workflows.cli` is equivalent to the
+installed `rtk-splat` entry point.
 
-Run the guarded Global Mapper A/B from the completed stereo front end:
+For a new source recording, publish and validate a new immutable segment:
 
 ```bash
-scripts/reproduce/headland_global_mapper.sh --check \
-  --python /path/to/rtk-splat/python \
-  --colmap /path/to/colmap-4.1.1
+rtk-splat ingest \
+  --config configs/sequences/headland.example.yaml \
+  --expected-frames 1344
 
-scripts/reproduce/headland_global_mapper.sh \
-  --python /path/to/rtk-splat/python \
-  --colmap /path/to/colmap-4.1.1
-
-# Only after reviewing the pose result:
-scripts/reproduce/headland_global_mapper.sh --resume --with-gs \
-  --python /path/to/rtk-splat/python \
-  --colmap /path/to/colmap-4.1.1
+rtk-splat validate \
+  --config configs/sequences/headland.example.yaml \
+  --expected-frames 1344
 ```
 
-This copies the cached feature/match database into a new artifact, holds the
-stereo calibration fixed, monitors memory, and uses fixed-scale metric
-georegistration. The default stops after pose validation; `--with-gs` proceeds
-to the full exploratory GS arm only if all integrity gates pass. See
-[GLOBAL_MAPPER_BACKEND.md](docs/methods/GLOBAL_MAPPER_BACKEND.md).
-
-For the unattended 65,000-iteration GS evaluation of the complete extracted
-headland-turn segment, first run its read-only check:
+If the source segment has no usable depth, derive SGBM depth into a **new**
+immutable contract-v2 segment. The source images are symlinked and the source
+segment is never modified:
 
 ```bash
-scripts/reproduce/headland_global_gs_overnight.sh --check
-scripts/reproduce/headland_global_gs_overnight.sh
+rtk-splat depth \
+  --config configs/sequences/headland.example.yaml \
+  --derived-segment /new/experiment/segments/headland-sgbm
 ```
 
-The second command waits for an already active protected pose solve, but never
-starts or retries COLMAP itself. It verifies all 1,344 stereo/depth inputs, AC
-power, host memory, disk, CUDA/VRAM idleness, the accepted pose artifact, and
-final training outputs. Expect roughly 4--5 hours: COLMAP is already complete.
-Run it inside `tmux` or keep the terminal open because training has no mid-run
-checkpoint. This is the 450-second headland-turn experiment, not the separate
-77-minute full-field bag. The GS arm intentionally uses the same left-RGB
-training protocol as the prior run; both cameras still constrain stereo depth
-and SfM.
-
-Verify the existing golden artifacts without rerunning COLMAP or GS:
+Point the following experiment configuration (or `--segment`) at that derived
+segment. If a validated v2 segment with suitable depth already exists, this
+stage is unnecessary. Then build one frontend foundation and run each COLMAP
+stage:
 
 ```bash
-python -m rtk_splat.verify_golden
+rtk-splat frontend-build \
+  --config configs/sequences/headland.example.yaml \
+  --frontend-name balanced-gpu \
+  --keyframe-preset balanced
+
+rtk-splat frontend-features \
+  --config configs/sequences/headland.example.yaml \
+  --frontend-name balanced-gpu \
+  --feature-profile gpu
+
+rtk-splat frontend-rig \
+  --config configs/sequences/headland.example.yaml \
+  --frontend-name balanced-gpu
+
+rtk-splat frontend-priors \
+  --config configs/sequences/headland.example.yaml \
+  --frontend-name balanced-gpu
+
+rtk-splat frontend-match \
+  --config configs/sequences/headland.example.yaml \
+  --frontend-name balanced-gpu
 ```
 
-For a new nondeterministic reproduction, apply the quality gates:
+The same sealed frontend can feed separate backend artifacts without
+recomputing features or matches:
 
 ```bash
-python -m rtk_splat.verify_golden \
-  --mode acceptance \
-  --workdir /path/to/workdir \
-  --pose-artifact colmap_stereo_repro \
-  --run headland_stereo_ba_repro
+rtk-splat backend-prepare \
+  --config configs/sequences/headland.example.yaml \
+  --frontend-name balanced-gpu \
+  --backend global \
+  --backend-name balanced-gpu-global
+
+rtk-splat backend-solve \
+  --config configs/sequences/headland.example.yaml \
+  --backend-name balanced-gpu-global
+
+rtk-splat backend-register \
+  --config configs/sequences/headland.example.yaml \
+  --backend-name balanced-gpu-global
+
+rtk-splat backend-quality \
+  --config configs/sequences/headland.example.yaml \
+  --backend-name balanced-gpu-global
+
+rtk-splat backend-export \
+  --config configs/sequences/headland.example.yaml \
+  --backend-name balanced-gpu-global \
+  --pose-name balanced-gpu-global
 ```
+
+Use `--backend incremental` and a different backend name for the fallback or
+reference arm. Backend export refuses an existing destination and publishes
+all-frame OpenCV view matrices, ENU camera centres, exact frame IDs and
+timestamps, alignment diagnostics, quality gates, and provenance under
+`<workdir>/pose_artifacts/<pose-name>/`.
+
+Cloud construction and training remain explicit:
+
+```bash
+rtk-splat cloud \
+  --config configs/sequences/headland.example.yaml \
+  --pose-name balanced-gpu-global
+
+rtk-splat train \
+  --config configs/sequences/headland.example.yaml \
+  --pose-name balanced-gpu-global \
+  --run-name balanced-gpu-global-15k \
+  --train-iters 15000
+```
+
+Do pose-only comparisons first. A short 15,000-iteration GS proxy should be run
+only after an arm passes registration, reprojection, RTK, and scale gates; one
+full 65,000-iteration run is reserved for the selected arm.
+
+Verify the historical golden artifacts without rerunning COLMAP or GS:
+
+```bash
+rtk-splat-verify
+```
+
+## Migration status
+
+`adapters.migrate_v1_to_v2` is a non-destructive, fail-closed
+one-time converter for the validated legacy headland layout. It preserves full
+timestamps, GNSS covariance/status, and dual-antenna evidence while symlinking
+bulk image/depth data. There is no v1 reader in the mapping core.
+
+The strict normalized migration was validated at
+`~/agromap4d_work/field_turn_contract_v2_normalized/segment`: 1,344/1,344
+position and heading rows are valid RTK-fixed observations, raw GNSS and
+heading streams each retain 2,273 samples, and the 1,176/168/0 split is
+unchanged. Images and computed depth are directory symlinks to the untouched
+source segment. Exact output hashes, association residuals, capabilities,
+runtime, and memory are recorded in
+[the migration receipt](docs/experiments/migrations/headland_contract_v2.json).
+This proves the conversion/contract boundary, not the unrun COLMAP or GS A/B.
 
 ## Repository layout
 
 ```text
-rtk_splat/                 Python package
-tests/                     lightweight and synthetic tests
-configs/reproductions/     machine-specific experiment records
-configs/benchmarks/        external-method/dataset configurations
-configs/environments/      environment descriptions
-scripts/reproduce/         guarded long-run entry points
-docs/architecture/         current contracts and design
-docs/methods/              current method notes
-docs/experiments/          result records and golden manifests
-docs/archive/              superseded research snapshots
+rtk_splat/                 small dataset-neutral core
+adapters/                  ROS/dataset ingestion and one-time migration
+frontends/                 keyframes, pair graph, sealed COLMAP frontend
+backends/                  Global/incremental mapping and gsplat
+workflows/                 explicit command-line orchestration
+tests/                     contract, isolation, geometry, and dry-run tests
+configs/robots/             stable platform facts
+configs/sequences/          per-recording facts
+configs/reproductions/      frozen historical experiment records
+docs/experiments/golden/    accepted metrics and hashes
 ```
 
-Only the reproduction configs contain local paths. They are experiment records,
-not hidden defaults. The CLI has no machine-specific default config.
+## Current limitations
 
-## Safety and reproducibility
+- Validation views participated in the historical SfM pose estimation.
+- The headland sequence has no independent survey-grade camera trajectory.
+- The new sealed frontend and adaptive-keyframe path still need controlled
+  real-data runtime, pose, and GS A/B results.
+- Global Mapper is visual; RTK factors inside local/global BA are not
+  implemented.
+- Full-field bounded submaps and cross-session merging are not implemented.
+- CitrusFarm/ROS 1 split-bag ingestion is not implemented.
+- Right-camera GS photometric supervision and learned stereo depth are not
+  validated.
 
-- Source datasets are read-only.
-- Long and optional stages are explicit.
-- Refined poses and their initialization clouds are isolated by artifact name.
-- The calibration audit is excluded from `all`, cloud building, and training.
-- Existing long-run outputs are not overwritten by the canonical script.
-- Generated bags, databases, arrays, checkpoints, logs, and splats are ignored
-  by Git.
-- Published results must record code state, config, split, pose fingerprint,
-  metrics, and environment.
-
-## Known limitations
-
-- The reference evaluation images participated in SfM pose estimation. Their
-  RGB and depth were excluded from GS training and cloud initialization, but
-  this is reconstruction evaluation rather than frozen-map localization.
-- There is no independent survey-grade camera trajectory for the headland run.
-- Incremental COLMAP took about 581 minutes for mapping and is not suitable for
-  the complete 77-minute recording without chunking or a faster backend.
-- The Global Mapper backend is an experimental controlled A/B. It reuses the
-  same visual front end and does not yet add RTK factors inside bundle
-  adjustment.
-- GS supervision is currently primarily left-camera RGB. Both cameras constrain
-  stereo geometry and COLMAP, but dual-camera GS supervision is not yet a
-  validated improvement.
-- SGBM is the only built-in depth backend. Other depth methods must first be
-  implemented and benchmarked rather than selected by an unused config label.
-- Current ROS ingestion still has dataset-specific synchronization assumptions.
-
-Historical plans under `docs/archive/` are provenance, not current guidance.
+See [PROGRESS.md](PROGRESS.md) for the detailed evidence and next experiment.

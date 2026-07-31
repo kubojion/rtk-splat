@@ -37,10 +37,16 @@ from gsplat.exporter import export_splats
 from gsplat.strategy import MCMCStrategy
 from torchmetrics.functional import structural_similarity_index_measure as tm_ssim
 
-from .cameras import ExposureAdjust, PoseAdjust, align_eval_pose, right_c2w
-from .pose_artifacts import (cloud_path, load_pose_artifact,
-                             pose_artifact_name, pose_fingerprint,
-                             verify_cloud_matches_poses)
+from .gsplat_cameras import (
+    ExposureAdjust,
+    PoseAdjust,
+    align_eval_pose,
+    right_c2w,
+)
+from rtk_splat.pose_artifacts import (cloud_path, load_pose_artifact,
+                                      pose_artifact_name, pose_fingerprint,
+                                      verify_cloud_matches_poses)
+from rtk_splat.segment import SegmentReader
 
 _LPIPS = None
 
@@ -101,21 +107,39 @@ def _masked_lpips(rgb, rgb_gt, sup, device):
     return float(_lpips_model(device)(a.clamp(0, 1), b.clamp(0, 1)))
 
 
-def _load_frame(seg_dir: Path, idx: int, dilate_px: int, device, side="L"):
+def _load_frame(
+    seg_dir: Path,
+    frames: dict[str, np.ndarray],
+    idx: int,
+    dilate_px: int,
+    device,
+    side="L",
+):
     """(rgb, depth, valid, supervise_mask) for one view of pair `idx`.
 
     The mask comes from LEFT stereo validity; for right views it is reused
     (boundary error ~ disparity << mask scale -- it only excludes large
     sky/far regions). Depth tensors are meaningful for left views only.
     """
-    name = "left" if side == "L" else "right"
-    img = cv2.imread(str(seg_dir / "images" / f"{name}_{idx:06d}.jpg"))
+    image_field = "left_image_path" if side == "L" else "right_image_path"
+    if image_field not in frames:
+        raise RuntimeError(f"segment has no {image_field} for {side}-camera view")
+    image_path = seg_dir / str(frames[image_field][idx])
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise RuntimeError(f"cannot read training image: {image_path}")
     rgb = torch.from_numpy(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).float() / 255.0
-    dz = np.load(seg_dir / "depth" / f"{idx:06d}.npz")
-    valid_np = dz["valid"]
+    if "depth_path" not in frames or not str(frames["depth_path"][idx]):
+        raise RuntimeError(
+            "GS training needs recorded or computed depth declared in frames.npz"
+        )
+    depth_path = seg_dir / str(frames["depth_path"][idx])
+    with np.load(depth_path, allow_pickle=False) as archive:
+        valid_np = np.asarray(archive["valid"], dtype=bool)
+        depth_np = np.asarray(archive["depth"], dtype=np.float32)
     kernel = np.ones((dilate_px, dilate_px), np.uint8)
     supervise_np = cv2.dilate(valid_np.astype(np.uint8), kernel).astype(bool)
-    depth = torch.from_numpy(dz["depth"].astype(np.float32))
+    depth = torch.from_numpy(depth_np)
     return (rgb.to(device), depth.to(device),
             torch.from_numpy(valid_np).to(device),
             torch.from_numpy(supervise_np).to(device))
@@ -203,11 +227,13 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    meta = json.loads((seg_dir / "segment_meta.json").read_text())
-    intr = meta["intrinsics"]
-    width, height = intr["width"], intr["height"]
-    k_mat = torch.tensor([[intr["fx"], 0, intr["cx"]],
-                          [0, intr["fy"], intr["cy"]],
+    segment = SegmentReader(seg_dir).validate()
+    frames = segment.frames
+    left_camera = segment.calibration["cameras"]["left"]
+    intr = np.asarray(left_camera["K"], dtype=np.float64)
+    width, height = int(left_camera["width"]), int(left_camera["height"])
+    k_mat = torch.tensor([[intr[0, 0], 0, intr[0, 2]],
+                          [0, intr[1, 1], intr[1, 2]],
                           [0, 0, 1]], dtype=torch.float32, device=device)
     viewmats_np, _ = load_pose_artifact(seg_dir, cfg)
     viewmats = torch.tensor(viewmats_np,
@@ -215,12 +241,14 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     c2ws = torch.linalg.inv(viewmats)
 
     n_pairs = len(viewmats)
-    from .manifest import load_or_create_manifest
-    manifest = load_or_create_manifest(seg_dir, cfg.train.holdout_every)
+    from rtk_splat.manifest import load_manifest
+    manifest = load_manifest(seg_dir)
     train_pairs = manifest["train"]
     eval_ids = manifest["val"]
     train_views = [(i, "L") for i in train_pairs]
     if cfg.train.use_right_camera:
+        if not segment.meta["capabilities"]["stereo"]:
+            raise RuntimeError("right-camera supervision requires a stereo segment")
         train_views += [(i, "R") for i in train_pairs]
 
     init_cloud = cloud_path(seg_dir, cfg)
@@ -284,7 +312,12 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
         "pose_fingerprint": pose_fingerprint(viewmats_np),
         "initial_cloud_sha256": _sha256_file(init_cloud),
         "manifest_sha256": _sha256_file(seg_dir / "manifest.json"),
+        "frames_sha256": _sha256_file(seg_dir / "frames.npz"),
+        "calibration_sha256": _sha256_file(seg_dir / "calibration.json"),
         "segment_meta_sha256": _sha256_file(seg_dir / "segment_meta.json"),
+        "training_image_presentations": int(cfg.train.iterations),
+        "available_training_views": len(train_views),
+        "all_segment_frames_retain_poses": len(viewmats_np),
         "training_implementation_sha256": _sha256_file(Path(__file__)),
         "effective_training_config": config_snapshot,
         "effective_training_config_sha256": config_snapshot_sha256,
@@ -298,21 +331,27 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     order = []
     history = []
     dilate = int(cfg.train.mask_dilate_px)
-    baseline = float(cfg.pose.baseline_m)
+    stereo_transform = np.asarray(
+        segment.calibration.get("T_right_left", np.eye(4)), dtype=np.float64
+    )
+    right_from_left = torch.tensor(
+        stereo_transform, dtype=torch.float32, device=device
+    )
 
     for step in range(cfg.train.iterations):
         if not order:
             order = [train_views[j] for j in rng.permutation(len(train_views))]
         pair, side = order.pop()
-        rgb_gt, depth_gt, valid, sup = _load_frame(seg_dir, pair, dilate,
-                                                   device, side)
+        rgb_gt, depth_gt, valid, sup = _load_frame(
+            seg_dir, frames, pair, dilate, device, side
+        )
 
         c2w = c2ws[pair]
         if pose_adj is not None and step >= po.start_iter:
             pid = torch.tensor([pair], device=device)
             c2w = pose_adj(c2w[None], pid)[0]
         if side == "R":
-            c2w = right_c2w(c2w, baseline)
+            c2w = right_c2w(c2w, right_from_left)
         out, _, info = render(params, torch.linalg.inv(c2w), k_mat,
                               width, height, cfg.train.sh_degree,
                               cfg.train.rasterize_mode)
@@ -373,8 +412,21 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
 
         if (step + 1) % cfg.train.eval_every == 0 or step == cfg.train.iterations - 1:
             final = step == cfg.train.iterations - 1
-            metrics = evaluate(params, c2ws, k_mat, width, height, seg_dir,
-                               run_dir, eval_ids, cfg, device, step + 1, final)
+            metrics = evaluate(
+                params,
+                c2ws,
+                k_mat,
+                width,
+                height,
+                seg_dir,
+                run_dir,
+                eval_ids,
+                cfg,
+                device,
+                step + 1,
+                final,
+                frames=frames,
+            )
             metrics.update(step=step + 1, n_gaussians=int(len(params["means"])),
                            loss=float(loss))
             history.append(metrics)
@@ -422,7 +474,7 @@ def export_pruned(params, run_dir: Path, cfg, seg_dir: Path = None):
 
 
 def evaluate(params, c2ws, k_mat, width, height, seg_dir, run_dir,
-             eval_ids, cfg, device, step, final=False):
+             eval_ids, cfg, device, step, final=False, *, frames=None):
     """LEFT-only held-out metrics with RAW given poses (comparable across all
     configurations). On the final call, additionally reports the test-time
     pose-ALIGNED masked PSNR (the honest number when training refined poses;
@@ -434,8 +486,12 @@ def evaluate(params, c2ws, k_mat, width, height, seg_dir, run_dir,
     do_align = final and int(cfg.train.eval_pose_align_steps) > 0
     if do_align:
         frozen = {k: v.detach() for k, v in params.items()}
+    if frames is None:
+        frames = SegmentReader(seg_dir).frames
     for i in eval_ids:
-        rgb_gt, _, _, sup = _load_frame(seg_dir, i, dilate, device)
+        rgb_gt, _, _, sup = _load_frame(
+            seg_dir, frames, i, dilate, device
+        )
         with torch.no_grad():
             out, _, _ = render(params, torch.linalg.inv(c2ws[i]), k_mat,
                                width, height, cfg.train.sh_degree,

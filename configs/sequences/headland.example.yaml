@@ -1,0 +1,18 @@
+# Per-recording facts only. Stable topics and measured geometry come from the
+# named robot profile in ../robots.
+robot: zed_dual_rtk.example
+
+paths:
+  bags:
+    - ~/bags/headland_recording
+  workdir: ~/agromap4d_work/headland_recording
+
+segment:
+  window_s: [2750.0, 3200.0]
+  frame_stride: 5
+  validation_every: 8
+  stereo_tolerance_s: 0.02
+  association_tolerance_s: 0.15
+
+train:
+  run_name: headland_recording

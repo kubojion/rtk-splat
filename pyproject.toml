@@ -13,11 +13,11 @@ dependencies = [
   "opencv-python-headless>=4.8",
   "pymap3d>=3.0",
   "PyYAML>=6.0",
-  "rosbags>=0.10",
   "scipy>=1.10",
 ]
 
 [project.optional-dependencies]
+ros2 = ["rosbags>=0.10"]
 gpu = [
   "gsplat>=1.5",
   "torch>=2.4",
@@ -27,11 +27,18 @@ diagnostics = ["matplotlib>=3.7"]
 test = ["pytest>=7.4"]
 
 [project.scripts]
-rtk-splat = "rtk_splat.cli:main"
+rtk-splat = "workflows.cli:main"
 rtk-splat-verify = "rtk_splat.verify_golden:main"
 
 [tool.setuptools.packages.find]
-include = ["rtk_splat*"]
+include = [
+  "rtk_splat*",
+  "adapters*",
+  "backends*",
+  "diagnostics*",
+  "frontends*",
+  "workflows*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

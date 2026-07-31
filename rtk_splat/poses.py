@@ -62,31 +62,79 @@ def smooth_yaw(track, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")
 
 
-def base_pose_at(track, yaw_smoothed: np.ndarray, t: float, pose_cfg):
-    """Interpolated (base_xyz, yaw) at t, or None if unposeable.
+def antenna_pose_at(track, yaw_smoothed: np.ndarray, t: float, pose_cfg):
+    """Interpolated primary-antenna centre and yaw, or ``None``.
 
-    Mirrors crop-row `_pose_at`: both bracketing heading samples must be
-    RTK-fixed, and t must be inside both the fix and heading tracks.
+    Position/heading quality gates are applied before interpolation. The
+    returned position is the measured phase centre; no robot-specific lever
+    arm is hidden in this function.
     """
     ft, rt = track.fix_t, track.relpos_t
     if not (ft[0] <= t <= ft[-1] and rt[0] <= t <= rt[-1]):
         return None
     j = int(np.searchsorted(rt, t))
     j0, j1 = max(0, j - 1), min(len(rt) - 1, j)
-    # the smoothed yaw at j0/j1 averages window//2 raw neighbors on each side,
-    # so the RTK-fixed gate must cover that whole support, not just j0/j1
+    # The smoothed yaw at j0/j1 averages window//2 raw neighbors on each side,
+    # so its source-specific observability gate must cover the whole support.
     half = pose_cfg.yaw_smooth_window // 2
     lo = max(0, j0 - half)
     hi = min(len(rt) - 1, j1 + half)
-    if track.relpos_carr[lo:hi + 1].min() < pose_cfg.min_carr_soln:
+    heading_valid = getattr(track, "heading_valid", None)
+    if heading_valid is not None and not np.asarray(
+        heading_valid, dtype=bool
+    )[lo:hi + 1].all():
+        return None
+    heading_kind = getattr(track, "heading_quality_kind", "carrier")
+    if heading_kind == "carrier" and (
+        track.relpos_carr[lo:hi + 1].min() < pose_cfg.min_carr_soln
+    ):
+        return None
+
+    k = int(np.searchsorted(ft, t))
+    k0, k1 = max(0, k - 1), min(len(ft) - 1, k)
+    minimum_fix_status = int(getattr(pose_cfg, "minimum_navsat_status", -1))
+    if np.min(np.asarray(track.fix_status)[[k0, k1]]) < minimum_fix_status:
+        return None
+    minimum_position_carrier = int(
+        getattr(pose_cfg, "minimum_position_carrier_status", -1)
+    )
+    position_carrier = np.asarray(
+        getattr(track, "fix_carrier_status", np.full(len(ft), -1))
+    )
+    if np.min(position_carrier[[k0, k1]]) < minimum_position_carrier:
+        return None
+    maximum_covariance = float(
+        getattr(pose_cfg, "maximum_position_covariance_m2", np.inf)
+    )
+    covariance = np.asarray(
+        getattr(track, "fix_cov_max", np.full(len(ft), np.nan)),
+        dtype=float,
+    )[[k0, k1]]
+    if np.isfinite(maximum_covariance) and (
+        not np.isfinite(covariance).all()
+        or np.max(covariance) > maximum_covariance
+    ):
         return None
     yaw = float(np.interp(t, rt, yaw_smoothed))
     ant_x = float(np.interp(t, ft, track.enu_xyz[:, 0]))
     ant_y = float(np.interp(t, ft, track.enu_xyz[:, 1]))
     ant_z = float(np.interp(t, ft, track.enu_xyz[:, 2]))
-    base = np.array([ant_x - pose_cfg.antenna_forward_m * np.cos(yaw),
-                     ant_y - pose_cfg.antenna_forward_m * np.sin(yaw),
-                     ant_z])
+    return np.array([ant_x, ant_y, ant_z]), yaw
+
+
+def base_pose_at(track, yaw_smoothed: np.ndarray, t: float, pose_cfg):
+    """Legacy scalar-chain base pose retained for historical diagnostics."""
+    result = antenna_pose_at(track, yaw_smoothed, t, pose_cfg)
+    if result is None:
+        return None
+    antenna, yaw = result
+    base = antenna - np.array(
+        [
+            pose_cfg.antenna_forward_m * np.cos(yaw),
+            pose_cfg.antenna_forward_m * np.sin(yaw),
+            0.0,
+        ]
+    )
     return base, yaw
 
 
@@ -167,6 +215,71 @@ def pose_frames(track, frame_stamps, pose_cfg,
         out.append(PosedFrame(t=t, viewmat=viewmat_from(r_wc, center),
                               cam_center=center))
     return out
+
+
+def pose_frames_from_extrinsic(
+    track,
+    frame_stamps,
+    pose_cfg,
+    T_camera_primary_antenna,
+    tilts=None,
+) -> list[PosedFrame | None]:
+    """Construct camera poses from the one declared antenna-camera transform.
+
+    ``T_camera_primary_antenna`` maps coordinates in the primary-antenna
+    frame into the left optical-camera frame. The antenna frame is assumed
+    body-aligned (x forward, y left, z up); its world orientation comes from
+    the measured/derived yaw plus optional terrain tilt.
+    """
+    camera_from_antenna = np.asarray(
+        T_camera_primary_antenna, dtype=np.float64
+    )
+    if (
+        camera_from_antenna.shape != (4, 4)
+        or not np.isfinite(camera_from_antenna).all()
+        or not np.allclose(camera_from_antenna[3], [0, 0, 0, 1], atol=1e-8)
+        or not np.allclose(
+            camera_from_antenna[:3, :3].T
+            @ camera_from_antenna[:3, :3],
+            np.eye(3),
+            atol=1e-5,
+        )
+        or not np.isclose(
+            np.linalg.det(camera_from_antenna[:3, :3]), 1.0, atol=1e-5
+        )
+    ):
+        raise ValueError(
+            "T_camera_primary_antenna must be a finite rigid transform"
+        )
+    antenna_from_camera = np.linalg.inv(camera_from_antenna)
+    r_ac = antenna_from_camera[:3, :3]
+    t_ac = antenna_from_camera[:3, 3]
+    yaw_smoothed = smooth_yaw(track, pose_cfg.yaw_smooth_window)
+    output = []
+    for index, stamp in enumerate(frame_stamps):
+        measured = antenna_pose_at(track, yaw_smoothed, stamp, pose_cfg)
+        if measured is None:
+            output.append(None)
+            continue
+        antenna_center, yaw = measured
+        roll_dev, pitch_dev = (
+            tuple(tilts[index]) if tilts is not None else (0.0, 0.0)
+        )
+        r_wa = (
+            _rot_z(yaw)
+            @ _rot_y(pitch_dev)
+            @ _rot_x(roll_dev)
+        )
+        r_wc = r_wa @ r_ac
+        camera_center = antenna_center + r_wa @ t_ac
+        output.append(
+            PosedFrame(
+                t=stamp,
+                viewmat=viewmat_from(r_wc, camera_center),
+                cam_center=camera_center,
+            )
+        )
+    return output
 
 
 def tilt_deviations(imu_t: np.ndarray, imu_quat_xyzw: np.ndarray,

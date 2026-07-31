@@ -22,8 +22,13 @@ from pathlib import Path
 
 import numpy as np
 
-from .bagio import RtkTrack, build_typestore, read_rtk_track
-from .poses import LocalEnu, PosedFrame, pose_frames, viewmat_from
+from adapters.ros2_zed_ublox import (
+    RELPOS_FLAG_NAMES,
+    RtkTrack,
+    build_typestore,
+    read_rtk_track,
+)
+from rtk_splat.poses import LocalEnu, PosedFrame, pose_frames, viewmat_from
 
 
 def _attach_enu(track: RtkTrack):
@@ -58,8 +63,6 @@ class GnssCourse:
     `min_course_speed_ms` get quality 0 (course undefined when stationary).
     """
 
-    MIN_COURSE_SPEED_MS = 0.05
-
     def __init__(self, cfg, typestore):
         self.cfg = cfg
         tr = _attach_enu(read_rtk_track(cfg.paths.bags, cfg.topics, typestore,
@@ -71,9 +74,25 @@ class GnssCourse:
         ys = np.convolve(np.pad(tr.enu_xyz[:, 1], pad, "edge"), kernel, "valid")
         dx, dy = np.gradient(xs, tr.fix_t), np.gradient(ys, tr.fix_t)
         speed = np.hypot(dx, dy)
+        minimum_speed = float(
+            getattr(cfg.pose, "min_course_speed_ms", 0.05)
+        )
+        if not np.isfinite(minimum_speed) or minimum_speed <= 0:
+            raise ValueError("pose.min_course_speed_ms must be positive")
         tr.relpos_t = tr.fix_t.copy()
         tr.relpos_yaw = np.unwrap(np.arctan2(dy, dx))
-        tr.relpos_carr = np.where(speed > self.MIN_COURSE_SPEED_MS, 2, 0)
+        # Course observability is not a carrier-phase solution. Keep the
+        # carrier status unknown and gate heading with a separate boolean.
+        tr.relpos_carr = np.full(len(speed), -1, dtype=np.int8)
+        tr.heading_valid = speed >= minimum_speed
+        tr.heading_quality_kind = "course"
+        tr.relpos_header_ns = tr.fix_header_ns.copy()
+        tr.relpos_log_ns = tr.fix_log_ns.copy()
+        tr.relpos_ned_m = np.full((len(tr.fix_t), 3), np.nan)
+        tr.relpos_acc_heading_rad = np.full(len(tr.fix_t), np.nan)
+        tr.relpos_flags = np.zeros(
+            (len(tr.fix_t), len(RELPOS_FLAG_NAMES)), dtype=bool
+        )
         self.track = tr
         self.origin = tr.origin
         self.enu = tr.enu
@@ -114,7 +133,9 @@ class TrajectoryFile:
             fix_status=np.full(len(self.t), -1, dtype=int),
             fix_cov_max=np.full(len(self.t), np.nan),
             relpos_t=self.t, relpos_yaw=np.unwrap(yaw),
-            relpos_carr=np.full(len(self.t), 2))
+            relpos_carr=np.full(len(self.t), -1),
+            heading_valid=np.ones(len(self.t), dtype=bool),
+            heading_quality_kind="trajectory")
         self.track.enu_xyz = self.xyz
         self.track.origin = self.origin
 
@@ -147,6 +168,11 @@ def make_pose_source(cfg):
         raise ValueError(
             "pose.source=rtk_dual_antenna requires paths.ublox_msgs_dir"
         )
-    ublox_dir = cfg.paths.ublox_msgs_dir if with_ublox else None
-    typestore = build_typestore(ublox_dir)
+    uses_bag = name in {"rtk_dual_antenna", "gnss_course"}
+    ublox_dir = (
+        Path(cfg.paths.ublox_msgs_dir).expanduser()
+        if with_ublox
+        else None
+    )
+    typestore = build_typestore(ublox_dir) if uses_bag else None
     return typestore, _SOURCES[name](cfg, typestore)

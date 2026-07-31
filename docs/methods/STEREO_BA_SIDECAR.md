@@ -1,4 +1,10 @@
-# Calibrated stereo pose sidecar
+# Calibrated stereo pose sidecar (accepted v1 experiment)
+
+This document preserves how the accepted `tile_turn3_stereo_ba` result was
+produced. Its v1 launcher and flat CLI were deliberately retired during the
+contract-v2 migration; the commands below are historical, not runnable
+instructions. New comparisons use the sealed frontend launchers documented in
+`docs/experiments/SEALED_FRONTEND_AB.md`.
 
 This experiment replaces per-frame RTK attitude construction with locally
 consistent stereo visual bundle-adjusted poses while preserving RTK as the
@@ -33,7 +39,7 @@ conda-forge COLMAP package:
 conda env create -f configs/environments/colmap-4.1.1-cuda.yml
 ```
 
-Verify the canonical segment, tools, and tests without writing a workspace or
+The retired launcher previously verified the segment and tools without
 starting compute:
 
 ```bash
@@ -42,9 +48,9 @@ scripts/reproduce/headland_stereo_ba.sh --check \
   --colmap /path/to/colmap
 ```
 
-## Overnight A/B
+## Historical overnight A/B
 
-Keep at least 20 GB free, then run:
+The accepted run used:
 
 ```bash
 cd /home/jion_kubo/agrorob_ws/src/AgroMap-4D/rtk_splat
@@ -69,7 +75,8 @@ deliberately does not power off the machine. Its explicit stages are:
 4. `cloud`: rebuild the stereo-depth cloud in the refined pose frame.
 5. `train`: run the same 65k/2.5M settings as `tile_turn2`.
 
-Long external work is never triggered by `rtk_splat.cli all`.
+The contract-v2 CLI has no catch-all command. Long COLMAP and GS stages remain
+explicit and write new artifacts.
 
 ## Acceptance gates
 

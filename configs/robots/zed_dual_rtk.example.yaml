@@ -1,0 +1,57 @@
+# Stable robot facts. Copy this profile, give it a robot-specific name, and
+# measure the geometry for that robot rather than editing sequence files.
+adapter: ros2_zed_ublox
+
+topics:
+  left_image: /zed/zed_node/left/color/rect/image/compressed
+  right_image: /zed/zed_node/right/color/rect/image/compressed
+  left_info: /zed/zed_node/left/color/rect/camera_info
+  right_info: /zed/zed_node/right/color/rect/camera_info
+  fix: /ublox_moving_base/fix
+  pvt: /ublox_moving_base/ubx_nav_pvt
+  relpos: /ublox_rover/ubx_nav_rel_pos_ned
+  imu: /zed/zed_node/imu/data
+
+pose:
+  source: rtk_dual_antenna
+  clockcheck_topic: /gps/fix
+  time_offset_s: 0.0
+  min_carr_soln: 2
+  minimum_navsat_status: 1
+  minimum_position_carrier_status: 2
+  maximum_position_covariance_m2: 0.01
+  yaw_smooth_window: 5
+  use_imu_tilt: false
+  imu_lp_window_s: 1.0
+
+# Dataset-portable frontend defaults accept NavSat status 0 and unknown
+# carrier state. This dual-RTK robot deliberately tightens both raw-status
+# gates; a single-antenna profile can omit these overrides.
+frontend:
+  pose_priors:
+    min_fix_status: 1
+    min_carrier_status: 2
+    covariance_floor_m: 0.03
+    max_covariance_m2: 0.04
+    max_source_residual_s: 0.15
+
+# Required, explicit frame semantics for contract v2. This example reflects
+# the measured headland rig; replace every value when configuring another
+# robot. T_camera_primary_antenna maps primary-antenna coordinates into the
+# rectified left optical camera frame.
+sensor_geometry:
+  frames:
+    world: map
+    camera: zed_left_optical
+    primary_antenna: gps_moving_base_phase_center
+    secondary_antenna: gps_rover_phase_center
+  T_camera_primary_antenna:
+    - [0.002273837398, -0.999997414828, 0.0, 0.053496825042]
+    - [-0.344805866506, -0.000784034501, -0.938673691819, 2.230807314490]
+    - [0.938671265186, 0.002134391345, -0.344806757891, -2.222902965596]
+    - [0.0, 0.0, 0.0, 1.0]
+  # One-sigma x/y/z translation uncertainty in the camera optical frame.
+  extrinsic_translation_sigma_m: [0.10, 0.10, 0.10]
+  extrinsic_provenance:
+    method: rough tape measurement plus configured mount rotation
+    status: rough prior; never silently treated as calibrated

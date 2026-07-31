@@ -1,18 +1,14 @@
-"""Resolve and validate immutable pose artifacts.
-
-The original RTK poses stay at ``segment/viewmats.npy``.  A refined pose
-source lives in ``segment/pose_artifacts/<name>/`` and gets its own initial
-cloud, preventing accidental mixing of geometry built in different frames.
-"""
+"""Resolve immutable contract-v2 initial poses and named refined artifacts."""
 
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from pathlib import Path
 
 import numpy as np
+
+from .segment import SegmentReader
 
 
 _RAW_NAMES = {"", "rtk", "raw_rtk"}
@@ -30,7 +26,18 @@ def pose_artifact_name(cfg) -> str:
 
 def pose_artifact_dir(seg_dir: Path, cfg) -> Path:
     name = pose_artifact_name(cfg)
-    return seg_dir if name == "rtk" else seg_dir / "pose_artifacts" / name
+    if name == "rtk":
+        raise ValueError("raw RTK poses live in frames.npz, not a sidecar directory")
+    root = getattr(cfg.pose, "artifact_root", None)
+    if root is None:
+        paths = getattr(cfg, "paths", None)
+        workdir = getattr(paths, "workdir", None)
+        if workdir is None:
+            raise ValueError(
+                "named poses require pose.artifact_root or paths.workdir"
+            )
+        root = Path(workdir) / "pose_artifacts"
+    return Path(root).expanduser() / name
 
 
 def pose_paths(seg_dir: Path, cfg) -> tuple[Path, Path]:
@@ -39,7 +46,16 @@ def pose_paths(seg_dir: Path, cfg) -> tuple[Path, Path]:
 
 
 def cloud_path(seg_dir: Path, cfg) -> Path:
-    return pose_artifact_dir(seg_dir, cfg) / "init_cloud.npz"
+    paths = getattr(cfg, "paths", None)
+    workdir = getattr(paths, "workdir", None)
+    root = getattr(getattr(cfg, "cloud", None), "artifact_root", None)
+    if root is None:
+        if workdir is None:
+            raise ValueError(
+                "cloud artifacts require cloud.artifact_root or paths.workdir"
+            )
+        root = Path(workdir) / "cloud_artifacts"
+    return Path(root).expanduser() / pose_artifact_name(cfg) / "init_cloud.npz"
 
 
 def pose_fingerprint(viewmats: np.ndarray) -> str:
@@ -70,15 +86,43 @@ def _validate_viewmats(viewmats: np.ndarray, expected_n: int | None) -> None:
 
 def load_pose_artifact(seg_dir: Path, cfg) -> tuple[np.ndarray, np.ndarray]:
     """Return validated OpenCV world-to-camera matrices and camera centres."""
+    reader = SegmentReader(seg_dir)
+    expected_n = int(reader.meta["n_frames"])
+    if pose_artifact_name(cfg) == "rtk":
+        frames = reader.frames
+        required = {
+            "initial_viewmat",
+            "initial_camera_center_m",
+            "pose_valid",
+        }
+        if not required <= set(frames):
+            raise FileNotFoundError(
+                "contract-v2 segment has no complete initial pose triplet"
+            )
+        valid = frames["pose_valid"].astype(bool)
+        if not valid.all():
+            raise ValueError(
+                f"initial pose source covers {int(valid.sum())}/{len(valid)} frames"
+            )
+        viewmats = frames["initial_viewmat"]
+        centers = frames["initial_camera_center_m"]
+        _validate_viewmats(viewmats, expected_n)
+        derived = np.linalg.inv(viewmats)[:, :3, 3]
+        if centers.shape != (expected_n, 3) or not np.isfinite(centers).all():
+            raise ValueError("invalid contract-v2 initial camera centres")
+        if not np.allclose(centers, derived, atol=2e-4):
+            raise ValueError("initial camera centres disagree with initial poses")
+        return (
+            viewmats.astype(np.float32, copy=False),
+            centers.astype(np.float32, copy=False),
+        )
+
     view_path, center_path = pose_paths(seg_dir, cfg)
     if not view_path.exists():
         raise FileNotFoundError(
             f"pose artifact '{pose_artifact_name(cfg)}' is missing {view_path}; "
-            "run stereo-export first" if pose_artifact_name(cfg) != "rtk"
-            else f"raw RTK poses are missing: {view_path}")
-    meta_path = seg_dir / "segment_meta.json"
-    expected_n = json.loads(meta_path.read_text())["n_frames"] \
-        if meta_path.exists() else None
+            "run the selected pose backend first"
+        )
     viewmats = np.load(view_path)
     _validate_viewmats(viewmats, expected_n)
     derived = np.linalg.inv(viewmats)[:, :3, 3]
