@@ -102,6 +102,47 @@ The full script chooses new artifact names by default and refuses to overwrite
 an existing pose artifact or GS run. It expects selection, extraction, and
 depth to be complete already.
 
+Run the guarded Global Mapper A/B from the completed stereo front end:
+
+```bash
+scripts/reproduce/headland_global_mapper.sh --check \
+  --python /path/to/rtk-splat/python \
+  --colmap /path/to/colmap-4.1.1
+
+scripts/reproduce/headland_global_mapper.sh \
+  --python /path/to/rtk-splat/python \
+  --colmap /path/to/colmap-4.1.1
+
+# Only after reviewing the pose result:
+scripts/reproduce/headland_global_mapper.sh --resume --with-gs \
+  --python /path/to/rtk-splat/python \
+  --colmap /path/to/colmap-4.1.1
+```
+
+This copies the cached feature/match database into a new artifact, holds the
+stereo calibration fixed, monitors memory, and uses fixed-scale metric
+georegistration. The default stops after pose validation; `--with-gs` proceeds
+to the full exploratory GS arm only if all integrity gates pass. See
+[GLOBAL_MAPPER_BACKEND.md](docs/methods/GLOBAL_MAPPER_BACKEND.md).
+
+For the unattended 65,000-iteration GS evaluation of the complete extracted
+headland-turn segment, first run its read-only check:
+
+```bash
+scripts/reproduce/headland_global_gs_overnight.sh --check
+scripts/reproduce/headland_global_gs_overnight.sh
+```
+
+The second command waits for an already active protected pose solve, but never
+starts or retries COLMAP itself. It verifies all 1,344 stereo/depth inputs, AC
+power, host memory, disk, CUDA/VRAM idleness, the accepted pose artifact, and
+final training outputs. Expect roughly 4--5 hours: COLMAP is already complete.
+Run it inside `tmux` or keep the terminal open because training has no mid-run
+checkpoint. This is the 450-second headland-turn experiment, not the separate
+77-minute full-field bag. The GS arm intentionally uses the same left-RGB
+training protocol as the prior run; both cameras still constrain stereo depth
+and SfM.
+
 Verify the existing golden artifacts without rerunning COLMAP or GS:
 
 ```bash
@@ -156,6 +197,9 @@ not hidden defaults. The CLI has no machine-specific default config.
 - There is no independent survey-grade camera trajectory for the headland run.
 - Incremental COLMAP took about 581 minutes for mapping and is not suitable for
   the complete 77-minute recording without chunking or a faster backend.
+- The Global Mapper backend is an experimental controlled A/B. It reuses the
+  same visual front end and does not yet add RTK factors inside bundle
+  adjustment.
 - GS supervision is currently primarily left-camera RGB. Both cameras constrain
   stereo geometry and COLMAP, but dual-camera GS supervision is not yet a
   validated improvement.

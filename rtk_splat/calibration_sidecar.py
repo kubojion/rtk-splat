@@ -244,6 +244,66 @@ class AuditConfig:
         )
 
 
+@dataclass(frozen=True)
+class RawVisualSource:
+    """Backend-neutral location of one immutable raw COLMAP trajectory."""
+
+    model: Path
+    database: Path
+    initial_visual_to_enu_rotation: np.ndarray
+    backend: str
+
+
+def resolve_raw_visual_source(
+        pose_artifact: Path, quality: dict) -> RawVisualSource:
+    """Resolve raw metric inputs from a supported pose-artifact schema.
+
+    Absolute paths recorded in quality reports are treated as provenance only.
+    Resolution is relative to the artifact so copied work directories remain
+    auditable.
+    """
+    source = Path(pose_artifact)
+    if "selected_model" in quality and "alignment" in quality:
+        model_name = Path(str(quality["selected_model"])).name
+        model = source / "colmap" / "models_text" / model_name
+        database = source / "colmap" / "database.db"
+        rotation_value = quality["alignment"].get(
+            "rotation_visual_world_to_enu")
+        backend = "incremental_stereo"
+    elif "model_stats" in quality and "fixed_scale_alignment" in quality:
+        model_name = Path(str(quality["model_stats"].get("path", ""))).name
+        model = source / "global" / "models_text" / model_name
+        database = source / "global" / "database.db"
+        rotation_value = quality["fixed_scale_alignment"].get(
+            "rotation_visual_world_to_enu")
+        backend = "global_mapper"
+    else:
+        raise ValueError(
+            "pose artifact does not expose a supported raw COLMAP trajectory")
+
+    if not model_name or model_name in {".", ".."}:
+        raise ValueError("pose artifact has no selected COLMAP model name")
+    for required in (model / "frames.txt", model / "rigs.txt", database):
+        if not required.is_file():
+            raise FileNotFoundError(
+                f"required raw visual input is missing: {required}")
+
+    rotation = np.asarray(rotation_value, dtype=float)
+    if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
+        raise ValueError(
+            "pose artifact has no finite 3x3 visual-to-ENU rotation")
+    if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1.0e-6) \
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1.0e-6):
+        raise ValueError(
+            "pose artifact visual-to-ENU rotation is not a valid rotation")
+    return RawVisualSource(
+        model=model,
+        database=database,
+        initial_visual_to_enu_rotation=rotation,
+        backend=backend,
+    )
+
+
 def _nearest_indices(reference_ns: np.ndarray,
                      query_ns: np.ndarray) -> np.ndarray:
     if len(reference_ns) == 0:
@@ -521,9 +581,9 @@ def run_integrity_audit(segment_dir: Path, cfg) -> tuple[Path, dict]:
     source = seg / "pose_artifacts" / audit.source_pose_artifact
     quality_path = source / "quality.json"
     quality = json.loads(quality_path.read_text())
-    selected_model_name = Path(quality["selected_model"]).name
-    model = source / "colmap" / "models_text" / selected_model_name
-    database = source / "colmap" / "database.db"
+    raw_source = resolve_raw_visual_source(source, quality)
+    model = raw_source.model
+    database = raw_source.database
 
     immutable_paths = [
         seg / "viewmats.npy",
@@ -589,8 +649,7 @@ def run_integrity_audit(segment_dir: Path, cfg) -> tuple[Path, dict]:
         f"integrity audit: recovered {len(observations.stereo_frames)} stereo "
         f"pairs, {len(observations.fixes)} fixes, "
         f"{len(observations.relpos)} baseline vectors", flush=True)
-    initial_rotation = np.asarray(
-        quality["alignment"]["rotation_visual_world_to_enu"], dtype=float)
+    initial_rotation = raw_source.initial_visual_to_enu_rotation
     problem = CalibrationProblem(
         data, audit.rig_prior, audit.solver,
         initial_global_rotation=initial_rotation)
@@ -649,6 +708,7 @@ def run_integrity_audit(segment_dir: Path, cfg) -> tuple[Path, dict]:
         "purpose":
             "read-only RTK-stereo metric integrity and physical extrinsic audit",
         "source_pose_artifact": audit.source_pose_artifact,
+        "source_pose_backend": raw_source.backend,
         "output_artifact": audit.output_artifact,
         "selected_raw_colmap_model": str(model.resolve()),
         "raw_colmap_input":

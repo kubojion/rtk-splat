@@ -97,6 +97,50 @@ colmap:
   min_registered_fraction: 0.95
   scale_range: [0.98, 1.02]
 
+# Isolated Global Mapper A/B. These stages reuse the completed stereo front
+# end but copy its database before COLMAP opens it. They are explicit only:
+# `all`, normal cloud construction, and training never invoke this backend.
+global_mapper:
+  source_pose_artifact: colmap_stereo
+  source_workspace_subdir: colmap
+  num_threads: 8
+  random_seed: 7
+  ba_num_iterations: 3
+  # Measured reduced profile for this 30 GiB/no-swap workstation. The initial
+  # full-track attempt is preserved as colmap_global_headland_v1: Ceres reached
+  # 15.7 GiB RSS and the safety monitor stopped it below 4 GiB MemAvailable.
+  # The successful incremental model predicts that the 1000/view target stops
+  # after ~53,866 longest tracks (~6.91 M observations, versus 18.21 M), while
+  # the 60k ceiling bounds adverse datasets. The core knobs remain generic.
+  max_num_tracks: 60000
+  required_tracks_per_view: 1000
+  # COLMAP retriangulation deletes the capped tracks and rebuilds from the full
+  # correspondence graph, defeating the memory bound. Stereo depth builds the
+  # GS initialization independently, so it is intentionally disabled here.
+  skip_retriangulation: true
+  # Keep the desktop responsive and stop before the no-swap host reaches OOM.
+  process_nice: 10
+  resource_sample_interval_s: 2.0
+  minimum_available_memory_gb: 4.0
+  low_memory_consecutive_samples: 2
+  minimum_free_space_gb: 15.0
+  minimum_runtime_free_space_gb: 5.0
+  quality_gates:
+    max_reprojection_error_px: 1.0
+    min_observation_fraction: 0.90
+    min_track_length_fraction: 0.75
+    max_baseline_error_m: 0.0005
+    max_rig_rotation_error_deg: 0.02
+    max_intrinsics_error: 1.0e-8
+    min_observations_per_image: 250
+    max_rtk_median_error_m: 0.06
+    max_rtk_p95_error_m: 0.12
+    max_rtk_error_m: 0.15
+    min_alignment_inlier_fraction: 1.0
+    max_step_m: 0.08             # broad catastrophe limit; reference 0.0393 m
+    max_rotation_step_deg: 1.5   # broad catastrophe limit; reference 0.714 deg
+    reference_regression_fraction: 0.05
+
 # Explicit, diagnostic-only calibration sidecar. It is run only with
 # `python3 -m rtk_splat.cli integrity-audit`; `all`, cloud, and train ignore
 # this section. The output lives under calibration_artifacts, never under
@@ -162,6 +206,7 @@ calibration:
 
 train:
   run_name: tile_turn2
+  seed: 0                       # seeds NumPy/Torch initialization and MCMC RNG
   max_gaussians: 2500000       # budget A/B vs turn1 (1.5M); probe 2026-07-27: 3.4M peaks 2.2 GB in-step, ample 8 GB headroom
   iterations: 65000            # epoch parity with tile_e7 (1176 frames x ~57)
   ssim_lambda: 0.2

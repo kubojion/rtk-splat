@@ -46,6 +46,10 @@ Current:
 - GNSS course-derived heading.
 - External TUM camera trajectory.
 - Calibrated stereo incremental COLMAP plus geographic alignment.
+- Calibrated stereo COLMAP Global Mapper using a copied cached front end,
+  fixed-scale geographic alignment, and strict publication gates.
+- A resource-bounded Global Mapper profile that retains the complete pair graph
+  but caps longest-track global positioning and audits per-image support.
 
 Diagnostic only:
 
@@ -53,8 +57,7 @@ Diagnostic only:
 
 Planned:
 
-- COLMAP Global Mapper sidecar.
-- Reduced global BA and fixed-scale RTK anchoring.
+- RTK-constrained global BA rather than post-hoc anchoring alone.
 - RTK-anchored chunks with overlap constraints.
 - Bounded sliding-window stereo–RTK estimation after simpler backends are
   measured.

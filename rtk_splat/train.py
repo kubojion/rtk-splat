@@ -23,8 +23,10 @@ psnr_masked_aligned: held-out views re-scored after BARF-style test-time pose
 alignment, the honest metric when training refines poses.
 """
 
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 import cv2
@@ -37,9 +39,43 @@ from torchmetrics.functional import structural_similarity_index_measure as tm_ss
 
 from .cameras import ExposureAdjust, PoseAdjust, align_eval_pose, right_c2w
 from .pose_artifacts import (cloud_path, load_pose_artifact,
-                             pose_artifact_name, verify_cloud_matches_poses)
+                             pose_artifact_name, pose_fingerprint,
+                             verify_cloud_matches_poses)
 
 _LPIPS = None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _jsonable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "__dict__"):
+        return {
+            key: _jsonable(item)
+            for key, item in sorted(vars(value).items())
+        }
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _training_config_snapshot(cfg) -> tuple[dict, str]:
+    snapshot = {
+        name: _jsonable(getattr(cfg, name))
+        for name in ("pose", "depth", "cloud", "train")
+    }
+    encoded = json.dumps(
+        snapshot, sort_keys=True, separators=(",", ":")).encode()
+    return snapshot, hashlib.sha256(encoded).hexdigest()
 
 
 def _lpips_model(device):
@@ -162,6 +198,11 @@ def _masked_psnr(rgb, rgb_gt, mask):
 
 
 def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
+    seed = int(getattr(cfg.train, "seed", 0))
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     meta = json.loads((seg_dir / "segment_meta.json").read_text())
     intr = meta["intrinsics"]
     width, height = intr["width"], intr["height"]
@@ -186,6 +227,12 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     verify_cloud_matches_poses(
         init_cloud, viewmats_np,
         require_fingerprint=pose_artifact_name(cfg) != "rtk")
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"refusing to reuse existing training run: {run_dir}") from exc
+    (run_dir / "renders").mkdir()
     params = init_params(init_cloud, cfg, device)
     optimizers = make_optimizers(params, cfg)
     # Annealing (upstream practice we previously missed): stop MCMC
@@ -226,9 +273,28 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
                                      eps=1e-15,
                                      weight_decay=float(eo.weight_decay))
 
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "renders").mkdir(exist_ok=True)
-    rng = np.random.default_rng(0)
+    config_snapshot, config_snapshot_sha256 = \
+        _training_config_snapshot(cfg)
+    (run_dir / "run_provenance.json").write_text(json.dumps({
+        "schema_version": 1,
+        "train_seed": seed,
+        "iterations": int(cfg.train.iterations),
+        "max_gaussians": int(cfg.train.max_gaussians),
+        "pose_artifact": pose_artifact_name(cfg),
+        "pose_fingerprint": pose_fingerprint(viewmats_np),
+        "initial_cloud_sha256": _sha256_file(init_cloud),
+        "manifest_sha256": _sha256_file(seg_dir / "manifest.json"),
+        "segment_meta_sha256": _sha256_file(seg_dir / "segment_meta.json"),
+        "training_implementation_sha256": _sha256_file(Path(__file__)),
+        "effective_training_config": config_snapshot,
+        "effective_training_config_sha256": config_snapshot_sha256,
+        "launcher_config_sha256":
+            os.environ.get("RTK_SPLAT_CONFIG_SHA256"),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "deterministic_algorithms_forced": False,
+    }, indent=2) + "\n")
+    rng = np.random.default_rng(seed)
     order = []
     history = []
     dilate = int(cfg.train.mask_dilate_px)

@@ -8,6 +8,9 @@ Stages (each writes its artifact; each re-runs independently):
   stereo-prepare  build a calibrated, zero-copy COLMAP rig workspace
   stereo-solve    run the long stereo visual bundle adjustment
   stereo-export   robustly georegister and publish the refined pose sidecar
+  global-prepare  clone a completed stereo front end into an isolated backend
+  global-solve    run COLMAP's integrated Global Mapper with safety monitoring
+  global-export   fixed-scale georegistration and strict publication gates
   integrity-audit read-only bounded RTK/stereo TF and clock calibration audit
   cloud       fuse depth into a voxel-downsampled world-frame init cloud
   train       optimize the Gaussian tile + eval on held-out frames
@@ -17,6 +20,7 @@ Usage: python -m rtk_splat.cli <stage> --config <config.yaml>
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -313,9 +317,16 @@ def cmd_cloud(cfg):
                                  cfg.cloud.max_points)
     out = cloud_path(seg, cfg)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, xyz=pts, rgb=cols,
-                        pose_fingerprint=np.asarray(
-                            pose_fingerprint(viewmats)))
+    temporary = out.with_name(f".{out.name}.tmp-{os.getpid()}.npz")
+    try:
+        np.savez_compressed(
+            temporary, xyz=pts, rgb=cols,
+            pose_fingerprint=np.asarray(pose_fingerprint(viewmats)))
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, out)
+    finally:
+        temporary.unlink(missing_ok=True)
     lo, hi = pts.min(axis=0), pts.max(axis=0)
     print(f"init cloud [{pose_artifact_name(cfg)}]: {len(pts):,} pts, extent "
           f"{hi[0]-lo[0]:.1f} x {hi[1]-lo[1]:.1f} x "
@@ -431,6 +442,21 @@ def cmd_stereo_export(cfg):
     export(_seg_dir(cfg), cfg)
 
 
+def cmd_global_prepare(cfg):
+    from .colmap_global import prepare
+    prepare(_seg_dir(cfg), cfg)
+
+
+def cmd_global_solve(cfg):
+    from .colmap_global import solve
+    solve(_seg_dir(cfg), cfg)
+
+
+def cmd_global_export(cfg):
+    from .colmap_global import export
+    export(_seg_dir(cfg), cfg)
+
+
 def cmd_integrity_audit(cfg):
     """Explicit diagnostic stage; never part of ``all`` or normal training."""
     from .calibration_sidecar import run_integrity_audit
@@ -454,6 +480,9 @@ def main():
               "stereo-prepare": cmd_stereo_prepare,
               "stereo-solve": cmd_stereo_solve,
               "stereo-export": cmd_stereo_export,
+              "global-prepare": cmd_global_prepare,
+              "global-solve": cmd_global_solve,
+              "global-export": cmd_global_export,
               "integrity-audit": cmd_integrity_audit,
               "ingest-agrigs": cmd_ingest_agrigs}
     ap = argparse.ArgumentParser(prog="rtk_splat")
