@@ -135,10 +135,17 @@ COLMAP or GS experiment has completed.
 
 Implemented and covered by unit/synthetic tests:
 
-- The reusable `rtk_splat/` core is isolated from ROS, adapters, frontends,
+- The reusable `rtk_splat/core/` package is isolated from ROS, adapters, frontends,
   backends, diagnostics, and orchestration.
-- Dataset-specific ingestion lives under `adapters/`; the registry currently
-  supports ROS 2 ZED/u-blox and AgriGS.
+- `rtk_splat` is now the only installed top-level Python namespace. Adapters,
+  frontends, backends, workflows, and diagnostics are explicit subpackages;
+  the former collision-prone global package names no longer exist.
+- Dataset-specific ingestion lives under `rtk_splat/adapters/`; the registry
+  currently supports ROS 2 ZED/u-blox and AgriGS.
+- Calibration ROS topics, u-blox message registration, message decoding, and
+  bounded MCAP reading moved into `rtk_splat/adapters/calibration_bag.py`.
+  Diagnostics retain only plain records, numerical analysis, COLMAP parsing,
+  and artifact reporting, and import without the optional ROS stack.
 - Immutable contract-v2 segments preserve exact nanosecond timestamps, full
   GNSS covariance/status, both stereo calibrations, explicit transform
   semantics, and the complete optional dual-antenna N/E/D baseline.
@@ -225,8 +232,8 @@ it verifies real-data planning and artifact publication only.
 Phases 5--7—RTK-factor submaps, CitrusFarm support, and rendering-quality
 changes—are outside this implementation.
 
-After integration, the complete repository suite passes **152 tests**. The
-dataset-neutral core contains **1,933 lines**, below the enforced 2,000-line
+After integration, the complete repository suite passes **155 tests**. The
+dataset-neutral core contains **1,932 lines**, below the enforced 2,000-line
 budget.
 
 ## Historical Global Mapper golden result

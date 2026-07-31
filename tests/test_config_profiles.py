@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rtk_splat.configio import _deep_merge, load_config
+from rtk_splat.core.configio import _deep_merge, load_config
 
 
 class ConfigProfileTests(unittest.TestCase):

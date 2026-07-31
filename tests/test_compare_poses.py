@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from diagnostics.compare_poses import (
+from rtk_splat.diagnostics.compare_poses import (
     compare_pose_artifacts,
     write_report_noreplace,
 )

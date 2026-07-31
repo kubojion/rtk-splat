@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from rtk_splat.pose_artifacts import pose_fingerprint
-from rtk_splat.verify_golden import verify
+from rtk_splat.core.pose_artifacts import pose_fingerprint
+from rtk_splat.core.verify_golden import verify
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]

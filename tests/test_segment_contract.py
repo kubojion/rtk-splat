@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from rtk_splat.segment import (
+from rtk_splat.core.segment import (
     POSITION_QUALITY_VOCABULARY,
     SegmentContractError,
     SegmentReader,

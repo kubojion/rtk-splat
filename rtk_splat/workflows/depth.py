@@ -10,8 +10,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from rtk_splat.depth import depth_from_pair, make_sgbm
-from rtk_splat.segment import OBSERVATION_KINDS, SegmentReader, SegmentWriter
+from rtk_splat.core.depth import depth_from_pair, make_sgbm
+from rtk_splat.core.segment import OBSERVATION_KINDS, SegmentReader, SegmentWriter
 
 
 def _sha256(path: Path) -> str:

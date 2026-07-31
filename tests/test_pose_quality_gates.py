@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from rtk_splat.poses import base_pose_at, pose_frames_from_extrinsic
+from rtk_splat.core.poses import base_pose_at, pose_frames_from_extrinsic
 
 
 def _config(**overrides):

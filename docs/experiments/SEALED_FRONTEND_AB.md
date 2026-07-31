@@ -154,7 +154,8 @@ until this A/B runs. Logs record actual elapsed seconds per stage.
 The former `scripts/reproduce/headland_stereo_ba.sh`,
 `headland_global_mapper.sh`, and `headland_global_gs_overnight.sh` were removed.
 They were experiment-specific v1 launchers, called the deleted
-`rtk_splat.cli` module, and could write into historical workdirs. Their accepted
+`rtk_splat.cli` compatibility module, and could write into historical
+workdirs. Their accepted
 scientific context remains in `docs/experiments/HEADLAND_STEREO_BA.md`, the
 golden manifest, and the measured facts above; they are not valid contract-v2
 commands.

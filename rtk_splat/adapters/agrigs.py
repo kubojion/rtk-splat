@@ -26,8 +26,8 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from rtk_splat.poses import viewmat_from
-from rtk_splat.segment import (
+from rtk_splat.core.poses import viewmat_from
+from rtk_splat.core.segment import (
     CONTRACT_VERSION,
     POSITION_QUALITY_VOCABULARY,
     SegmentReader,

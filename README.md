@@ -77,8 +77,9 @@ fixed-scale ENU pose artifact
 pose-matched cloud → GS train → evaluate
 ```
 
-The core package under `rtk_splat/` imports no ROS, bag, dataset, backend, or
-workflow module. ROS 2 ZED/u-blox and AgriGS are adapters under `adapters/`.
+The core package under `rtk_splat/core/` imports no ROS, bag, dataset, backend,
+or workflow module. ROS 2 ZED/u-blox and AgriGS are adapters under
+`rtk_splat/adapters/`.
 CitrusFarm is not supported until a ROS 1/split-bag adapter passes the same
 contract tests.
 
@@ -128,7 +129,7 @@ rtk-splat -h
 rtk-splat validate --config configs/sequences/headland.example.yaml
 ```
 
-From a source checkout, `python -m workflows.cli` is equivalent to the
+From a source checkout, `python -m rtk_splat.workflows.cli` is equivalent to the
 installed `rtk-splat` entry point.
 
 For a new source recording, publish and validate a new immutable segment:
@@ -242,7 +243,7 @@ rtk-splat-verify
 
 ## Migration status
 
-`adapters.migrate_v1_to_v2` is a non-destructive, fail-closed
+`rtk_splat.adapters.migrate_v1_to_v2` is a non-destructive, fail-closed
 one-time converter for the validated legacy headland layout. It preserves full
 timestamps, GNSS covariance/status, and dual-antenna evidence while symlinking
 bulk image/depth data. There is no v1 reader in the mapping core.
@@ -260,12 +261,14 @@ This proves the conversion/contract boundary, not the unrun COLMAP or GS A/B.
 ## Repository layout
 
 ```text
-rtk_splat/                 small dataset-neutral core
-adapters/                  ROS/dataset ingestion and one-time migration
-frontends/                 keyframes, pair graph, sealed COLMAP frontend
-backends/                  Global/incremental mapping and gsplat
-workflows/                 explicit command-line orchestration
-tests/                     contract, isolation, geometry, and dry-run tests
+rtk_splat/                  the only installed Python package
+  core/                     small dataset-neutral contract and primitives
+  adapters/                 ROS/dataset ingestion and one-time migration
+  frontends/                keyframes, pair graph, sealed COLMAP frontend
+  backends/                 Global/incremental mapping and gsplat
+  workflows/                explicit command-line orchestration
+  diagnostics/              optional ROS-free analysis
+tests/                      contract, isolation, geometry, and dry-run tests
 configs/robots/             stable platform facts
 configs/sequences/          per-recording facts
 configs/reproductions/      frozen historical experiment records

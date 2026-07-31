@@ -5,10 +5,10 @@ from pathlib import Path
 
 import numpy as np
 
-from frontends.keyframes import KEYFRAME_PRESETS, KeyframeConfig
-from frontends.pair_graph import PairGraphConfig
-from frontends.planning import make_rig_config, plan_frontend
-from rtk_splat.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
+from rtk_splat.frontends.keyframes import KEYFRAME_PRESETS, KeyframeConfig
+from rtk_splat.frontends.pair_graph import PairGraphConfig
+from rtk_splat.frontends.planning import make_rig_config, plan_frontend
+from rtk_splat.core.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
 
 
 def _segment(path: Path):

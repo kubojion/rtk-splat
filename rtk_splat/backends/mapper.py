@@ -26,7 +26,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from frontends.artifact import (
+from rtk_splat.frontends.artifact import (
     ArtifactError,
     FRONTEND_SEAL_FILE,
     StageLedger,

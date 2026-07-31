@@ -43,10 +43,10 @@ from .gsplat_cameras import (
     align_eval_pose,
     right_c2w,
 )
-from rtk_splat.pose_artifacts import (cloud_path, load_pose_artifact,
+from rtk_splat.core.pose_artifacts import (cloud_path, load_pose_artifact,
                                       pose_artifact_name, pose_fingerprint,
                                       verify_cloud_matches_poses)
-from rtk_splat.segment import SegmentReader
+from rtk_splat.core.segment import SegmentReader
 
 _LPIPS = None
 
@@ -241,7 +241,7 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     c2ws = torch.linalg.inv(viewmats)
 
     n_pairs = len(viewmats)
-    from rtk_splat.manifest import load_manifest
+    from rtk_splat.core.manifest import load_manifest
     manifest = load_manifest(seg_dir)
     train_pairs = manifest["train"]
     eval_ids = manifest["val"]

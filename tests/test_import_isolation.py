@@ -5,9 +5,14 @@ import unittest
 from pathlib import Path
 
 import rtk_splat
+import rtk_splat.core
+from rtk_splat.core.verify_golden import REPOSITORY_ROOT
+from rtk_splat.workflows.cli import REPO_ROOT
 
 
-CORE = Path(rtk_splat.__file__).resolve().parent
+PACKAGE = Path(rtk_splat.__file__).resolve().parent
+CORE = Path(rtk_splat.core.__file__).resolve().parent
+REPOSITORY = PACKAGE.parent
 FORBIDDEN_IMPORT_ROOTS = {
     "adapters",
     "backends",
@@ -17,6 +22,22 @@ FORBIDDEN_IMPORT_ROOTS = {
     "rospy",
     "workflows",
 }
+FORBIDDEN_PACKAGE_PREFIXES = tuple(
+    f"rtk_splat.{name}" for name in (
+        "adapters",
+        "backends",
+        "diagnostics",
+        "frontends",
+        "workflows",
+    )
+)
+LEGACY_TOP_LEVEL_PACKAGES = (
+    "adapters",
+    "backends",
+    "diagnostics",
+    "frontends",
+    "workflows",
+)
 MOVED_MODULES = {
     "bagio.py",
     "calibration_io.py",
@@ -44,9 +65,33 @@ class CoreIsolationTests(unittest.TestCase):
                 elif isinstance(node, ast.ImportFrom) and node.level == 0:
                     names = [node.module or ""]
                 for name in names:
-                    if name.split(".", 1)[0] in FORBIDDEN_IMPORT_ROOTS:
+                    if (
+                        name.split(".", 1)[0] in FORBIDDEN_IMPORT_ROOTS
+                        or any(
+                            name == prefix or name.startswith(prefix + ".")
+                            for prefix in FORBIDDEN_PACKAGE_PREFIXES
+                        )
+                    ):
                         violations.append(f"{path.name}:{node.lineno}: {name}")
         self.assertEqual(violations, [])
+
+    def test_only_rtk_splat_is_an_installed_top_level_namespace(self):
+        project = (REPOSITORY / "pyproject.toml").read_text(encoding="utf-8")
+        package_section = project.split(
+            "[tool.setuptools.packages.find]", maxsplit=1
+        )[1].split("\n[tool.", maxsplit=1)[0]
+        self.assertIn('include = ["rtk_splat*"]', package_section)
+        for name in LEGACY_TOP_LEVEL_PACKAGES:
+            self.assertNotIn(f'"{name}*"', package_section)
+        present = [
+            name for name in LEGACY_TOP_LEVEL_PACKAGES
+            if (REPOSITORY / name).exists()
+        ]
+        self.assertEqual(present, [])
+
+    def test_repository_roots_survive_the_nested_package_layout(self):
+        self.assertEqual(REPO_ROOT, REPOSITORY)
+        self.assertEqual(REPOSITORY_ROOT, REPOSITORY)
 
     def test_old_flat_modules_are_deleted(self):
         present = sorted(path.name for path in CORE.glob("*.py") if path.name in MOVED_MODULES)
@@ -66,7 +111,22 @@ class CoreIsolationTests(unittest.TestCase):
         ]
         for name in names:
             with self.subTest(module=name):
-                importlib.import_module(f"rtk_splat.{name}")
+                importlib.import_module(f"rtk_splat.core.{name}")
+
+    def test_diagnostics_have_no_ros_runtime_imports(self):
+        violations = []
+        for path in sorted((PACKAGE / "diagnostics").glob("*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    names = [node.module or ""]
+                for name in names:
+                    if name.split(".", 1)[0] in {"rclpy", "rosbags", "rospy"}:
+                        violations.append(f"{path.name}:{node.lineno}: {name}")
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

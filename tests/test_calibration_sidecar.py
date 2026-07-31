@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from diagnostics.calibration_sidecar import resolve_raw_visual_source
+from rtk_splat.diagnostics.calibration_sidecar import resolve_raw_visual_source
 
 
 class RawVisualSourceTests(unittest.TestCase):

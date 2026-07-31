@@ -19,6 +19,9 @@ import numpy as np
 from .pose_artifacts import pose_fingerprint
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -237,7 +240,7 @@ def main() -> int:
         description="Read-only verification of an RTK-Splat golden result"
     )
     default_manifest = (
-        Path(__file__).resolve().parent.parent
+        REPOSITORY_ROOT
         / "docs/experiments/golden/headland_stereo_ba.json"
     )
     parser.add_argument("--manifest", type=Path, default=default_manifest)

@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from rtk_splat.segment import SegmentReader
+from rtk_splat.core.segment import SegmentReader
 
 
 ADAPTER_NAMES = ("agrigs", "ros2_zed_ublox")

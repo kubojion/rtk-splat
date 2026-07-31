@@ -19,11 +19,11 @@ from typing import Any
 import cv2
 import numpy as np
 
-from rtk_splat.configio import load_config
-from rtk_splat.segment import SegmentReader
+from rtk_splat.core.configio import load_config
+from rtk_splat.core.segment import SegmentReader
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _plain(value: Any) -> Any:
@@ -153,7 +153,7 @@ def cmd_validate(cfg, args) -> None:
 
 
 def cmd_ingest(cfg, args) -> None:
-    from adapters.registry import publish_from_config
+    from rtk_splat.adapters.registry import publish_from_config
 
     window = getattr(_section(cfg, "segment"), "window_s", None)
     if window is not None:
@@ -166,7 +166,7 @@ def cmd_ingest(cfg, args) -> None:
 
 
 def cmd_depth(cfg, args) -> None:
-    from workflows.depth import derive_sgbm_depth
+    from rtk_splat.workflows.depth import derive_sgbm_depth
 
     source = _reader(cfg, args)
     destination = (
@@ -179,8 +179,8 @@ def cmd_depth(cfg, args) -> None:
 
 
 def _frontend_configs(cfg, args):
-    from frontends.keyframes import KEYFRAME_PRESETS, KeyframeConfig
-    from frontends.pair_graph import PairGraphConfig
+    from rtk_splat.frontends.keyframes import KEYFRAME_PRESETS, KeyframeConfig
+    from rtk_splat.frontends.pair_graph import PairGraphConfig
 
     frontend = _section(cfg, "frontend")
     keyframes = _section(frontend, "keyframes")
@@ -205,11 +205,11 @@ def _frontend_configs(cfg, args):
 
 
 def cmd_frontend_build(cfg, args) -> None:
-    from frontends.artifact import (
+    from rtk_splat.frontends.artifact import (
         FrontendArtifactBuilder,
         collect_provenance,
     )
-    from frontends.planning import plan_frontend
+    from rtk_splat.frontends.planning import plan_frontend
 
     reader = _reader(cfg, args)
     preset, keyframe_config, pair_config = _frontend_configs(cfg, args)
@@ -252,7 +252,7 @@ def cmd_frontend_build(cfg, args) -> None:
 
 
 def cmd_frontend_features(cfg, args) -> None:
-    from frontends.colmap import run_feature_extraction
+    from rtk_splat.frontends.colmap import run_feature_extraction
 
     features = _section(_section(cfg, "frontend"), "features")
     profile = str(args.feature_profile or getattr(features, "profile", "gpu"))
@@ -270,14 +270,14 @@ def cmd_frontend_features(cfg, args) -> None:
 
 
 def cmd_frontend_rig(cfg, args) -> None:
-    from frontends.colmap import run_rig_configurator
+    from rtk_splat.frontends.colmap import run_rig_configurator
 
     report = run_rig_configurator(_frontend_path(cfg, args), _colmap(cfg))
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def cmd_frontend_priors(cfg, args) -> None:
-    from frontends.colmap import insert_pose_priors
+    from rtk_splat.frontends.colmap import insert_pose_priors
 
     priors = _section(_section(cfg, "frontend"), "pose_priors")
     maximum = getattr(priors, "max_covariance_m2", 0.04)
@@ -296,7 +296,7 @@ def cmd_frontend_priors(cfg, args) -> None:
 
 
 def cmd_frontend_match(cfg, args) -> None:
-    from frontends.colmap import run_matches_importer
+    from rtk_splat.frontends.colmap import run_matches_importer
 
     matching = _section(_section(cfg, "frontend"), "matching")
     report = run_matches_importer(
@@ -311,7 +311,7 @@ def cmd_frontend_match(cfg, args) -> None:
 
 
 def _mapper_config(cfg, args):
-    from backends.mapper import MapperConfig
+    from rtk_splat.backends.mapper import MapperConfig
 
     mapper_values = dict(vars(_section(cfg, "mapper")))
     mapper_values.pop("name", None)
@@ -322,7 +322,7 @@ def _mapper_config(cfg, args):
 
 
 def cmd_backend_prepare(cfg, args) -> None:
-    from backends.mapper import prepare_mapper_backend
+    from rtk_splat.backends.mapper import prepare_mapper_backend
 
     workspace = prepare_mapper_backend(
         _frontend_path(cfg, args),
@@ -333,28 +333,28 @@ def cmd_backend_prepare(cfg, args) -> None:
 
 
 def cmd_backend_solve(cfg, args) -> None:
-    from backends.mapper import run_mapper_solve
+    from rtk_splat.backends.mapper import run_mapper_solve
 
     report = run_mapper_solve(_backend_path(cfg, args), _colmap(cfg))
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def cmd_backend_register(cfg, args) -> None:
-    from backends.mapper import run_image_registration
+    from rtk_splat.backends.mapper import run_image_registration
 
     report = run_image_registration(_backend_path(cfg, args), _colmap(cfg))
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def cmd_backend_quality(cfg, args) -> None:
-    from backends.mapper import run_quality_summary
+    from rtk_splat.backends.mapper import run_quality_summary
 
     report = run_quality_summary(_backend_path(cfg, args), _colmap(cfg))
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def cmd_backend_export(cfg, args) -> None:
-    from backends.mapper import export_pose_artifact
+    from rtk_splat.backends.mapper import export_pose_artifact
 
     output = export_pose_artifact(
         _backend_path(cfg, args),
@@ -365,8 +365,8 @@ def cmd_backend_export(cfg, args) -> None:
 
 
 def cmd_cloud(cfg, args) -> None:
-    from rtk_splat.cloud import backproject, to_world, voxel_downsample
-    from rtk_splat.pose_artifacts import (
+    from rtk_splat.core.cloud import backproject, to_world, voxel_downsample
+    from rtk_splat.core.pose_artifacts import (
         cloud_path,
         load_pose_artifact,
         pose_artifact_name,
@@ -439,7 +439,7 @@ def cmd_train(cfg, args) -> None:
         cfg.train.iterations = args.train_iters
     if args.run_name:
         cfg.train.run_name = args.run_name
-    from backends.gsplat import train_tile
+    from rtk_splat.backends.gsplat import train_tile
 
     reader = _reader(cfg, args)
     run = Path(cfg.paths.workdir) / "runs" / str(cfg.train.run_name)

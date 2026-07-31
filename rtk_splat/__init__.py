@@ -1,9 +1,8 @@
-"""Georeferenced Gaussian Splatting from stereo and metric pose artifacts.
+"""Georeferenced Gaussian Splatting from stereo and metric positioning.
 
-The mapping core is dataset-agnostic. Dataset adapters may read ROS bags or
-external folders, but downstream pose, depth, cloud, and training stages
-communicate through the canonical segment artifacts documented in
-``docs/architecture/DATA_CONTRACT.md``.
+All installed modules live below this namespace.  The dependency-free shared
+contract is in :mod:`rtk_splat.core`; adapters, frontends, backends, workflows,
+and diagnostics are explicit sibling layers.
 """
 
 __version__ = "0.1.0"

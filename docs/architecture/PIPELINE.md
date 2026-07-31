@@ -45,13 +45,14 @@ experiments cannot contaminate the sealed frontend or one another.
 
 ## Core and adapter boundary
 
-`rtk_splat/` is the small, dataset-independent core. It defines the canonical
+`rtk_splat/core/` is the small, dataset-independent core. It defines the canonical
 segment reader/writer, geometry, generic configuration, pose/cloud artifact
 primitives, and golden verification. Source ingestion, visual frontends,
-mapper/training backends, diagnostics, and orchestration live in their named
-top-level packages. Import-isolation tests enforce that boundary.
+mapper/training backends, diagnostics, and orchestration live in sibling
+subpackages of the single installed `rtk_splat` namespace. Import-isolation
+tests enforce that boundary.
 
-`adapters/` owns all source-specific behavior:
+`rtk_splat/adapters/` owns all source-specific behavior:
 
 - ROS version, bag storage, topics, and message types;
 - image decoding and timestamp synchronization;
@@ -152,7 +153,7 @@ control. Both backends use the same lifecycle:
 The corresponding Python API is `MapperConfig`,
 `prepare_mapper_backend()`, `run_mapper_solve()`,
 `run_image_registration()`, `run_quality_summary()`, and
-`export_pose_artifact()` in `backends.mapper`.
+`export_pose_artifact()` in `rtk_splat.backends.mapper`.
 
 Resume markers are stage-specific and content-verified. A marker is not trusted
 when its command, input hashes, calibration, or output inventory differs.

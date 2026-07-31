@@ -2,12 +2,12 @@ import unittest
 
 import numpy as np
 
-from frontends.keyframes import (
+from rtk_splat.frontends.keyframes import (
     KEYFRAME_PRESETS,
     KeyframeConfig,
     select_keyframes,
 )
-from frontends.pair_graph import PairGraphConfig, build_pair_graph
+from rtk_splat.frontends.pair_graph import PairGraphConfig, build_pair_graph
 
 
 def yaw_quaternions(degrees):

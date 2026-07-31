@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from rtk_splat.pose_artifacts import (
+from rtk_splat.core.pose_artifacts import (
     cloud_path,
     load_pose_artifact,
     pose_fingerprint,

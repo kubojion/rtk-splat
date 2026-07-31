@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from rtk_splat.segment import SegmentReader
+from rtk_splat.core.segment import SegmentReader
 
 from .keyframes import KeyframeConfig, KeyframeSelection, select_keyframes
 from .pair_graph import PairGraph, PairGraphConfig, build_pair_graph

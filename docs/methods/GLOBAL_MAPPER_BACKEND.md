@@ -78,7 +78,7 @@ The Python API is:
 - `run_quality_summary()`; and
 - `export_pose_artifact()`.
 
-All are defined in `backends.mapper`.
+All are defined in `rtk_splat.backends.mapper`.
 
 ## Solve and all-frame registration
 

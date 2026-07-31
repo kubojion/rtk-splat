@@ -27,18 +27,11 @@ diagnostics = ["matplotlib>=3.7"]
 test = ["pytest>=7.4"]
 
 [project.scripts]
-rtk-splat = "workflows.cli:main"
-rtk-splat-verify = "rtk_splat.verify_golden:main"
+rtk-splat = "rtk_splat.workflows.cli:main"
+rtk-splat-verify = "rtk_splat.core.verify_golden:main"
 
 [tool.setuptools.packages.find]
-include = [
-  "rtk_splat*",
-  "adapters*",
-  "backends*",
-  "diagnostics*",
-  "frontends*",
-  "workflows*",
-]
+include = ["rtk_splat*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

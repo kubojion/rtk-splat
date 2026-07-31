@@ -8,8 +8,8 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from adapters import agrigs
-from rtk_splat.segment import SegmentReader
+from rtk_splat.adapters import agrigs
+from rtk_splat.core.segment import SegmentReader
 
 
 class AgrigsAdapterContractTests(unittest.TestCase):

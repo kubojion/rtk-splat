@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from rtk_splat.segment import SegmentReader
+from rtk_splat.core.segment import SegmentReader
 
 from .artifact import (
     ArtifactError,

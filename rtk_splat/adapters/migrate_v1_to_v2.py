@@ -18,8 +18,8 @@ from typing import Any
 import numpy as np
 import yaml
 
-from adapters.synchronization import TimestampMatchError, nearest_matches
-from rtk_splat.segment import (
+from rtk_splat.adapters.synchronization import TimestampMatchError, nearest_matches
+from rtk_splat.core.segment import (
     POSITION_QUALITY_VOCABULARY,
     SegmentReader,
     SegmentWriter,

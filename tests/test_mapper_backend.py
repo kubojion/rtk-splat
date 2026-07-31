@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from backends.mapper import (
+from rtk_splat.backends.mapper import (
     MapperConfig,
     build_mapper_command,
     build_registration_command,
@@ -23,7 +23,7 @@ from backends.mapper import (
     run_mapper_solve,
     run_quality_summary,
 )
-from frontends.artifact import (
+from rtk_splat.frontends.artifact import (
     ArtifactError,
     create_database_snapshot,
     create_frontend_seal,
@@ -601,12 +601,13 @@ class MapperBackendTests(unittest.TestCase):
 
     def test_module_has_no_ros_dataset_or_segment_dependency(self):
         source = (
-            Path(__file__).parents[1] / "backends" / "mapper.py"
+            Path(__file__).parents[1]
+            / "rtk_splat" / "backends" / "mapper.py"
         ).read_text(encoding="utf-8")
         self.assertNotIn("rosbag", source)
         self.assertNotIn("sensor_msgs", source)
-        self.assertNotIn("rtk_splat.segment", source)
-        self.assertNotIn("adapters.", source)
+        self.assertNotIn("rtk_splat.core.segment", source)
+        self.assertNotIn("rtk_splat.adapters.", source)
 
 
 def _write_and_return(path: Path, payload: bytes) -> bytes:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from adapters.migrate_v1_to_v2 import MigrationError, migrate
+from rtk_splat.adapters.migrate_v1_to_v2 import MigrationError, migrate
 
 
 def _make_v1(root: Path, n: int = 3) -> tuple[Path, Path]:

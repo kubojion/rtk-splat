@@ -18,13 +18,13 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from adapters.image_decode import detect_compressed_format
-from adapters.synchronization import (
+from rtk_splat.adapters.image_decode import detect_compressed_format
+from rtk_splat.adapters.synchronization import (
     TimestampMatches,
     monotonic_matches,
     nearest_matches,
 )
-from rtk_splat.segment import (
+from rtk_splat.core.segment import (
     CAPABILITIES,
     CONTRACT_VERSION,
     POSITION_QUALITY_VOCABULARY,
@@ -1369,8 +1369,8 @@ def ingest_config_v2(
     window: Mapping[str, Any] | None = None,
 ) -> SegmentReader:
     """Run the ROS2 adapter from a resolved robot/sequence configuration."""
-    from adapters.pose_sources import make_pose_source
-    from rtk_splat.poses import (
+    from rtk_splat.adapters.pose_sources import make_pose_source
+    from rtk_splat.core.poses import (
         pose_frames_from_extrinsic,
         tilt_deviations,
     )

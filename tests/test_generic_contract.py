@@ -14,20 +14,20 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from adapters import agrigs
-from adapters.pose_sources import (
+from rtk_splat.adapters import agrigs
+from rtk_splat.adapters.pose_sources import (
     TrajectoryFile,
     _attach_enu,
     make_pose_source,
 )
-from adapters.registry import ADAPTER_NAMES, publish_from_config
-from adapters.ros2_zed_ublox import (
+from rtk_splat.adapters.registry import ADAPTER_NAMES, publish_from_config
+from rtk_splat.adapters.ros2_zed_ublox import (
     FrameRecord,
     RtkTrack,
     publish_segment_v2,
 )
-from rtk_splat.configio import load_config
-from rtk_splat.segment import CAPABILITIES, SegmentReader
+from rtk_splat.core.configio import load_config
+from rtk_splat.core.segment import CAPABILITIES, SegmentReader
 
 
 BASE_NS = 1_700_000_000_123_456_789
@@ -542,7 +542,7 @@ class AdapterRegistryTests(unittest.TestCase):
         selection = {"t0": 1.0, "t1": 2.0}
         expected = object()
         with patch(
-            "adapters.ros2_zed_ublox.ingest_config_v2",
+            "rtk_splat.adapters.ros2_zed_ublox.ingest_config_v2",
             return_value=expected,
         ) as ingest:
             result = publish_from_config(
@@ -558,7 +558,7 @@ class AdapterRegistryTests(unittest.TestCase):
         destination = Path("/new/segment")
         expected = object()
         with patch(
-            "adapters.agrigs.ingest_config_v2",
+            "rtk_splat.adapters.agrigs.ingest_config_v2",
             return_value=expected,
         ) as ingest:
             result = publish_from_config(cfg, destination)
@@ -620,7 +620,7 @@ class ConfigTests(unittest.TestCase):
             relpos_carr=np.array([2, 2]),
         )
         with patch(
-            "adapters.pose_sources.LocalEnu.to_enu",
+            "rtk_splat.adapters.pose_sources.LocalEnu.to_enu",
             return_value=np.zeros((2, 3)),
         ):
             _attach_enu(track)

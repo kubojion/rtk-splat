@@ -39,7 +39,7 @@ For files under `configs/sequences/`, the enclosing `configs/` directory is
 used automatically:
 
 ```python
-from rtk_splat.configio import load_config
+from rtk_splat.core.configio import load_config
 
 cfg = load_config("configs/sequences/headland.example.yaml")
 ```
@@ -61,8 +61,8 @@ The generic ingestion boundary selects an adapter from the resolved robot
 profile and publishes a new, immutable contract-v2 segment:
 
 ```python
-from adapters.registry import publish_from_config
-from rtk_splat.configio import load_config
+from rtk_splat.adapters.registry import publish_from_config
+from rtk_splat.core.configio import load_config
 
 cfg = load_config("configs/sequences/headland.example.yaml")
 segment = publish_from_config(cfg, "/new/output/segment")
@@ -81,7 +81,7 @@ rtk-splat <stage> --config configs/sequences/<name>.yaml
 ```
 
 For a source checkout, the equivalent module is
-`python -m workflows.cli`. No machine-specific configuration is selected
+`python -m rtk_splat.workflows.cli`. No machine-specific configuration is selected
 implicitly.
 
 Only implemented options belong in active configs. SGBM is the current built-in

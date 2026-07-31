@@ -13,12 +13,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .calibration_io import (
-    CalibrationTopics,
     atomic_calibration_artifact,
-    build_calibration_typestore,
     calibration_artifact_path,
     load_raw_colmap_rig_trajectory,
-    read_calibration_bag_observations,
     validate_calibration_artifact_name,
     write_json,
 )
@@ -570,6 +567,13 @@ def _human_report(result: dict, diagnostics: dict,
 
 def run_integrity_audit(segment_dir: Path, cfg) -> tuple[Path, dict]:
     """Run one bounded audit and atomically publish a diagnostic artifact."""
+    # Keep the diagnostics package importable without the optional ROS stack.
+    from ..adapters.calibration_bag import (
+        CalibrationTopics,
+        build_calibration_typestore,
+        read_calibration_bag_observations,
+    )
+
     seg = Path(segment_dir)
     audit = AuditConfig.from_config(cfg)
     final_path = calibration_artifact_path(seg, audit.output_artifact)

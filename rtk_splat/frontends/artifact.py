@@ -21,7 +21,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from rtk_splat.segment import SegmentReader, publish_directory_noreplace
+from rtk_splat.core.segment import SegmentReader, publish_directory_noreplace
 
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")

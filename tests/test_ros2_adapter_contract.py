@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
-from adapters.ros2_zed_ublox import (
+from rtk_splat.adapters.ros2_zed_ublox import (
     FrameRecord,
     RtkTrack,
     publish_segment_v2,

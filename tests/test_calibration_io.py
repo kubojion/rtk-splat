@@ -9,15 +9,17 @@ from unittest.mock import patch
 
 import numpy as np
 
-from diagnostics.calibration_io import (
+from rtk_splat.adapters.calibration_bag import (
     CalibrationTopics,
-    CameraAntennaGeometry,
     _bounded_reader_messages,
+    historical_stereo_bucket,
+    read_calibration_bag_observations,
+)
+from rtk_splat.diagnostics.calibration_io import (
+    CameraAntennaGeometry,
     atomic_calibration_artifact,
     calibration_artifact_path,
-    historical_stereo_bucket,
     load_raw_colmap_rig_trajectory,
-    read_calibration_bag_observations,
     validate_calibration_artifact_name,
     write_json,
 )
@@ -342,7 +344,9 @@ class BagObservationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             camera_bag, rtk_bag, payloads = self.prepare_fake_bags(temporary)
             image_dir = self.write_extracted(temporary, payloads)
-            with patch("diagnostics.calibration_io.Reader", FakeReader):
+            with patch(
+                "rtk_splat.adapters.calibration_bag.Reader", FakeReader
+            ):
                 observations = self.read(
                     [Path(camera_bag), Path(rtk_bag)], image_dir)
 
@@ -398,7 +402,9 @@ class BagObservationTests(unittest.TestCase):
             camera_bag, rtk_bag, payloads = self.prepare_fake_bags(temporary)
             image_dir = self.write_extracted(temporary, payloads)
             (image_dir / "right_000001.jpg").write_bytes(b"not-the-bag-image")
-            with patch("diagnostics.calibration_io.Reader", FakeReader):
+            with patch(
+                "rtk_splat.adapters.calibration_bag.Reader", FakeReader
+            ):
                 with self.assertRaisesRegex(ValueError, "right JPEG hash"):
                     self.read([Path(camera_bag), Path(rtk_bag)], image_dir)
 

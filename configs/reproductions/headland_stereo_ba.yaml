@@ -141,10 +141,10 @@ global_mapper:
     max_rotation_step_deg: 1.5   # broad catastrophe limit; reference 0.714 deg
     reference_regression_fraction: 0.05
 
-# Explicit, diagnostic-only calibration sidecar. It is run only with
-# `python3 -m rtk_splat.cli integrity-audit`; `all`, cloud, and train ignore
-# this section. The output lives under calibration_artifacts, never under
-# pose_artifacts, and cannot overwrite an existing name.
+# Historical, diagnostic-only calibration sidecar configuration. No current
+# contract-v2 CLI exposes `integrity-audit`; normal cloud and train stages
+# ignore this section. Its output lives under calibration_artifacts, never
+# under pose_artifacts, and cannot overwrite an existing name.
 calibration:
   source_pose_artifact: colmap_stereo
   output_artifact: rtk_stereo_metric_integrity_v2_strict

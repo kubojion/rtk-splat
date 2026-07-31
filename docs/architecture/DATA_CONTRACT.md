@@ -210,7 +210,7 @@ An adapter must:
 6. Publish to a new destination with `SegmentWriter`; an existing destination
    is an error and is never overwritten.
 
-The supported dispatch boundary is `adapters.registry.publish_from_config`.
+The supported dispatch boundary is `rtk_splat.adapters.registry.publish_from_config`.
 Adding a new dataset means writing an adapter that publishes the same v2
 contract, not adding conditionals to the mapper.
 
@@ -221,7 +221,7 @@ utility exists only to convert the previously validated headland segment and
 its metric-integrity observation archive:
 
 ```bash
-python -m adapters.migrate_v1_to_v2 \
+python -m rtk_splat.adapters.migrate_v1_to_v2 \
   --source-segment /path/to/v1/segment \
   --destination-segment /path/to/new-v2/segment \
   --observations /path/to/observations.npz \

@@ -230,7 +230,7 @@ ab_check_definition() {
 
 ab_validate_cli() {
     local help
-    help="$("$AB_PYTHON" -m workflows.cli --help)"
+    help="$("$AB_PYTHON" -m rtk_splat.workflows.cli --help)"
     local stage
     for stage in \
         frontend-build frontend-features frontend-rig frontend-priors \
@@ -284,8 +284,8 @@ ab_read_segment() {
 import sys
 from pathlib import Path
 
-from rtk_splat.configio import load_config
-from rtk_splat.segment import SegmentReader
+from rtk_splat.core.configio import load_config
+from rtk_splat.core.segment import SegmentReader
 
 cfg = load_config(sys.argv[1])
 configured = getattr(cfg.paths, "segment", None)
@@ -326,7 +326,7 @@ PY
     AB_CONFIG_WORKDIR="${info[3]}"
     "$AB_PYTHON" - "$AB_CONFIG" <<'PY'
 import sys
-from rtk_splat.configio import load_config
+from rtk_splat.core.configio import load_config
 
 cfg = load_config(sys.argv[1])
 if getattr(cfg.pose, "artifact_root", None) is not None:
@@ -432,8 +432,8 @@ import hashlib
 import json
 import sys
 
-from rtk_splat.configio import load_config
-from workflows.cli import _plain
+from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.cli import _plain
 
 resolved = _plain(load_config(sys.argv[1]))
 payload = json.dumps(
@@ -522,7 +522,7 @@ ab_run_cli() {
     mkdir -p "$workdir"
     log="$AB_LOG_DIR/$arm-$stage.log"
     local command=(
-        "$AB_PYTHON" -m workflows.cli "$stage"
+        "$AB_PYTHON" -m rtk_splat.workflows.cli "$stage"
         --config "$AB_CONFIG"
         --segment "$AB_SEGMENT"
         --workdir "$workdir"
@@ -566,8 +566,8 @@ import json
 import sys
 from pathlib import Path
 
-from rtk_splat.configio import load_config
-from rtk_splat.pose_artifacts import load_pose_artifact
+from rtk_splat.core.configio import load_config
+from rtk_splat.core.pose_artifacts import load_pose_artifact
 
 cfg = load_config(sys.argv[1])
 segment = Path(sys.argv[2])
@@ -616,7 +616,7 @@ PY
     [[ -d "$reference" ]] ||
         ab_die "accepted golden pose artifact is unavailable: $reference"
     if [[ ! -e "$output" ]]; then
-        "$AB_PYTHON" -m diagnostics.compare_poses \
+        "$AB_PYTHON" -m rtk_splat.diagnostics.compare_poses \
             --reference "$reference" \
             --candidate "$candidate" \
             --output "$output"
@@ -762,8 +762,8 @@ ab_verify_cloud() {
 import sys
 from pathlib import Path
 
-from rtk_splat.configio import load_config
-from rtk_splat.pose_artifacts import (
+from rtk_splat.core.configio import load_config
+from rtk_splat.core.pose_artifacts import (
     cloud_path,
     load_pose_artifact,
     verify_cloud_matches_poses,

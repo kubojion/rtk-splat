@@ -8,20 +8,20 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-import adapters.ros2_zed_ublox as ros2_adapter
-from adapters.image_decode import (
+import rtk_splat.adapters.ros2_zed_ublox as ros2_adapter
+from rtk_splat.adapters.image_decode import (
     ImageDecodeError,
     decode_compressed_image,
     decode_raw_image,
     detect_compressed_format,
 )
-from adapters.synchronization import (
+from rtk_splat.adapters.synchronization import (
     TimestampMatchError,
     associate_timestamps,
     monotonic_matches,
     nearest_matches,
 )
-from adapters.ros2_zed_ublox import FrameRecord, pair_stereo_timestamps
+from rtk_splat.adapters.ros2_zed_ublox import FrameRecord, pair_stereo_timestamps
 
 
 class TimestampSynchronizationTests(unittest.TestCase):
@@ -168,7 +168,7 @@ def guarded(name, *args, **kwargs):
         raise ModuleNotFoundError("blocked by import-isolation test")
     return real_import(name, *args, **kwargs)
 builtins.__import__ = guarded
-import adapters.ros2_zed_ublox
+import rtk_splat.adapters.ros2_zed_ublox
 """
         completed = subprocess.run(
             [sys.executable, "-c", source],

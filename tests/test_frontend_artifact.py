@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from frontends.artifact import (
+from rtk_splat.frontends.artifact import (
     ArtifactError,
     FrontendArtifactBuilder,
     StageLedger,
@@ -18,7 +18,7 @@ from frontends.artifact import (
     probe_colmap_identity,
     stage_fingerprint,
 )
-from rtk_splat.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
+from rtk_splat.core.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
 
 
 def _digest(payload: bytes) -> str:

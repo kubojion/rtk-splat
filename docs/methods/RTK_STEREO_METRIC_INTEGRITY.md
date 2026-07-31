@@ -6,11 +6,11 @@ primary-to-secondary dual-antenna vector. It does not run COLMAP, Gaussian
 training, depth, or cloud generation, and it does not publish camera poses.
 
 This page records the already-completed v1 diagnostic experiment. Phase 1
-moved its implementation to the optional `diagnostics/` package and removed
-the old `rtk_splat.cli` compatibility path. There is therefore no active
-command that silently reruns this historical audit against a contract-v2
-segment. A future calibration experiment must get its own explicit v2
-diagnostic entry point and a new artifact name.
+moved its implementation to the optional `rtk_splat/diagnostics/` package and
+removed the old `rtk_splat.cli` compatibility path. There is therefore no
+active command that silently reruns this historical audit against a
+contract-v2 segment. A future calibration experiment must get its own explicit
+v2 diagnostic entry point and a new artifact name.
 
 The accepted historical output was written atomically to:
 

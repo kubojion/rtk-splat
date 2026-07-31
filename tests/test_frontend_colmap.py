@@ -9,14 +9,14 @@ from pathlib import Path
 
 import numpy as np
 
-from frontends.artifact import (
+from rtk_splat.frontends.artifact import (
     ArtifactError,
     FrontendArtifactBuilder,
     collect_provenance,
     sha256_file,
     verify_frontend_seal,
 )
-from frontends.colmap import (
+from rtk_splat.frontends.colmap import (
     build_feature_extractor_command,
     build_matches_importer_command,
     build_rig_configurator_command,
@@ -25,7 +25,7 @@ from frontends.colmap import (
     run_matches_importer,
     run_rig_configurator,
 )
-from rtk_splat.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
+from rtk_splat.core.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
 
 
 PAIR_ID_BASE = 2_147_483_647

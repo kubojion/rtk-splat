@@ -7,7 +7,7 @@ from unittest import mock
 import numpy as np
 
 from test_frontend_planning import _segment
-from workflows.depth import derive_sgbm_depth
+from rtk_splat.workflows.depth import derive_sgbm_depth
 
 
 class DepthWorkflowTests(unittest.TestCase):
@@ -26,9 +26,9 @@ class DepthWorkflowTests(unittest.TestCase):
             depth = np.full((12, 16), 2.0, dtype=np.float32)
             valid = np.ones((12, 16), dtype=bool)
             with (
-                mock.patch("workflows.depth.make_sgbm", return_value=object()),
+                mock.patch("rtk_splat.workflows.depth.make_sgbm", return_value=object()),
                 mock.patch(
-                    "workflows.depth.depth_from_pair",
+                    "rtk_splat.workflows.depth.depth_from_pair",
                     return_value=(depth, valid),
                 ),
             ):
