@@ -1,9 +1,29 @@
 # RTK-Splat Progress
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 This is the current source of truth for this repository. Superseded plans are
 kept under `docs/archive/`.
+
+## Repository cleanup status
+
+The production-boundary cleanup is complete and did not alter any work
+artifact or accepted metric:
+
+- `9da4bb8` froze the pre-cleanup evidence and tag
+  `pre-cleanup-20260802`;
+- `92baca0` added strict profile -> robot -> sequence ownership, auditable
+  runtime-derived controls, the fail-closed resolved-config ledger, and removed
+  the real adapter/backend/diagnostic coupling; and
+- `7acd7b6` moved the sole installed namespace to `src/rtk_splat`, made
+  provenance and golden verification wheel-safe, and updated every supported
+  launcher.
+
+The final source-tree gate passes **236 tests plus 35 subtests**, shell and
+compile checks, and the historical verifier still passes **38/38 exact
+checks**. A clean wheel installs only the `rtk_splat` namespace and works
+outside a Git checkout. Existing editable environments must run
+`python -m pip install -e .` once after the layout move.
 
 ## Current reference result
 
@@ -254,22 +274,25 @@ COLMAP or GS experiment has completed.
 
 Implemented and covered by unit/synthetic tests:
 
-- The reusable `rtk_splat/core/` package is isolated from ROS, adapters, frontends,
+- The reusable `src/rtk_splat/core/` package is isolated from ROS, adapters, frontends,
   backends, diagnostics, and orchestration.
 - `rtk_splat` is now the only installed top-level Python namespace. Adapters,
   frontends, backends, workflows, and diagnostics are explicit subpackages;
   the former collision-prone global package names no longer exist.
-- Dataset-specific ingestion lives under `rtk_splat/adapters/`; the registry
+- Dataset-specific ingestion lives under `src/rtk_splat/adapters/`; the registry
   supports ROS 2 ZED/u-blox, ROS 1 CitrusFarm, and AgriGS.
 - Calibration ROS topics, u-blox message registration, message decoding, and
-  bounded MCAP reading moved into `rtk_splat/adapters/calibration_bag.py`.
+  bounded MCAP reading moved into `src/rtk_splat/adapters/calibration_bag.py`.
   Diagnostics retain only plain records, numerical analysis, COLMAP parsing,
   and artifact reporting, and import without the optional ROS stack.
 - Immutable contract-v2 segments preserve exact nanosecond timestamps, full
   GNSS covariance/status, both stereo calibrations, explicit transform
   semantics, and the complete optional dual-antenna N/E/D baseline.
-- Robot defaults and sequence-specific settings are deep-merged from explicit
-  configuration. There is no local-machine default configuration.
+- Strict configuration resolves profile -> robot -> sequence. Data-dependent
+  frame sampling, stereo range, training duration, and Gaussian capacity are
+  derived at the stage that can measure their inputs, logged with provenance,
+  and remain explicitly overridable. There is no local-machine default
+  configuration.
 - The strict normalized v1-to-v2 migration completed at
   `~/agromap4d_work/field_turn_contract_v2_normalized/segment` in 2.85 s
   (66.5 MiB maximum RSS). It validates 1,344 frames, preserves 2,273 raw GNSS
@@ -365,7 +388,7 @@ real read-only preflight and bounded ingest/SGBM/sealed-frontend smoke, and has
 completed one full-window visual reconstruction. That attempt failed the
 held-out RTK export gate, so it produced no accepted pose or GS result.
 
-The dataset-neutral core remains below its enforced 2,000-line budget.
+The dataset-neutral core meets its enforced 2,000-line budget exactly.
 
 ## CitrusFarm ROS 1 candidate
 
@@ -383,7 +406,7 @@ bag-log timestamp. Real read-only preflight evidence is:
 - adapter preflight: **127.3 s**, **156.8 MB** reported maximum RSS;
 - GNSS path length: **228.725603 m**;
 - 0.15 m metric sampling estimate: **about 1,525 stereo pairs** (the ingest
-  result, not this estimate, will be authoritative);
+  estimate; the completed ingest published **1,495 pairs**);
 - recorded rectified stereo baseline: **0.119885166 m**;
 - estimated camera-to-GNSS header correction: **+72.548749 ms**;
 - final per-sequence configured correction: **+72.548749 ms** (zero residual);
@@ -427,8 +450,7 @@ valid coverage was 65.0--73.4% per frame (69.0% median), with a 2.30 m median
 valid depth across frames. This
 short, almost linear slice is intentionally not used to judge Global Mapper
 or fixed-scale georeferencing observability, so no mapper or GS smoke is
-claimed. The repository suite passes **207 tests** in the RTK-Splat
-environment after this integration.
+claimed. The current repository-wide cleanup receipt is recorded above.
 
 `scripts/runs/citrusfarm_05_13d_uturn.sh` provides plan, preflight, fresh run,
 and evidence-checked resume modes without `tmux`. It runs ingest, immutable

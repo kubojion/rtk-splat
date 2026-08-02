@@ -41,9 +41,9 @@ The current repository has since implemented and unit-tested a cleaner
 contract-v2 path:
 
 - Phase 0: the two measured golden results are frozen and regression checked.
-- Phase 1: contract v2, isolated adapters, adapter conformance tests, two-level
-  robot/sequence configuration, and the one-time v1 migration utility are
-  implemented.
+- Phase 1: contract v2, isolated adapters, adapter conformance tests,
+  profile/robot/sequence configuration plus auditable runtime derivation, and
+  the one-time v1 migration utility are implemented.
 - Phase 2: independent target-based stereo calibration was deliberately
   skipped.
 - Phase 3: a sealed mapper-neutral COLMAP frontend and isolated Global or
@@ -85,9 +85,9 @@ fixed-scale ENU pose artifact
 pose-matched cloud → GS train → evaluate
 ```
 
-The core package under `rtk_splat/core/` imports no ROS, bag, dataset, backend,
+The core package under `src/rtk_splat/core/` imports no ROS, bag, dataset, backend,
 or workflow module. ROS 2 ZED/u-blox, ROS 1 CitrusFarm, and AgriGS are adapters
-under `rtk_splat/adapters/`. The CitrusFarm implementation handles an ordered
+under `src/rtk_splat/adapters/`. The CitrusFarm implementation handles an ordered
 chain of ROS 1 bags, raw rectified stereo, Piksi `NavSatFix`, single-antenna
 course heading, clock auditing, and travelled-distance sampling without adding
 dataset conditionals to the mapping core.
@@ -110,6 +110,33 @@ on calibration blocks only, reported as a diagnostic, and never applied.
 
 See [PIPELINE.md](docs/architecture/PIPELINE.md) and
 [DATA_CONTRACT.md](docs/architecture/DATA_CONTRACT.md).
+
+## Configuration model
+
+Configuration has three authored layers and one measured layer:
+
+- `profiles/` owns versioned method and quality policy;
+- `robots/` owns stable topics, sensor geometry, and pose-source facts;
+- `sequences/` owns recording paths, windows, artifact names, and a narrow set
+  of documented scene overrides; and
+- runtime resolution derives data-dependent controls only after their inputs
+  exist.
+
+The runtime-derived controls are frame stride or metric spacing from measured
+motion, stereo range from focal-length-times-baseline and reliable disparity,
+training iterations from the actual number of training views, and Gaussian
+capacity from initial-cloud size and available VRAM. `auto` opts into a named
+formula; a numeric value is an explicit override. Formula inputs, bounds,
+source-file hashes, CLI overrides, and chosen values are written to
+`<workdir>/config_artifacts/resolved_config.json` and copied into immutable
+stage evidence. Reusing a work directory after a configuration source changes
+fails closed.
+
+`quality_v1` is an empirical candidate policy, not a cross-dataset optimum or
+a quality guarantee. RTK acceptance limits remain independent, authored metre
+caps; receiver covariance is evidence for weighting and diagnostics, not
+permission to silently relax a failed georeferencing result. See
+[the configuration guide](configs/README.md).
 
 ## Install
 
@@ -279,6 +306,13 @@ Verify the historical golden artifacts without rerunning COLMAP or GS:
 rtk-splat-verify
 ```
 
+That no-argument shortcut is available only in a source checkout. An installed
+wheel is dataset-neutral and therefore requires an explicit experiment record:
+
+```bash
+rtk-splat-verify --manifest /path/to/experiment-manifest.json
+```
+
 ## Prepared CitrusFarm reproduction
 
 The checked-in CitrusFarm candidate uses the 192 s window at 543--735 s,
@@ -351,7 +385,7 @@ This proves the conversion/contract boundary, not the unrun COLMAP or GS A/B.
 ## Repository layout
 
 ```text
-rtk_splat/                  the only installed Python package
+src/rtk_splat/              the only installed Python package
   core/                     small dataset-neutral contract and primitives
   adapters/                 ROS/dataset ingestion and one-time migration
   frontends/                keyframes, pair graph, sealed COLMAP frontend
@@ -361,9 +395,15 @@ rtk_splat/                  the only installed Python package
 tests/                      contract, isolation, geometry, and dry-run tests
 configs/robots/             stable platform facts
 configs/sequences/          per-recording facts
+configs/profiles/           reusable quality policy
 configs/reproductions/      frozen historical experiment records
 docs/experiments/golden/    accepted metrics and hashes
 ```
+
+The `src/` boundary ensures that tests and scripts exercise the installed
+package layout instead of importing a same-named directory merely because the
+repository is the current working directory. Configurations and experiment
+records remain repository data; they are not hidden inside the wheel.
 
 ## Current limitations
 

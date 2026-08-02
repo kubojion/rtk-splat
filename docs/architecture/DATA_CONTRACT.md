@@ -239,9 +239,10 @@ estimated +72.548749 ms; that value is frozen in the sequence profile, and
 the measured -2.581 ms drift across the 543--735 s window is inside its 15 ms
 gate. It also inventoried recorded
 depth and confidence without declaring them as active primary inputs. The
-prepared reproduction instead uses `depth --derived-segment` to publish SGBM
-depth separately. A bounded 4 s real-data contract/SGBM/frontend smoke passes;
-the full 192 s Citrus contract and mapping run remain unexecuted.
+completed reproduction used `depth --derived-segment` to publish SGBM depth
+separately. The full 192 s reconstruction registered 2,990/2,990 images
+but failed the held-out RTK export gates. It therefore published no accepted
+pose, cloud, GS model, or rendering metric.
 
 ## One-time migration from the validated v1 headland layout
 

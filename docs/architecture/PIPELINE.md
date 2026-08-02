@@ -55,14 +55,15 @@ experiments cannot contaminate the sealed frontend or one another.
 
 ## Core and adapter boundary
 
-`rtk_splat/core/` is the small, dataset-independent core. It defines the canonical
-segment reader/writer, geometry, generic configuration, pose/cloud artifact
-primitives, and golden verification. Source ingestion, visual frontends,
+`src/rtk_splat/core/` is the small, dataset-independent core. It defines the
+canonical segment reader/writer, geometry, runtime-evidence primitives,
+pose/cloud artifact primitives, and golden verification. Strict configuration
+loading and orchestration live under `workflows/`. Source ingestion, visual frontends,
 mapper/training backends, diagnostics, and orchestration live in sibling
 subpackages of the single installed `rtk_splat` namespace. Import-isolation
 tests enforce that boundary.
 
-`rtk_splat/adapters/` owns all source-specific behavior:
+`src/rtk_splat/adapters/` owns all source-specific behavior:
 
 - ROS version, bag storage, topics, and message types;
 - image decoding and timestamp synchronization;
@@ -79,6 +80,22 @@ status/covariance and ROS bag-log times, estimates single-antenna course
 heading, and samples by travelled distance. Its topic and geometry facts live
 in robot/sequence YAML rather than the mapping core. Arbitrary unconfigured
 topic/message layouts are not inferred automatically.
+
+## Configuration and runtime resolution
+
+Authored configuration resolves in a strict order: reusable quality profile,
+stable robot facts, then recording/sequence facts and bounded overrides. Keys
+in the wrong layer and unknown keys are rejected before a long stage starts.
+
+Frame sampling, stereo maximum range, training iterations, and Gaussian
+capacity can be `auto` because their motion, calibration, frame-count, cloud,
+or VRAM measurements do not exist at YAML-authoring time. The consuming stage
+records the immutable authored origin, exact measurements, named formula,
+policy bounds, chosen value, and any CLI override. Successful commands
+atomically accumulate this evidence in
+`<workdir>/config_artifacts/resolved_config.json`; artifacts also carry their
+own effective-configuration hash. Previous derived values are provenance only
+and are remeasured before reuse.
 
 ## Immutable contract-v2 segment
 
@@ -107,15 +124,16 @@ recorded in `docs/experiments/migrations/headland_contract_v2.json`. Neither
 the source v1 segment nor the earlier v2 migration was modified. No new COLMAP
 or GS result is claimed from this migration yet.
 
-The CitrusFarm primary candidate follows the same boundary. Its source segment
-will contain RGB plus single-RTK evidence; SGBM then publishes a separately
-named immutable depth segment. Recorded ZED depth and confidence topics are
+The CitrusFarm primary candidate follows the same boundary. Its completed
+source segment contains 1,495 stereo pairs plus single-RTK evidence; SGBM
+published a separately named immutable depth segment. Recorded ZED depth and
+confidence topics are
 inventoried in preflight provenance but deliberately withheld from this arm.
 The real preflight measured a 0.119885 m stereo baseline and a +72.548749 ms
 camera-to-GNSS clock offset, now frozen per sequence. Drift across the window
-was -2.581 ms, within the configured 15 ms gate. The bounded smoke published
-10 stereo frames and sealed all 52 planned frontend pairs; it does not prove
-full-window mapper or GS quality.
+was -2.581 ms, within the configured 15 ms gate. The full reconstruction
+registered 2,990/2,990 images but failed the held-out RTK export gates. It
+therefore published no accepted pose, cloud, GS model, or rendering metric.
 
 ## Sealed mapper-neutral frontend
 
