@@ -3,6 +3,19 @@
 # and the published sensor geometry.
 adapter: ros1_citrusfarm
 
+# Stable ROS1 bag-chain and clock-contract policy for this published platform.
+# The adapter still measures every boundary and the per-recording offset stays
+# in the sequence file.
+segment:
+  maximum_bag_gap_s: 0.1
+  maximum_bag_overlap_s: 0.01
+  image_encoding: png_lossless
+
+timing:
+  clock_model: ros_log_constant
+  maximum_offset_error_s: 0.015
+  maximum_window_drift_s: 0.015
+
 topics:
   left_image: /zed2i/zed_node/left/image_rect_color
   right_image: /zed2i/zed_node/right/image_rect_color

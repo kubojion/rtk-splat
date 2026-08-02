@@ -17,13 +17,14 @@ configs/
   own bags, topics or sensor geometry.
 - `robots/` stores facts measured or selected once for a platform: adapter,
   topics, camera rig, image geometry, antenna frames, camera-to-antenna
-  transform and uncertainty, baseline, and pose source. It cannot own output
-  paths or training policy.
+  transform and uncertainty, baseline, pose source, and stable adapter clock/
+  chunk-contract policy. It cannot own output paths or training policy.
 - `sequences/` stores recording inputs and a documented, bounded set of run
-  overrides: `profile: <name>`, `robot: <name>`, bag or dataset paths, output
+  overrides: `profile: <name>`, `robot: <name>`, recording paths, output
   work directory, time window, sampling mode, artifact names, scene depth
-  bounds, topology/keyframe settings, and independent acceptance gates. It
-  cannot redefine topics, sensor geometry, feature extraction, or loss terms.
+  bounds, topology/keyframe settings, bag/clock validation gates, and
+  independent acceptance gates. It cannot redefine topics, sensor geometry,
+  feature extraction, or loss terms.
 - Runtime derivation owns values which are neither method constants nor robot
   or recording facts: frame stride/spacing, stereo maximum range, iteration
   count, and Gaussian capacity. An authored value is either `auto` or an

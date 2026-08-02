@@ -11,9 +11,6 @@ paths:
 segment:
   window_s: [2750.0, 3200.0]
   frame_stride: auto
-  validation_every: 8
-  stereo_tolerance_s: 0.02
-  association_tolerance_s: 0.15
 
 train:
   run_name: headland_recording

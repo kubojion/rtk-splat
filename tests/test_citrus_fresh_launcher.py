@@ -32,7 +32,7 @@ class CitrusFreshPosePriorLauncherTests(unittest.TestCase):
     def test_launcher_freezes_inputs_and_has_only_one_workflow_stage(self):
         contents = SCRIPT.read_text(encoding="utf-8")
 
-        self.assertIn("citrusfarm_05_13d_uturn.yaml", contents)
+        self.assertIn("citrusfarm_05_13d_uturn_v2.yaml", contents)
         self.assertIn("citrus-05-13d-543-735-global-bounded-v1", contents)
         self.assertIn("citrus-05-13d-543-735-rtk-l2-v1", contents)
         self.assertIn(

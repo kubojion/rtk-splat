@@ -424,6 +424,13 @@ LAYER_SCHEMAS: dict[str, dict[str, Any]] = {
         "paths": _subset("paths", "ublox_msgs_dir"),
         "topics": CONFIG_SCHEMA["topics"],
         "pose": CONFIG_SCHEMA["pose"],
+        "segment": _subset(
+            "segment",
+            "maximum_bag_gap_s",
+            "maximum_bag_overlap_s",
+            "image_encoding",
+        ),
+        "timing": CONFIG_SCHEMA["timing"],
         "gnss_quality": CONFIG_SCHEMA["gnss_quality"],
         "sensor_geometry": CONFIG_SCHEMA["sensor_geometry"],
         "frontend": {
@@ -441,8 +448,6 @@ LAYER_SCHEMAS: dict[str, dict[str, Any]] = {
             "bags",
             "camera_bags",
             "gnss_bags",
-            "dataset_root",
-            "ground_truth_csv",
         ),
         "pose": _subset(
             "pose",
@@ -451,7 +456,21 @@ LAYER_SCHEMAS: dict[str, dict[str, Any]] = {
             "trajectory_file",
             "time_offset_s",
         ),
-        "segment": CONFIG_SCHEMA["segment"],
+        "segment": _subset(
+            "segment",
+            "window_s",
+            "window_epoch_source",
+            "search_t_start_s",
+            "heading_std_max_deg",
+            "speed_range_ms",
+            "length_s",
+            "frame_stride",
+            "frame_spacing_m",
+            "maximum_bag_gap_s",
+            "maximum_bag_overlap_s",
+        ),
+        # Robot profiles provide the normal clock contract, but a recording
+        # may override its validation model/gates with explicit evidence.
         "timing": CONFIG_SCHEMA["timing"],
         # Scene range can be an explicit measured override of profile auto.
         "depth": _subset("depth", "min_z_m", "max_z_m"),

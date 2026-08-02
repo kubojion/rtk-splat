@@ -10,7 +10,7 @@ umask 027
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PYTHON="${RTK_SPLAT_PYTHON:-/home/jion_kubo/miniconda3/envs/rtk-splat/bin/python}"
 COLMAP="${COLMAP_BIN:-/home/jion_kubo/miniconda3/envs/colmap-rtk/bin/colmap}"
-CONFIG="${RTK_SPLAT_CONFIG:-$REPO_ROOT/configs/sequences/citrusfarm_05_13d_uturn.yaml}"
+CONFIG="${RTK_SPLAT_CONFIG:-$REPO_ROOT/configs/reproductions/citrusfarm_05_13d_uturn_v2.yaml}"
 WORKDIR="${RTK_SPLAT_WORKDIR:-/home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_v1}"
 BACKEND_NAME="citrus-05-13d-543-735-global-bounded-v1"
 CONTROL_NAME="citrus-05-13d-543-735-rtk-refined-v1"

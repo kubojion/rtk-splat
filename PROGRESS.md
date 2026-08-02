@@ -19,7 +19,7 @@ artifact or accepted metric:
   provenance and golden verification wheel-safe, and updated every supported
   launcher.
 
-The final source-tree gate passes **236 tests plus 35 subtests**, shell and
+The final source-tree gate passes **237 tests plus 36 subtests**, shell and
 compile checks, and the historical verifier still passes **38/38 exact
 checks**. A clean wheel installs only the `rtk_splat` namespace and works
 outside a Git checkout. Existing editable environments must run
@@ -293,6 +293,12 @@ Implemented and covered by unit/synthetic tests:
   derived at the stage that can measure their inputs, logged with provenance,
   and remain explicitly overridable. There is no local-machine default
   configuration.
+- The supported Citrus sequence now contains **14 authored leaves**, down from
+  54: unused evaluation paths, duplicated bag counts, frozen artifact names,
+  and an unrelated RTK-refinement experiment were removed. Stable ROS1 chunk/
+  clock policy moved to the robot profile; spacing, depth, iterations, and
+  Gaussian capacity use the logged runtime rules. The historical 0.15 m run is
+  unchanged at SHA-256 `5649e840d8af4189ec1a270c0873d249c23fc4a48b6e8f9f5d60b3bb88a8432e`.
 - The strict normalized v1-to-v2 migration completed at
   `~/agromap4d_work/field_turn_contract_v2_normalized/segment` in 2.85 s
   (66.5 MiB maximum RSS). It validates 1,344 frames, preserves 2,273 raw GNSS
@@ -412,6 +418,22 @@ bag-log timestamp. Real read-only preflight evidence is:
 - final per-sequence configured correction: **+72.548749 ms** (zero residual);
   and
 - estimated clock drift across the window: **-2.580854 ms**.
+
+Those numbers describe the completed frozen 0.15 m experiment. The next
+supported transfer run authors `frame_spacing_m: auto`; `quality_v1` resolves
+that to a 0.10 m target (about 2,288 pairs from the measured path), while fB,
+training-view count, initial-cloud size, and detected VRAM resolve the other
+three automatic controls. It keeps the validated all-frame Citrus topology so
+adaptive-keyframe behavior is not confounded with configuration cleanup.
+
+A fresh read-only adapter preflight of that cleaned configuration passed on
+2026-08-02: 228.725603 m produced an estimate of 2,288 pairs, the 0.119885166 m
+baseline and +72.548749 ms correction were recovered, all 9,875 decoded
+receiver states were `FIXED_RTK`, and the worst 11.061 ms chunk gap / 0.585 ms
+overlap were well inside the new 100 ms / 10 ms platform gates. No artifact was
+created. The complete launcher currently stops before bag payload reads or
+decoding because the internal disk has 51 GiB free, below its unchanged 65 GiB
+safety floor.
 
 The configured offset and measured drift pass the configured 15 ms gates. The
 configured camera/GPS transform composes the published UCR camera/lidar/GPS

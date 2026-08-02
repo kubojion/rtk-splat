@@ -116,7 +116,8 @@ See [PIPELINE.md](docs/architecture/PIPELINE.md) and
 Configuration has three authored layers and one measured layer:
 
 - `profiles/` owns versioned method and quality policy;
-- `robots/` owns stable topics, sensor geometry, and pose-source facts;
+- `robots/` owns stable topics, sensor geometry, pose-source, and adapter clock/
+  chunk-contract facts;
 - `sequences/` owns recording paths, windows, artifact names, and a narrow set
   of documented scene overrides; and
 - runtime resolution derives data-dependent controls only after their inputs
@@ -313,32 +314,35 @@ wheel is dataset-neutral and therefore requires an explicit experiment record:
 rtk-splat-verify --manifest /path/to/experiment-manifest.json
 ```
 
-## Prepared CitrusFarm reproduction
+## Prepared CitrusFarm generic-policy transfer
 
-The checked-in CitrusFarm candidate uses the 192 s window at 543--735 s,
-0.15 m travelled-distance sampling, stereo RGB, computed SGBM depth, and
-single-antenna Piksi RTK. Its launcher calls the same explicit workflow stages,
-writes only to an internal-disk work directory, does not use `tmux`, and
-resumes only stages whose code/config/command evidence still matches:
+The supported CitrusFarm candidate uses the 192 s window at 543--735 s,
+stereo RGB, computed SGBM depth, and single-antenna Piksi RTK. It deliberately
+tests the generic `quality_v1` runtime policy: 0.10 m metric sampling, stereo
+range from measured fB, iterations from the actual training split, and Gaussian
+capacity from the cloud and available VRAM. Its launcher writes only to a new
+internal-disk work directory, does not use `tmux`, and resumes only stages
+whose complete layered-config/code/command evidence still matches:
 
 ```bash
 bash scripts/runs/citrusfarm_05_13d_uturn.sh plan
 bash scripts/runs/citrusfarm_05_13d_uturn.sh preflight
 bash scripts/runs/citrusfarm_05_13d_uturn.sh run \
-  --workdir /home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_v2
+  --workdir /home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_auto_v1
 ```
 
-The real read-only adapter preflight measured a 228.726 m GNSS path, estimated
-about 1,525 stereo pairs, recovered a 0.119885 m recorded rig baseline, and
-estimated a +72.548749 ms camera-to-GNSS clock correction. That audited value
-is now frozen in the sequence profile (zero configured residual); estimated
-window drift was -2.581 ms, within the 15 ms gate. Recorded ZED depth and
-confidence are inventoried but are not used by this primary arm; SGBM
-publishes depth in a new immutable derived segment.
+The expected automatic choices on this machine are about 2,288 stereo pairs,
+20 m maximum stereo depth, 65,000 iterations and approximately 2.46 million
+Gaussians; these are estimates, not authored results. The exact values and
+inputs are written by the stages. The real read-only preflight previously
+measured a 228.726 m GNSS path, a 0.119885 m rig baseline and +72.548749 ms
+camera-to-GNSS clock correction. Recorded ZED depth/confidence are inventoried
+but withheld from this arm; SGBM publishes a new immutable derived segment.
 
 A 4 s real-data smoke published 10 stereo pairs, computed SGBM depth, and
 sealed a 20-image GPU frontend with all 52 requested pairs verified. The first
-full-window attempt later published 1,495 stereo pairs and registered all 2,990
+full-window **frozen 0.15 m** attempt later published 1,495 stereo pairs and
+registered all 2,990
 images at 0.973 px mean reprojection error, but it failed the untouched-block
 RTK export gate (0.266 m median and 59.2% support). A separate 31.7-minute
 position-prior refinement preserved the rig/intrinsics and improved those
@@ -349,7 +353,8 @@ preserves the receiver's own fixed/float state; the recorded NavSatFix
 covariance is explicitly static/approximated rather than live accuracy. See
 `PROGRESS.md` for the exact audit and measured stage timings. The 24.8 dB
 headland result remains a historical regression reference, not a promised or
-directly comparable CitrusFarm score.
+directly comparable CitrusFarm score. Its complete settings remain unchanged
+in `configs/reproductions/citrusfarm_05_13d_uturn_v2.yaml`.
 The rejected refinement A/B is frozen in
 `docs/experiments/citrusfarm_rtk_refinement_v1.json` so it cannot silently be
 relabelled as an accepted result later.

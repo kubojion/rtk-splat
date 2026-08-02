@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproducible CitrusFarm 05_13D window [543,735] pipeline.
+# CitrusFarm 05_13D [543,735] generic-policy transfer experiment.
 #
 # This script is deliberately stage-oriented. It never overwrites an artifact,
 # never starts in tmux, and only resumes stages carrying matching script-owned
@@ -12,19 +12,17 @@ umask 027
 readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly REPO_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/../.." && pwd -P)"
 readonly DEFAULT_CONFIG="$REPO_ROOT/configs/sequences/citrusfarm_05_13d_uturn.yaml"
-readonly ROBOT_CONFIG="$REPO_ROOT/configs/robots/citrusfarm_jackal_zed2i_piksi.yaml"
-readonly DEFAULT_WORKDIR="/home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_v2"
+readonly DEFAULT_WORKDIR="/home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_auto_v1"
 readonly DEFAULT_PYTHON="/home/jion_kubo/miniconda3/envs/rtk-splat/bin/python"
 readonly DEFAULT_COLMAP="/home/jion_kubo/miniconda3/envs/colmap-rtk/bin/colmap"
 readonly DATASET_ROOT="/media/jion_kubo/Buffalo SSD/CitrusFarm"
 readonly SEQUENCE_ROOT="$DATASET_ROOT/05_13D_Jackal"
-readonly GT_CSV="$DATASET_ROOT/ground_truth/05_13D_Jackal/gt.csv"
-readonly FRONTEND_NAME="citrus-05-13d-543-735-all-gpu-v2"
-readonly BACKEND_NAME="citrus-05-13d-543-735-global-bounded-v2"
+readonly FRONTEND_NAME="citrus-05-13d-543-735-auto-all-gpu-v1"
+readonly BACKEND_NAME="citrus-05-13d-543-735-auto-global-v1"
 readonly POSE_NAME="$BACKEND_NAME"
-readonly TRAIN_NAME="citrus-05-13d-543-735-gs-v2"
-readonly SOURCE_SEGMENT_NAME="citrus-05-13d-543-735-rgb-v2"
-readonly DERIVED_SEGMENT_NAME="citrus-05-13d-543-735-sgbm-v2"
+readonly TRAIN_NAME="citrus-05-13d-543-735-auto-gs-v1"
+readonly SOURCE_SEGMENT_NAME="citrus-05-13d-543-735-auto-rgb-v1"
+readonly DERIVED_SEGMENT_NAME="citrus-05-13d-543-735-auto-sgbm-v1"
 readonly MIN_OUTPUT_FREE_GIB=65
 
 ACTION="plan"
@@ -65,39 +63,39 @@ EOF
 
 print_plan() {
     cat <<EOF
-CitrusFarm 05_13D end-to-end plan
+CitrusFarm 05_13D generic-auto end-to-end plan
 
 Input window:
   relative time:       [543, 735] s from first Piksi bag-log timestamp
   duration/path:       192 s / approximately 229 m
-  frame policy:        0.15 m metric spacing (frame count is measured, not fixed)
-  expected scale:      roughly 1,500 stereo pairs; exact count is an output
+  frame policy:        runtime-derived 0.10 m metric target
+  expected scale:      roughly 2,288 stereo pairs; exact count is an output
   sensors used:        rectified stereo RGB + computed stereo depth + Piksi RTK
   pose source:         GNSS course, with per-recording audited clock correction
-  mapper:              bounded Global Mapper; incremental is not auto-started
-  GS supervision:      left RGB, same proven 65k/2.5M quality profile as headland
+  mapper:              all-frame bounded Global Mapper; no silent fallback
+  GS supervision:      left RGB; iterations/cap derived from views/cloud/VRAM
 
-Stages and updated estimates on this machine (first full window measured):
-  drive/config/timing preflight        2-5 min
-  ROS1 ingest + lossless extraction   10-15 min  (measured 9m53s)
-  immutable SGBM depth                  4-8 min  (measured 3m29s)
-  frontend build/features/rig           3-6 min  (measured 2m49s)
-  RTK-guided matching                  14-25 min  (measured 13m39s)
-  bounded Global Mapper                7-15 min  (measured solve 6m54s)
-  registration/quality/export           4-8 min
+Expected automatic values (the run logs the exact formula and inputs):
+  depth maximum:       20 m from measured fB, bounded by the quality profile
+  training:            likely 65k iterations after the actual split is known
+  Gaussian capacity:   likely about 2.46M on this GPU after cloud creation
+
+Stages and conservative estimates on this machine:
+  drive/config/timing preflight        4-7 min  (current USB2 scan measured ~4.5 min)
+  ingest through held-out pose gate    55-90 min
   pose-matched initialization cloud     5-20 min
   65k Gaussian training + final eval   3-5 h
-  total if every pose gate passes       approximately 4-6 h
+  total if every pose gate passes       approximately 5-8 h; allow 8-10 h
 
-The first visual-only solve registered every image but failed the independent
-held-out RTK export gate. Repeating the same mapper is not expected to cure
-that time-dependent pose disagreement; preserve the failed evidence and use a
-new workdir only for a provenance-complete reproduction after pose refinement.
+This is a new transfer test of runtime derivation, not a reproduction of the
+completed 0.15 m arm. The old arm is immutable under configs/reproductions/.
+The denser run may still stop honestly at the held-out RTK gate after about an
+hour; automatic resource settings do not hide a trajectory/GNSS disagreement.
 
 The headland 24.8 dB result is a regression reference, not a cross-dataset
 threshold: CitrusFarm has different cameras, resolution, motion, foliage and
 validation views. This run enforces complete stereo registration, held-out RTK
-gates and identical high-quality GS settings; its PSNR is measured honestly.
+gates and the same named high-quality policy; its PSNR is measured honestly.
 
 Nothing runs from plan. Start with:
   $SCRIPT_PATH preflight
@@ -193,9 +191,7 @@ nearest_existing_parent() {
 
 verify_required_files() {
     [[ -r "$CONFIG" ]] || die "missing config: $CONFIG"
-    [[ -r "$ROBOT_CONFIG" ]] || die "missing robot profile: $ROBOT_CONFIG"
     [[ -d "$DATASET_ROOT" ]] || die "CitrusFarm is not mounted at $DATASET_ROOT"
-    [[ -r "$GT_CSV" ]] || die "missing evaluation trajectory: $GT_CSV"
 
     local -a camera_bags gnss_bags
     mapfile -d '' camera_bags < <(
@@ -344,8 +340,8 @@ if list(map(float, cfg.segment.window_s)) != [543.0, 735.0]:
     raise SystemExit("window must remain [543,735] seconds")
 if cfg.segment.window_epoch_source != "first_gnss_log":
     raise SystemExit("window epoch must be first_gnss_log")
-if float(cfg.segment.frame_spacing_m) != 0.15:
-    raise SystemExit("frame spacing must remain 0.15 m")
+if cfg.segment.frame_spacing_m != "auto":
+    raise SystemExit("supported transfer config must derive frame spacing")
 if len(cfg.paths.camera_bags) != 27 or len(cfg.paths.gnss_bags) != 2:
     raise SystemExit("config does not declare the complete ordered bag chain")
 if cfg.pose.source != "gnss_course":
@@ -364,10 +360,20 @@ if int(cfg.frontend.pose_priors.min_carrier_status) != 2:
     raise SystemExit("Citrus COLMAP priors must require receiver-fixed RTK")
 if abs(float(cfg.pose.time_offset_s) - 0.072548749) > 1e-12:
     raise SystemExit("audited sequence clock correction must remain +0.072548749 s")
-if cfg.mapper.backend != "global" or cfg.mapper.name != "citrus-05-13d-543-735-global-bounded-v2":
-    raise SystemExit("unexpected mapper backend/artifact")
+if cfg.frontend.keyframes.preset != "all":
+    raise SystemExit("Citrus transfer must retain the validated all-frame topology")
+if cfg.mapper.backend != "global":
+    raise SystemExit("unexpected mapper backend")
 if cfg.depth.backend != "sgbm":
-    raise SystemExit("this primary reproduction requires an immutable SGBM depth segment")
+    raise SystemExit("this transfer experiment requires an immutable SGBM depth segment")
+if cfg.depth.max_z_m != "auto":
+    raise SystemExit("supported transfer config must derive stereo depth range")
+if cfg.train.iterations != "auto" or cfg.train.max_gaussians != "auto":
+    raise SystemExit("supported transfer config must derive training resources")
+if hasattr(cfg, "rtk_refinement"):
+    raise SystemExit("optional RTK-refinement experiments do not belong in the active config")
+if hasattr(cfg.paths, "dataset_root") or hasattr(cfg.paths, "ground_truth_csv"):
+    raise SystemExit("unused dataset/evaluation paths do not belong in mapping config")
 if cfg.mapper.rtk_covariance_gate_mode != "diagnostic_only":
     raise SystemExit("static approximate covariance cannot enforce the chi-square gate")
 t = np.asarray(cfg.sensor_geometry.T_camera_primary_antenna, dtype=float)
@@ -389,7 +395,11 @@ print(json.dumps({
     "gnss_bags": len(cfg.paths.gnss_bags),
     "window_s": cfg.segment.window_s,
     "window_epoch_source": cfg.segment.window_epoch_source,
-    "frame_spacing_m": cfg.segment.frame_spacing_m,
+    "authored_frame_spacing_m": cfg.segment.frame_spacing_m,
+    "keyframe_preset": cfg.frontend.keyframes.preset,
+    "depth_max_z_m": cfg.depth.max_z_m,
+    "train_iterations": cfg.train.iterations,
+    "train_max_gaussians": cfg.train.max_gaussians,
     "clock_offset_s": cfg.pose.time_offset_s,
     "receiver_state_required": cfg.gnss_quality.receiver_state_required,
     "covariance_provenance": cfg.gnss_quality.covariance_provenance,
@@ -426,6 +436,9 @@ if covariance.get("configured_provenance") != "driver_static_nominal":
     raise SystemExit("Citrus covariance provenance was not retained")
 if covariance.get("is_live_per_epoch") is not False:
     raise SystemExit("Citrus static covariance was incorrectly labelled live")
+spacing = float((report.get("sampling") or {}).get("frame_spacing_m", 0.0))
+if abs(spacing - 0.10) > 1e-12:
+    raise SystemExit(f"automatic metric spacing resolved unexpectedly: {spacing}")
 def chain_summary(chain):
     gaps = [int(value) for value in chain["gaps_ns"]]
     return {
@@ -477,7 +490,18 @@ fi
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 
 CONFIG_FINGERPRINT="$({
-    sha256sum "$CONFIG" "$ROBOT_CONFIG" "$SCRIPT_PATH"
+    "$PYTHON" - "$CONFIG" <<'PY'
+import json
+import sys
+from rtk_splat.workflows.configio import load_config
+
+cfg = load_config(sys.argv[1])
+print(json.dumps([
+    {"role": item.role, "path": item.path, "sha256": item.sha256}
+    for item in cfg.runtime_resolution.source_files
+], sort_keys=True, separators=(",", ":")))
+PY
+    sha256sum "$SCRIPT_PATH"
     find "$REPO_ROOT/src/rtk_splat" -type f -name '*.py' -print0 \
         | sort -z | xargs -0 sha256sum
     git -C "$REPO_ROOT" rev-parse HEAD
@@ -598,10 +622,10 @@ PY
 
 run_stage frontend-build \
     "${CLI[@]}" frontend-build "${COMMON[@]}" \
-    --frontend-name "$FRONTEND_NAME" --keyframe-preset all --feature-profile gpu
+    --frontend-name "$FRONTEND_NAME"
 run_stage frontend-features \
     "${CLI[@]}" frontend-features "${COMMON[@]}" \
-    --frontend-name "$FRONTEND_NAME" --feature-profile gpu
+    --frontend-name "$FRONTEND_NAME"
 run_stage frontend-rig \
     "${CLI[@]}" frontend-rig "${COMMON[@]}" --frontend-name "$FRONTEND_NAME"
 run_stage frontend-priors \

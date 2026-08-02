@@ -160,6 +160,8 @@ class ConfigProfileTests(unittest.TestCase):
             (robots / "good.yaml").write_text(
                 "topics: {left_image: /camera/left}\n"
                 "pose: {source: gnss_course}\n"
+                "segment: {maximum_bag_gap_s: 0.1, image_encoding: png_lossless}\n"
+                "timing: {clock_model: ros_log_constant}\n"
             )
             sequence = sequences / "sequence_bad.yaml"
             sequence.write_text(
@@ -177,6 +179,7 @@ class ConfigProfileTests(unittest.TestCase):
                 "feature policy": "frontend: {features: {profile: cpu_reference}}\n",
                 "loss policy": "train: {ssim_lambda: 0.4}\n",
                 "robot-only path": "paths: {workdir: /run, ublox_msgs_dir: /msgs}\n",
+                "unused dataset root": "paths: {workdir: /run, dataset_root: /data}\n",
             }
             for label, body in forbidden_nested.items():
                 with self.subTest(layer="sequence", option=label):
@@ -184,7 +187,8 @@ class ConfigProfileTests(unittest.TestCase):
                     prefix = "paths: {workdir: /run}\n" if not body.startswith("paths:") else ""
                     candidate.write_text(prefix + body)
                     with self.assertRaisesRegex(
-                        ValueError, "unknown configuration option"
+                        ValueError,
+                        "unknown configuration option|sequence layer cannot own option",
                     ):
                         load_config(candidate)
 
@@ -212,6 +216,8 @@ class ConfigProfileTests(unittest.TestCase):
                 "robot: robot\n"
                 "paths: {workdir: /run}\n"
                 "pose: {time_offset_s: 0.04}\n"
+                "segment: {maximum_bag_gap_s: 0.2}\n"
+                "timing: {maximum_window_drift_s: 0.025}\n"
                 "depth: {max_z_m: 18.0}\n"
                 "frontend:\n"
                 "  keyframes: {preset: all}\n"
@@ -225,6 +231,8 @@ class ConfigProfileTests(unittest.TestCase):
             self.assertEqual(cfg.frontend.features.profile, "gpu")
             self.assertEqual(cfg.frontend.keyframes.preset, "all")
             self.assertEqual(cfg.pose.time_offset_s, 0.04)
+            self.assertEqual(cfg.segment.maximum_bag_gap_s, 0.2)
+            self.assertEqual(cfg.timing.maximum_window_drift_s, 0.025)
             self.assertEqual(cfg.depth.max_z_m, 18.0)
             self.assertEqual(cfg.mapper.max_rtk_median_error_m, 0.20)
             self.assertEqual(cfg.train.iterations, 50000)

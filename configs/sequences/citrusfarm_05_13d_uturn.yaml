@@ -1,12 +1,12 @@
-# Supported CitrusFarm sequence: recording facts and evidence-based overrides.
-# Generic mapping/training policy comes from profiles/quality_v1.yaml. The
-# complete accepted v2 experiment remains immutable in reproductions/.
+# Supported CitrusFarm transfer experiment: recording facts and independent
+# georeferencing acceptance gates only. Method policy and runtime-derived
+# values come from quality_v1; the completed 0.15 m/all-frame experiment stays
+# byte-for-byte frozen under reproductions/.
 profile: quality_v1
 robot: citrusfarm_jackal_zed2i_piksi
 
 paths:
-  workdir: ~/agromap4d_work/citrusfarm_05_13d_543_735_v2
-  dataset_root: /media/jion_kubo/Buffalo SSD/CitrusFarm
+  workdir: ~/agromap4d_work/citrusfarm_05_13d_543_735_auto_v1
   camera_bags:
     - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-05-13_0.bag
     - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-05-42_1.bag
@@ -38,7 +38,6 @@ paths:
   gnss_bags:
     - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/base_2023-07-16-17-05-13_0.bag
     - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/base_2023-07-16-17-13-40_1.bag
-  ground_truth_csv: /media/jion_kubo/Buffalo SSD/CitrusFarm/ground_truth/05_13D_Jackal/gt.csv
 
 pose:
   time_offset_s: 0.072548749
@@ -46,67 +45,22 @@ pose:
 segment:
   window_s: [543.0, 735.0]
   window_epoch_source: first_gnss_log
-  # Measured choice from the completed v2 experiment; metric sampler consumes
-  # this directly, so it intentionally overrides quality_v1's generic target.
-  frame_spacing_m: 0.15
-  expected_camera_bag_count: 27
-  expected_gnss_bag_count: 2
-  maximum_bag_gap_s: 1.0
-  maximum_bag_overlap_s: 0.10
-  image_encoding: png_lossless
-
-timing:
-  clock_model: ros_log_constant
-  maximum_offset_error_s: 0.015
-  maximum_window_drift_s: 0.015
-
-depth:
-  # Explicit accepted value; the frozen run did not use automatic range.
-  max_z_m: 20.0
+  # quality_v1 derives the target from its named metric-sampling policy and
+  # ingest records the measured path length, formula, and selected value.
+  frame_spacing_m: auto
 
 frontend:
-  name: citrus-05-13d-543-735-all-gpu-v2
-  turn_rate_deg_s: 5.0
+  # Keep the already validated fast-motion/topology choice for this transfer
+  # run. Adaptive keyframes need their own controlled A/B, not a config edit.
   keyframes:
     preset: all
-  pairs:
-    max_view_angle_deg: 110.0
 
 mapper:
-  name: citrus-05-13d-543-735-global-bounded-v2
-  pose_artifact_name: citrus-05-13d-543-735-global-bounded-v2
+  # These remain authored metre gates: static driver covariance is evidence,
+  # not permission to relax georeferencing acceptance automatically.
   alignment_ransac_threshold_m: 0.30
   max_rtk_median_error_m: 0.15
   max_rtk_p95_inlier_error_m: 0.30
 
-# Optional, explicit mapper-neutral position-prior experiment. It remains out
-# of the normal workflow unless its dedicated stage is requested.
-rtk_refinement:
-  name: citrus-05-13d-543-735-rtk-refined-v1
-  num_threads: 8
-  random_seed: 7
-  ba_global_max_num_iterations: 50
-  ba_global_max_refinements: 3
-  initialization_mode: continuation
-  prior_position_loss_scale: 2.795
-  process_nice: 10
-  resource_sample_interval_s: 2.0
-  minimum_available_memory_gb: 4.0
-  low_memory_consecutive_samples: 2
-  minimum_free_space_gb: 10.0
-  minimum_runtime_free_space_gb: 5.0
-  max_reprojection_regression_px: 0.10
-  min_track_length_retention: 0.90
-  fresh_min_mean_track_length: 3.0
-  fresh_min_mean_observations_per_image: 500.0
-  max_trajectory_scale_deviation: 0.005
-  max_stereo_baseline_change_m: 5.0e-5
-  max_calibration_parameter_change: 1.0e-9
-  max_holdout_median_regression_m: 0.01
-  min_holdout_median_improvement_m: 0.005
-
 train:
-  run_name: citrus-05-13d-543-735-gs-v2
-  # Explicit accepted v2 values. New sequences can leave quality_v1 on auto.
-  max_gaussians: 2500000
-  iterations: 65000
+  run_name: citrus-05-13d-543-735-auto-gs-v1
