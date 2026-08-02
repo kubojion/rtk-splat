@@ -1,0 +1,181 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from rtk_splat.adapters.sampling import resolve_frame_stride
+from rtk_splat.core.runtime_resolution import (
+    configuration_evidence,
+    runtime_resolution_plain,
+    set_runtime_cli_override,
+)
+from rtk_splat.workflows.config_ledger import (
+    authored_config_plain,
+    commit_config_ledger,
+    prepare_config_ledger,
+)
+from rtk_splat.workflows.configio import load_config
+from rtk_splat.workflows import cli
+
+
+class ConfigLedgerTests(unittest.TestCase):
+    def _layout(self, root: Path) -> tuple[Path, Path, Path]:
+        profiles = root / "profiles"
+        sequences = root / "sequences"
+        profiles.mkdir()
+        sequences.mkdir()
+        profile = profiles / "quality.yaml"
+        profile.write_text(
+            "derivation:\n"
+            "  frame_sampling: {target_spacing_m: 0.10}\n"
+        )
+        workdir = root / "work"
+        sequence = sequences / "field.yaml"
+        sequence.write_text(
+            f"profile: quality\npaths: {{workdir: {workdir}}}\n"
+            "segment: {frame_stride: auto}\n"
+        )
+        return profile, sequence, workdir
+
+    def test_separate_invocations_accumulate_without_applying_old_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, sequence, workdir = self._layout(Path(tmp))
+            first = load_config(sequence)
+            authored = authored_config_plain(first)
+            prepare_config_ledger(
+                first, stage="ingest", authored_config=authored
+            )
+            resolve_frame_stride(
+                first,
+                measured_camera_rate_hz=15.0,
+                measured_median_speed_m_s=0.75,
+            )
+            ledger_path = commit_config_ledger(
+                first, authored_config=authored
+            )
+
+            second = load_config(sequence)
+            second_authored = authored_config_plain(second)
+            self.assertEqual(second.segment.frame_stride, "auto")
+            prepare_config_ledger(
+                second, stage="validate", authored_config=second_authored
+            )
+
+            # Hydration carries proof forward but never turns an authored auto
+            # control into a stale operational value.
+            self.assertEqual(second.segment.frame_stride, "auto")
+            record = runtime_resolution_plain(second)["derivations"][
+                "frame_stride"
+            ]
+            self.assertEqual(record["chosen_value"], 2)
+            commit_config_ledger(second, authored_config=second_authored)
+
+            ledger = json.loads(ledger_path.read_text())
+            self.assertEqual(ledger["authored_config"], authored)
+            self.assertEqual(len(ledger["stages"]), 2)
+            self.assertIn("frame_stride", ledger["derivations"])
+
+            # A comment-only source change leaves merged values identical but
+            # still invalidates the source identity.
+            profile.write_text(profile.read_text() + "# changed source\n")
+            changed = load_config(sequence)
+            with self.assertRaisesRegex(ValueError, "source_files"):
+                prepare_config_ledger(
+                    changed,
+                    stage="validate",
+                    authored_config=authored_config_plain(changed),
+                )
+            self.assertEqual(
+                ledger_path,
+                workdir / "config_artifacts/resolved_config.json",
+            )
+
+    def test_cli_override_is_separate_and_changes_effective_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, sequence, _ = self._layout(Path(tmp))
+            cfg = load_config(sequence)
+            authored = authored_config_plain(cfg)
+            prepare_config_ledger(
+                cfg,
+                stage="train",
+                authored_config=authored,
+                stage_overrides={"train_iters": 42000},
+            )
+            before = configuration_evidence(cfg)["effective_config_sha256"]
+            cfg.train = type(cfg)(iterations="auto")
+            set_runtime_cli_override(
+                cfg,
+                "train_iterations",
+                cfg.train.iterations,
+                42000,
+                option="--train-iters",
+                config_path="train.iterations",
+            )
+            cfg.train.iterations = 42000
+            evidence = configuration_evidence(cfg)
+
+            self.assertNotEqual(before, evidence["effective_config_sha256"])
+            self.assertEqual(
+                evidence["stage_overrides"], {"train_iters": 42000}
+            )
+            self.assertEqual(
+                evidence["runtime_resolution"]["cli_overrides"]
+                ["train_iterations"]["option"],
+                "--train-iters",
+            )
+            self.assertEqual(authored["segment"]["frame_stride"], "auto")
+
+    def test_failed_stage_does_not_create_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, sequence, workdir = self._layout(Path(tmp))
+            cfg = load_config(sequence)
+            prepare_config_ledger(
+                cfg,
+                stage="ingest",
+                authored_config=authored_config_plain(cfg),
+            )
+            self.assertFalse(
+                (workdir / "config_artifacts/resolved_config.json").exists()
+            )
+
+    def test_cli_commits_only_after_successful_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / "successful"
+            config = root / "config.yaml"
+            config.write_text(f"paths: {{workdir: {workdir}}}\n")
+            observed = {}
+
+            def success(cfg, _args):
+                path = Path(cfg.config_ledger.path)
+                observed["prepared"] = True
+                observed["absent_during_stage"] = not path.exists()
+
+            with mock.patch.dict(cli.COMMANDS, {"validate": success}):
+                self.assertEqual(
+                    cli.main(["validate", "--config", str(config)]), 0
+                )
+            self.assertTrue(observed["prepared"])
+            self.assertTrue(observed["absent_during_stage"])
+            self.assertTrue(
+                (workdir / "config_artifacts/resolved_config.json").is_file()
+            )
+
+            failed_workdir = root / "failed"
+            failed = root / "failed.yaml"
+            failed.write_text(f"paths: {{workdir: {failed_workdir}}}\n")
+
+            def failure(_cfg, _args):
+                raise RuntimeError("synthetic stage failure")
+
+            with mock.patch.dict(cli.COMMANDS, {"validate": failure}):
+                with self.assertRaisesRegex(RuntimeError, "synthetic"):
+                    cli.main(["validate", "--config", str(failed)])
+            self.assertFalse(
+                (failed_workdir / "config_artifacts/resolved_config.json").exists()
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

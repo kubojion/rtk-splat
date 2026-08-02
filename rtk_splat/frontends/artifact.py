@@ -361,6 +361,7 @@ def collect_provenance(
     segment: str | Path,
     *,
     resolved_config: Mapping[str, Any],
+    configuration: Mapping[str, Any] | None = None,
     colmap: Mapping[str, Any] | str | Path,
     seed: int,
     repo_root: str | Path,
@@ -383,7 +384,11 @@ def collect_provenance(
     return {
         "schema_version": 1,
         "git": collect_git_state(repo_root),
+        "resolved_config": _normal(resolved_config),
         "resolved_config_sha256": canonical_hash(resolved_config),
+        "configuration": _normal(
+            resolved_config if configuration is None else configuration
+        ),
         "colmap": colmap_record,
         "seed": seed,
         "contract_inputs": {

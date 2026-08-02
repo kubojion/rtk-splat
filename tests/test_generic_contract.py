@@ -26,7 +26,7 @@ from rtk_splat.adapters.ros2_zed_ublox import (
     RtkTrack,
     publish_segment_v2,
 )
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 from rtk_splat.core.segment import CAPABILITIES, SegmentReader
 
 
@@ -582,6 +582,16 @@ class AdapterRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown adapter"):
             publish_from_config(
                 SimpleNamespace(adapter="not-real"),
+                Path("/new/segment"),
+            )
+
+    def test_builtin_adapter_rejects_unvalidated_namespaced_options(self):
+        with self.assertRaisesRegex(ValueError, "does not declare any"):
+            publish_from_config(
+                SimpleNamespace(
+                    adapter="ros2_zed_ublox",
+                    adapter_options=SimpleNamespace(vendor_mode=True),
+                ),
                 Path("/new/segment"),
             )
 

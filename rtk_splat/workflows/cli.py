@@ -16,10 +16,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import cv2
 import numpy as np
 
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
+from rtk_splat.workflows.config_ledger import (
+    authored_config_plain,
+    commit_config_ledger,
+    prepare_config_ledger,
+)
 from rtk_splat.core.segment import SegmentReader
 
 
@@ -233,6 +237,7 @@ def _frontend_configs(cfg, args):
 
 
 def cmd_frontend_build(cfg, args) -> None:
+    from rtk_splat.core.runtime_resolution import configuration_evidence
     from rtk_splat.frontends.artifact import (
         FrontendArtifactBuilder,
         collect_provenance,
@@ -259,6 +264,7 @@ def cmd_frontend_build(cfg, args) -> None:
     provenance = collect_provenance(
         reader.root,
         resolved_config=resolved,
+        configuration=configuration_evidence(cfg),
         colmap=_colmap(cfg),
         seed=seed,
         repo_root=REPO_ROOT,
@@ -423,83 +429,26 @@ def cmd_backend_export(cfg, args) -> None:
 
 
 def cmd_cloud(cfg, args) -> None:
-    from rtk_splat.core.cloud import backproject, to_world, voxel_downsample
-    from rtk_splat.core.pose_artifacts import (
-        cloud_path,
-        load_pose_artifact,
-        pose_artifact_name,
-        pose_fingerprint,
-    )
+    from rtk_splat.workflows.cloud import construct_initial_cloud
 
     reader = _reader(cfg, args)
     if args.pose_name:
         cfg.pose.artifact = args.pose_name
-    frames = reader.frames
-    viewmats, _ = load_pose_artifact(reader.root, cfg)
-    camera = reader.calibration["cameras"]["left"]
-    k = np.asarray(camera["K"], dtype=float)
-    intrinsics = {
-        "fx": float(k[0, 0]),
-        "fy": float(k[1, 1]),
-        "cx": float(k[0, 2]),
-        "cy": float(k[1, 2]),
-    }
-    if "depth_path" not in frames or any(not str(path) for path in frames["depth_path"]):
-        raise RuntimeError("cloud construction requires depth for every frame")
-    points, colours = [], []
-    for frame_id in reader.manifest["train"]:
-        index = int(frame_id)
-        with np.load(reader.root / str(frames["depth_path"][index])) as depth:
-            image = cv2.imread(str(reader.root / str(frames["left_image_path"][index])))
-            if image is None:
-                raise RuntimeError(f"cannot read frame {index}")
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            xyz, colour = backproject(
-                depth["depth"].astype(np.float32),
-                depth["valid"].astype(bool),
-                rgb,
-                intrinsics,
-                int(cfg.cloud.pixel_stride),
-            )
-        points.append(to_world(xyz, viewmats[index]))
-        colours.append(colour)
-    xyz = np.concatenate(points).astype(np.float32)
-    rgb = np.concatenate(colours)
-    xyz, rgb = voxel_downsample(
-        xyz, rgb, float(cfg.cloud.voxel_m), int(cfg.cloud.max_points)
-    )
-    output = cloud_path(reader.root, cfg)
-    if output.exists():
-        raise FileExistsError(f"refusing to overwrite cloud artifact: {output}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("xb") as stream:
-            np.savez_compressed(
-                stream,
-                xyz=xyz,
-                rgb=rgb,
-                pose_fingerprint=np.asarray(pose_fingerprint(viewmats)),
-                pose_artifact=np.asarray(pose_artifact_name(cfg)),
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, output)
-    finally:
-        temporary.unlink(missing_ok=True)
-    print(f"initial cloud: {len(xyz):,} points -> {output}")
+    output, point_count = construct_initial_cloud(reader, cfg)
+    print(f"initial cloud: {point_count:,} points -> {output}")
 
 
 def cmd_train(cfg, args) -> None:
     if args.pose_name:
         cfg.pose.artifact = args.pose_name
-    if args.train_iters is not None:
-        cfg.train.iterations = args.train_iters
     if args.run_name:
         cfg.train.run_name = args.run_name
     from rtk_splat.backends.gsplat import train_tile
+    from rtk_splat.core.pose_artifacts import cloud_path
+    from rtk_splat.workflows.runtime_config import resolve_training_controls
 
     reader = _reader(cfg, args)
+    resolve_training_controls(cfg, reader, cloud_path(reader.root, cfg))
     run = Path(cfg.paths.workdir) / "runs" / str(cfg.train.run_name)
     result = train_tile(reader.root, run, cfg)
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -529,6 +478,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rtk-splat")
     parser.add_argument("stage", choices=tuple(COMMANDS))
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument(
+        "--config-root",
+        type=Path,
+        help="external directory containing profiles/ and robots/",
+    )
     parser.add_argument("--workdir", type=Path, help="new experiment root override")
     parser.add_argument("--segment", type=Path, help="immutable v2 segment override")
     parser.add_argument(
@@ -571,6 +525,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _stage_overrides(args) -> dict[str, Any]:
+    """Return only explicit command-line controls, separate from YAML."""
+    names = (
+        "workdir", "segment", "derived_segment", "frontend_name",
+        "feature_profile", "keyframe_preset", "backend", "backend_name",
+        "refinement_name", "initialization_mode", "prior_position_loss",
+        "pose_name", "run_name", "train_iters", "expected_frames",
+    )
+    result = {
+        name: _plain(getattr(args, name))
+        for name in names
+        if getattr(args, name) is not None
+    }
+    if args.skip_image_quality:
+        result["skip_image_quality"] = True
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.train_iters is not None and args.train_iters <= 0:
@@ -591,13 +563,33 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(
             "--initialization-mode is valid only for backend-refine-rtk"
         )
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, config_root=args.config_root)
+    authored_config = authored_config_plain(cfg)
     if args.workdir is not None:
         cfg.paths.workdir = args.workdir.expanduser()
     if args.segment is not None:
         cfg.paths.segment = args.segment.expanduser()
     cfg.paths.workdir = Path(cfg.paths.workdir).expanduser()
+    prepare_config_ledger(
+        cfg,
+        stage=args.stage,
+        authored_config=authored_config,
+        stage_overrides=_stage_overrides(args),
+    )
+    if args.train_iters is not None:
+        from rtk_splat.core.runtime_resolution import set_runtime_cli_override
+
+        set_runtime_cli_override(
+            cfg,
+            "train_iterations",
+            cfg.train.iterations,
+            args.train_iters,
+            option="--train-iters",
+            config_path="train.iterations",
+        )
+        cfg.train.iterations = args.train_iters
     COMMANDS[args.stage](cfg, args)
+    commit_config_ledger(cfg, authored_config=authored_config)
     return 0
 
 

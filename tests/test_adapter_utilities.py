@@ -181,6 +181,53 @@ import rtk_splat.adapters.ros1_citrusfarm
 
 
 class Ros2EvidenceTests(unittest.TestCase):
+    def test_camera_rate_measurement_uses_bounded_header_sample(self):
+        connection = SimpleNamespace(topic="/left", msgtype="Image")
+        messages = [
+            SimpleNamespace(
+                header=SimpleNamespace(
+                    stamp=SimpleNamespace(sec=10, nanosec=index * 100_000_000)
+                )
+            )
+            for index in range(6)
+        ]
+
+        class FakeReader:
+            def __init__(self, _path):
+                self.connections = [connection]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def messages(self, *, connections, start=None, stop=None):
+                self.assert_connections = connections
+                for message in messages:
+                    yield connection, 10_000_000_000, message
+
+        typestore = SimpleNamespace(deserialize_cdr=lambda raw, _kind: raw)
+        with patch.object(ros2_adapter, "_reader_type", return_value=FakeReader):
+            rate = ros2_adapter.measure_camera_header_rate(
+                [Path("/fake/bag")],
+                "/left",
+                typestore,
+                10.0,
+                10.5,
+            )
+        self.assertAlmostEqual(rate, 10.0)
+
+    def test_track_speed_measurement_uses_selected_window(self):
+        track = SimpleNamespace(
+            fix_t=np.array([0.0, 1.0, 2.0, 3.0]),
+            enu_xyz=np.array(
+                [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0],
+                 [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]]
+            ),
+        )
+        self.assertEqual(ros2_adapter.measure_track_speed(track, 0.0, 2.0), 0.5)
+
     def test_frame_record_retains_exact_header_nanoseconds(self):
         record = FrameRecord(
             t=1_700_000_000.1234567,

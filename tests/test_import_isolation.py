@@ -46,6 +46,7 @@ MOVED_MODULES = {
     "cli.py",
     "colmap_global.py",
     "colmap_stereo.py",
+    "configio.py",
     "ingest_agrigs.py",
     "metric_calibration.py",
     "pose_sources.py",
@@ -54,6 +55,12 @@ MOVED_MODULES = {
 
 
 class CoreIsolationTests(unittest.TestCase):
+    def test_pose_sources_do_not_import_the_concrete_ros2_adapter(self):
+        pose_sources = (PACKAGE / "adapters" / "pose_sources.py").read_text()
+        rtk_io = (PACKAGE / "adapters" / "ros2_rtk_io.py").read_text()
+        self.assertNotIn("ros2_zed_ublox", pose_sources)
+        self.assertNotIn("pose_sources", rtk_io)
+
     def test_core_has_no_ros_dataset_or_backend_imports(self):
         violations = []
         for path in sorted(CORE.glob("*.py")):

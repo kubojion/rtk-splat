@@ -16,7 +16,7 @@ from typing import Sequence
 from rosbags.rosbag2 import Reader
 from rosbags.typesys import Stores, get_types_from_msg, get_typestore
 
-from ..diagnostics.calibration_io import (
+from .records import (
     CalibrationBagObservations,
     NavPvtStatusObservation,
     NavSatFixObservation,

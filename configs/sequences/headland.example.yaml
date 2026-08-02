@@ -1,6 +1,7 @@
 # Per-recording facts only. Stable topics and measured geometry come from the
 # named robot profile in ../robots.
 robot: zed_dual_rtk.example
+profile: quality_v1
 
 paths:
   bags:
@@ -9,7 +10,7 @@ paths:
 
 segment:
   window_s: [2750.0, 3200.0]
-  frame_stride: 5
+  frame_stride: auto
   validation_every: 8
   stereo_tolerance_s: 0.02
   association_tolerance_s: 0.15

@@ -47,6 +47,17 @@ class DepthWorkflowTests(unittest.TestCase):
             self.assertEqual(
                 derived.meta["depth_observation"]["quantity"], "optical_z"
             )
+            configuration = derived.meta["derived_segment"]["configuration"]
+            self.assertEqual(
+                configuration["effective_config"]["depth"]["max_z_m"],
+                10.0,
+            )
+            self.assertEqual(
+                configuration["runtime_resolution"]["derivations"]
+                ["depth_max_z_m"]["source"],
+                "override",
+            )
+            self.assertEqual(len(configuration["effective_config_sha256"]), 64)
             with self.assertRaises(FileExistsError):
                 derive_sgbm_depth(source.root, derived.root, cfg)
 

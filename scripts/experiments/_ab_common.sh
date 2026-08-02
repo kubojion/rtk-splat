@@ -284,7 +284,7 @@ ab_read_segment() {
 import sys
 from pathlib import Path
 
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 from rtk_splat.core.segment import SegmentReader
 
 cfg = load_config(sys.argv[1])
@@ -326,7 +326,7 @@ PY
     AB_CONFIG_WORKDIR="${info[3]}"
     "$AB_PYTHON" - "$AB_CONFIG" <<'PY'
 import sys
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 
 cfg = load_config(sys.argv[1])
 if getattr(cfg.pose, "artifact_root", None) is not None:
@@ -432,7 +432,7 @@ import hashlib
 import json
 import sys
 
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 from rtk_splat.workflows.cli import _plain
 
 resolved = _plain(load_config(sys.argv[1]))
@@ -566,7 +566,7 @@ import json
 import sys
 from pathlib import Path
 
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 from rtk_splat.core.pose_artifacts import load_pose_artifact
 
 cfg = load_config(sys.argv[1])
@@ -791,7 +791,7 @@ ab_verify_cloud() {
 import sys
 from pathlib import Path
 
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 from rtk_splat.core.pose_artifacts import (
     cloud_path,
     load_pose_artifact,

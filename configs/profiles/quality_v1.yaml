@@ -1,0 +1,165 @@
+# Named, versioned candidate high-quality policy. Its automatic rules are
+# empirical operating bounds awaiting cross-dataset A/B validation, not a
+# guarantee of best quality or physical constants. Every new dataset must pass
+# pose/georeferencing and GS acceptance gates. Numeric robot/sequence values
+# override the automatic rules.
+
+segment:
+  validation_every: 8
+  stereo_tolerance_s: 0.02
+  association_tolerance_s: 0.15
+
+derivation:
+  frame_sampling:
+    # A raw-stream sequence opts in with `segment.frame_stride: auto`.
+    # Metric-sampling adapters opt in with `segment.frame_spacing_m: auto`.
+    target_spacing_m: 0.10
+  depth:
+    # SGBM range is fB/disparity, bounded because tiny disparities are not a
+    # trustworthy reason to supervise arbitrarily distant geometry.
+    min_reliable_disparity_px: 1.0
+    max_z_cap_m: 20.0
+  training:
+    # One iteration presents one view. Bounds avoid under-training small
+    # segments and unbounded runtimes on long recordings.
+    image_presentations_per_view: 50.0
+    min_iterations: 30000
+    max_iterations: 65000
+    # Empirical budget for this gsplat implementation; runtime records the
+    # detected GPU and exact calculation. Override max_gaussians explicitly
+    # when a different renderer/memory profile has been measured.
+    gaussians_per_gib: 400000
+    reserve_vram_gib: 1.5
+    initial_cloud_growth_factor: 3.0
+    min_gaussians: 500000
+    max_gaussians: 3400000
+    vram_gib_override: null
+
+depth:
+  backend: sgbm
+  min_z_m: 0.5
+  max_z_m: auto
+  sgbm:
+    num_disparities: 128
+    block_size: 5
+    uniqueness_ratio: 10
+    speckle_window: 100
+    speckle_range: 2
+
+frontend:
+  seed: 7
+  turn_rate_deg_s: 3.0
+  keyframes:
+    preset: balanced
+  features:
+    profile: gpu
+    max_image_size: -1
+    num_threads: 8
+    max_num_features: 8192
+    gpu_index: -1
+  matching:
+    use_gpu: true
+    gpu_index: -1
+    num_threads: 8
+  pairs:
+    temporal_max_distance_m: 1.5
+    temporal_max_seconds: 3.0
+    max_temporal_neighbors: 4
+    revisit_distance_m: 0.75
+    revisit_min_separation_s: 10.0
+    max_revisit_neighbors: 3
+    max_cross_frame_degree: 8
+    max_view_angle_deg: 100.0
+    registration_max_distance_m: 1.5
+    registration_max_seconds: 3.0
+    max_registration_neighbors: 2
+    match_right_camera_temporally: true
+
+mapper:
+  backend: global
+  num_threads: 8
+  random_seed: 7
+  min_num_matches: 15
+  ba_num_iterations: 3
+  keep_max_num_tracks: 60000
+  track_required_tracks_per_view: 1000
+  skip_retriangulation: true
+  gp_use_gpu: false
+  ba_ceres_use_gpu: false
+  process_nice: 10
+  resource_sample_interval_s: 2.0
+  minimum_available_memory_gb: 4.0
+  low_memory_consecutive_samples: 2
+  minimum_free_space_gb: 15.0
+  minimum_runtime_free_space_gb: 5.0
+  require_all_keyframes: true
+  require_all_frames: true
+  max_reprojection_error_px: 2.0
+  min_mean_track_length: 2.0
+  alignment_ransac_threshold_m: 0.15
+  alignment_ransac_iterations: 5000
+  alignment_temporal_blocks: 5
+  # These are independent acceptance caps, not covariance-derived solver
+  # weights. Dataset sequences may tighten or relax them with stated evidence.
+  max_rtk_median_error_m: 0.12
+  max_rtk_p95_inlier_error_m: 0.20
+  min_rtk_inlier_fraction: 0.80
+  rtk_chi2_inlier_probability: 0.95
+  max_rtk_median_mahalanobis_sq: 4.108344935632312
+  min_rtk_chi2_inlier_fraction: 0.80
+  rtk_covariance_gate_mode: diagnostic_only
+
+cloud:
+  pixel_stride: 6
+  voxel_m: 0.02
+  max_points: 4000000
+
+colmap:
+  executable: colmap
+
+train:
+  seed: 0
+  max_gaussians: auto
+  iterations: auto
+  ssim_lambda: 0.2
+  depth_lambda: 0.1
+  opacity_reg: 0.01
+  scale_reg: 0.01
+  holdout_every: 8
+  eval_every: 2000
+  sh_degree: 1
+  init_opacity: 0.1
+  init_scale_mult: 1.5
+  mask_dilate_px: 25
+  min_scale_m: 0.001
+  max_scale_m: 0.30
+  max_anisotropy: 8.0
+  export_prune_opacity: 0.05
+  export_crop: true
+  rasterize_mode: antialiased
+  refine_stop_frac: 0.8
+  means_lr_final_mult: 0.1
+  color_finetune_frac: 0.0
+  use_right_camera: false
+  pose_opt:
+    enabled: false
+    start_iter: 1000
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+    max_trans_m: 0.05
+    max_rot_deg: 1.0
+    trans_penalty: 1.0e-2
+    rot_penalty: 1.0e-3
+  exposure_opt:
+    enabled: true
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  eval_pose_align_steps: 200
+  eval_pose_align_lr: 2.0e-3
+  lr:
+    means: 1.6e-4
+    scales: 5.0e-3
+    quats: 1.0e-3
+    opacities: 5.0e-2
+    sh0: 2.5e-3
+    shN: 1.25e-4

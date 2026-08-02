@@ -47,6 +47,7 @@ from rtk_splat.core.pose_artifacts import (cloud_path, load_pose_artifact,
                                       pose_artifact_name, pose_fingerprint,
                                       verify_cloud_matches_poses)
 from rtk_splat.core.segment import SegmentReader
+from rtk_splat.core.runtime_resolution import configuration_evidence
 
 _LPIPS = None
 
@@ -79,6 +80,8 @@ def _training_config_snapshot(cfg) -> tuple[dict, str]:
         name: _jsonable(getattr(cfg, name))
         for name in ("pose", "depth", "cloud", "train")
     }
+    if hasattr(cfg, "runtime_resolution"):
+        snapshot["runtime_resolution"] = _jsonable(cfg.runtime_resolution)
     encoded = json.dumps(
         snapshot, sort_keys=True, separators=(",", ":")).encode()
     return snapshot, hashlib.sha256(encoded).hexdigest()
@@ -321,6 +324,7 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
         "training_implementation_sha256": _sha256_file(Path(__file__)),
         "effective_training_config": config_snapshot,
         "effective_training_config_sha256": config_snapshot_sha256,
+        "configuration": configuration_evidence(cfg),
         "launcher_config_sha256":
             os.environ.get("RTK_SPLAT_CONFIG_SHA256"),
         "torch_version": torch.__version__,

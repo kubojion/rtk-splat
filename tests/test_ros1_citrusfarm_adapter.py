@@ -509,6 +509,13 @@ class SyntheticRos1ChainTests(unittest.TestCase):
                 reader.meta["position_observation"]["quality_source"],
                 "receiver_state.fix_mode",
             )
+            configuration = reader.meta["provenance"]["configuration"]
+            self.assertIn("effective_config", configuration)
+            self.assertEqual(
+                configuration["runtime_resolution"]["derivations"]
+                ["frame_spacing_m"]["chosen_value"],
+                0.12,
+            )
 
 
 if __name__ == "__main__":

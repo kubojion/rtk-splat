@@ -29,15 +29,16 @@ import cv2
 import numpy as np
 
 from rtk_splat.adapters.image_decode import decode_raw_image
-from rtk_splat.adapters.ros2_zed_ublox import (
-    FrameRecord,
-    RELPOS_FLAG_NAMES,
-    RtkTrack,
-    publish_segment_v2,
-)
+from rtk_splat.adapters.publication import publish_segment_v2
+from rtk_splat.adapters.records import FrameRecord, RELPOS_FLAG_NAMES, RtkTrack
 from rtk_splat.adapters.synchronization import nearest_matches
 from rtk_splat.core.segment import normalize_navsat_position_quality
 from rtk_splat.core.poses import LocalEnu, pose_frames_from_extrinsic
+from rtk_splat.adapters.sampling import resolve_metric_frame_spacing
+from rtk_splat.core.runtime_resolution import (
+    configuration_evidence,
+    runtime_resolution_plain,
+)
 
 
 NANOSECONDS = 1_000_000_000
@@ -1358,7 +1359,7 @@ def _prepare_config(
     _, extrinsic_resolution = _resolved_camera_extrinsic(
         cfg.sensor_geometry, left_info
     )
-    spacing = float(cfg.segment.frame_spacing_m)
+    spacing = resolve_metric_frame_spacing(cfg)
     fix_log = np.asarray(track.fix_log_ns, dtype=np.int64)
     mask = (fix_log >= start_ns) & (fix_log <= stop_ns)
     trajectory = track.enu_xyz[mask]
@@ -1475,7 +1476,9 @@ def ingest_config_v2(
     stereo_tolerance_ns = _integer_ns(
         cfg.segment.stereo_tolerance_s, "segment.stereo_tolerance_s"
     )
-    spacing_m = float(cfg.segment.frame_spacing_m)
+    # `_prepare_config` resolves and records this once. Reuse its value so an
+    # automatic derivation is not subsequently mislabeled as a numeric override.
+    spacing_m = float(report["sampling"]["frame_spacing_m"])
     image_encoding = str(getattr(cfg.segment, "image_encoding", "png_lossless"))
     geometry = getattr(cfg, "sensor_geometry", None)
     if geometry is None:
@@ -1576,6 +1579,8 @@ def ingest_config_v2(
                 "camera_chain": report["camera_chain"],
                 "gnss_chain": report["gnss_chain"],
                 "sampling": sampling,
+                "runtime_resolution": runtime_resolution_plain(cfg),
+                "configuration": configuration_evidence(cfg),
                 "dropped_unposeable": len(frames) - count,
                 "input_image_transport": "sensor_msgs/Image raw",
                 "stored_image_encoding": image_encoding,
@@ -1597,7 +1602,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     preflight.add_argument("--config", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.command == "preflight":
-        from rtk_splat.core.configio import load_config
+        from rtk_splat.workflows.configio import load_config
 
         print(json.dumps(preflight_config(load_config(arguments.config)), indent=2))
         return 0

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]

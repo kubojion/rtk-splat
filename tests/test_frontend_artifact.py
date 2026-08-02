@@ -164,9 +164,20 @@ def _git_repo(path: Path) -> Path:
 
 
 def _provenance(segment: Path, repo: Path) -> dict:
+    configuration = {
+        "schema_version": 1,
+        "effective_config": {"frontend": {"seed": 7, "feature": "sift"}},
+        "runtime_resolution": {
+            "derivations": {
+                "frame_stride": {"source": "derived", "chosen_value": 2}
+            }
+        },
+        "effective_config_sha256": "1" * 64,
+    }
     return collect_provenance(
         segment,
         resolved_config={"frontend": {"seed": 7, "feature": "sift"}},
+        configuration=configuration,
         colmap={"executable": "/opt/colmap", "version": "COLMAP 4.1.1"},
         seed=7,
         repo_root=repo,
@@ -230,6 +241,19 @@ class FrontendArtifactTests(unittest.TestCase):
                 (first / "pairs.txt").read_text(),
                 "left_000000.jpg right_000000.jpg\n"
                 "left_000001.jpg right_000001.jpg\n",
+            )
+            stored_provenance = json.loads(
+                (first / "provenance.json").read_text()
+            )
+            self.assertEqual(
+                stored_provenance["configuration"]["runtime_resolution"]
+                ["derivations"]["frame_stride"]["chosen_value"],
+                2,
+            )
+            self.assertEqual(
+                stored_provenance["configuration"]
+                ["effective_config_sha256"],
+                "1" * 64,
             )
             self.assertEqual(
                 source_entries,

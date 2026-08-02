@@ -26,32 +26,38 @@ from typing import Any
 
 import numpy as np
 
-from rtk_splat.backends.mapper import (
-    MapperConfig,
-    Runner,
-    _analyze_model,
+from rtk_splat.backends.artifact_io import (
     _atomic_json,
     _atomic_write,
-    _cartesian_camera_priors,
     _complete_stage,
-    _execute,
     _json,
-    _model_candidates,
-    _next_solve_attempt,
-    _poses_from_images_txt,
     _report_path,
+    _tree_manifest,
+    _verify_tree,
+)
+from rtk_splat.backends.colmap_model import (
+    _analyze_model,
+    _cartesian_camera_priors,
+    _model_candidates,
+    _poses_from_images_txt,
+    registered_names_from_images_txt,
+)
+from rtk_splat.backends.execution import (
+    Runner,
+    _execute,
+    _next_solve_attempt,
     _run_injected_mapper,
     _run_monitored_mapper,
     _solve_resource_paths,
-    _tree_manifest,
-    _verify_tree,
-    _workspace_context,
+)
+from rtk_splat.backends.mapper_config import MapperConfig
+from rtk_splat.backends.quality import (
     estimate_temporal_heldout_alignment,
     quality_summary,
-    registered_names_from_images_txt,
     rtk_residual_quality,
     temporal_block_split,
 )
+from rtk_splat.backends.workspace import _workspace_context
 from rtk_splat.core.segment import publish_directory_noreplace
 from rtk_splat.frontends.artifact import (
     ArtifactError,

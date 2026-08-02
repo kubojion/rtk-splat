@@ -20,6 +20,7 @@ is camera-to-ECEF with OpenCV optical axes (x right, y down, z forward).
 """
 
 import csv
+from collections.abc import Mapping
 from pathlib import Path
 
 import cv2
@@ -27,6 +28,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
 from rtk_splat.core.poses import viewmat_from
+from rtk_splat.core.runtime_resolution import configuration_evidence
 from rtk_splat.core.segment import (
     CONTRACT_VERSION,
     POSITION_QUALITY_VOCABULARY,
@@ -140,7 +142,8 @@ def _interpolation_indices(
 
 
 def ingest(dataset_dir: Path, cam: str, intrinsic, distortion, out_seg: Path,
-           min_z: float, max_z: float) -> SegmentReader:
+           min_z: float, max_z: float,
+           provenance: Mapping | None = None) -> SegmentReader:
     """Build one immutable v2 segment with independent train/val traversals."""
     dataset_dir = Path(dataset_dir)
     out_seg = Path(out_seg)
@@ -419,6 +422,7 @@ def ingest(dataset_dir: Path, cam: str, intrinsic, distortion, out_seg: Path,
             "path_length_m": float(
                 np.linalg.norm(np.diff(center_array, axis=0), axis=1).sum()
             ),
+            "provenance": dict(provenance or {}),
         }
         manifest = {
             "train": split_ids["train"],
@@ -506,6 +510,10 @@ def ingest_config_v2(cfg, destination: str | Path) -> SegmentReader:
         Path(destination),
         float(cfg.depth.min_z_m),
         float(cfg.depth.max_z_m),
+        provenance={
+            "adapter": "agrigs",
+            "configuration": configuration_evidence(cfg),
+        },
     )
 
 

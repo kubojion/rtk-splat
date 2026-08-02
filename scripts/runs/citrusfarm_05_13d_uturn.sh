@@ -335,7 +335,7 @@ verify_config() {
 import json
 import sys
 import numpy as np
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 
 cfg = load_config(sys.argv[1])
 if cfg.adapter != "ros1_citrusfarm":
@@ -405,7 +405,7 @@ adapter_preflight() {
 import dataclasses
 import json
 import sys
-from rtk_splat.core.configio import load_config
+from rtk_splat.workflows.configio import load_config
 from rtk_splat.adapters.ros1_citrusfarm import preflight_config
 
 report = preflight_config(load_config(sys.argv[1]))

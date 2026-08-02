@@ -65,17 +65,18 @@ class AgrigsAdapterContractTests(unittest.TestCase):
             self._write_split(dataset, "train", (10, 11), (0.0, 0.2))
             self._write_split(dataset, "val", (20, 21), (0.4, 0.6))
             segment = root / "segment"
-
-            with patch.object(agrigs, "pymap3d", self._synthetic_geodesy):
-                returned = agrigs.ingest(
-                    dataset,
-                    "cam_1",
+            cfg = SimpleNamespace(
+                agrigs=SimpleNamespace(
+                    dataset_dir=str(dataset),
+                    camera="cam_1",
                     intrinsic=[10.0, 10.0, 4.0, 3.0],
                     distortion=[0.0, 0.0, 0.0, 0.0, 0.0],
-                    out_seg=segment,
-                    min_z=0.5,
-                    max_z=3.0,
-                )
+                ),
+                depth=SimpleNamespace(min_z_m=0.5, max_z_m=3.0),
+            )
+
+            with patch.object(agrigs, "pymap3d", self._synthetic_geodesy):
+                returned = agrigs.ingest_config_v2(cfg, segment)
 
             self.assertEqual(returned.root, segment)
             reader = SegmentReader(segment).validate()
@@ -108,6 +109,12 @@ class AgrigsAdapterContractTests(unittest.TestCase):
                 reader.meta["position_evidence"]["position_provenance"],
                 "oracle groundtruth",
             )
+            configuration = reader.meta["provenance"]["configuration"]
+            self.assertEqual(
+                configuration["effective_config"]["agrigs"]["camera"],
+                "cam_1",
+            )
+            self.assertEqual(len(configuration["effective_config_sha256"]), 64)
 
             gnss = reader.observations("gnss")
             assert gnss is not None

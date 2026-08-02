@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from rtk_splat.core.configio import _deep_merge, load_config
+from rtk_splat.workflows.configio import _deep_merge, load_config
 from rtk_splat.workflows.cli import _mapper_config
 
 
@@ -15,22 +15,58 @@ class ConfigProfileTests(unittest.TestCase):
         sequences.mkdir()
         return robots, sequences
 
+    def test_quality_profile_robot_sequence_precedence_and_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            robots, sequences = self._layout(root)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            (profiles / "quality.yaml").write_text(
+                "depth: {min_z_m: 0.5, max_z_m: auto}\n"
+                "train: {iterations: auto, max_gaussians: auto}\n"
+            )
+            (robots / "robot.yaml").write_text(
+                "adapter: ros2_zed_ublox\n"
+                "pose: {source: rtk_dual_antenna}\n"
+            )
+            sequence = sequences / "run.yaml"
+            sequence.write_text(
+                "profile: quality\n"
+                "robot: robot\n"
+                "paths: {workdir: /sequence}\n"
+                "depth: {max_z_m: 12.0}\n"
+            )
+
+            cfg = load_config(sequence)
+
+            self.assertEqual(cfg.paths.workdir, Path("/sequence"))
+            self.assertEqual(cfg.depth.min_z_m, 0.5)
+            self.assertEqual(cfg.depth.max_z_m, 12.0)
+            self.assertEqual(cfg.train.iterations, "auto")
+            sources = vars(cfg.runtime_resolution.config_sources)
+            self.assertEqual(Path(sources["profile"]), profiles / "quality.yaml")
+            self.assertEqual(Path(sources["robot"]), robots / "robot.yaml")
+            self.assertEqual(Path(sources["sequence"]), sequence)
+            origins = vars(cfg.runtime_resolution.origins)
+            self.assertEqual(origins["depth_max_z_m"].layer, "sequence")
+            self.assertEqual(origins["depth_max_z_m"].authored_value, 12.0)
+            self.assertEqual(origins["train_iterations"].layer, "profile")
+            self.assertEqual(origins["train_iterations"].authored_value, "auto")
+
     def test_profile_is_deep_merged_then_sequence_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             robots, sequences = self._layout(root)
             (robots / "field_robot.yaml").write_text(
                 "adapter: ros2_zed_ublox\n"
-                "paths:\n"
-                "  workdir: /profile/default\n"
                 "topics:\n"
                 "  left_image: /left\n"
                 "  right_image: /right\n"
                 "pose:\n"
                 "  source: rtk_dual_antenna\n"
-                "  mount:\n"
-                "    forward_m: 3.1\n"
-                "    up_m: 1.3\n"
+                "  cam_forward_m: 3.1\n"
+                "  cam_up_m: 1.3\n"
+                "  time_offset_s: 0.0\n"
             )
             sequence = sequences / "field.yaml"
             sequence.write_text(
@@ -39,8 +75,7 @@ class ConfigProfileTests(unittest.TestCase):
                 "  workdir: ~/runs/field\n"
                 "  bags: [~/bags/field]\n"
                 "pose:\n"
-                "  mount:\n"
-                "    up_m: 1.4\n"
+                "  time_offset_s: 0.04\n"
                 "train:\n"
                 "  run_name: field_01\n"
             )
@@ -51,8 +86,9 @@ class ConfigProfileTests(unittest.TestCase):
             self.assertEqual(cfg.robot, "field_robot")
             self.assertEqual(cfg.topics.left_image, "/left")
             self.assertEqual(cfg.pose.source, "rtk_dual_antenna")
-            self.assertEqual(cfg.pose.mount.forward_m, 3.1)
-            self.assertEqual(cfg.pose.mount.up_m, 1.4)
+            self.assertEqual(cfg.pose.cam_forward_m, 3.1)
+            self.assertEqual(cfg.pose.cam_up_m, 1.3)
+            self.assertEqual(cfg.pose.time_offset_s, 0.04)
             self.assertEqual(cfg.paths.workdir, Path("~/runs/field").expanduser())
             self.assertEqual(
                 cfg.paths.bags, [Path("~/bags/field").expanduser()]
@@ -76,7 +112,6 @@ class ConfigProfileTests(unittest.TestCase):
             root = Path(tmp)
             robots, _ = self._layout(root)
             (robots / "robot.yaml").write_text(
-                "paths: {workdir: /default}\n"
                 "pose: {source: gnss_course}\n"
             )
             elsewhere = root / "runs"
@@ -90,6 +125,109 @@ class ConfigProfileTests(unittest.TestCase):
 
             self.assertEqual(cfg.pose.source, "gnss_course")
             self.assertEqual(cfg.paths.workdir, Path("/run"))
+
+    def test_layers_reject_values_owned_elsewhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            robots, sequences = self._layout(root)
+            profiles = root / "profiles"
+            profiles.mkdir()
+
+            (profiles / "bad.yaml").write_text(
+                "topics: {left_image: /camera/left}\n"
+            )
+            sequence = sequences / "profile_bad.yaml"
+            sequence.write_text(
+                "profile: bad\npaths: {workdir: /run}\n"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "profile layer cannot own option.*topics"
+            ):
+                load_config(sequence)
+
+            (robots / "bad.yaml").write_text(
+                "train: {iterations: 30000}\n"
+            )
+            sequence = sequences / "robot_bad.yaml"
+            sequence.write_text(
+                "robot: bad\npaths: {workdir: /run}\n"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "robot layer cannot own option.*train"
+            ):
+                load_config(sequence)
+
+            (robots / "good.yaml").write_text(
+                "topics: {left_image: /camera/left}\n"
+                "pose: {source: gnss_course}\n"
+            )
+            sequence = sequences / "sequence_bad.yaml"
+            sequence.write_text(
+                "robot: good\n"
+                "paths: {workdir: /run}\n"
+                "topics: {left_image: /wrong}\n"
+            )
+            with self.assertRaisesRegex(
+                ValueError, r"sequence layer cannot own option.*topics"
+            ):
+                load_config(sequence)
+
+            forbidden_nested = {
+                "sensor geometry": "pose: {cam_up_m: 1.2}\n",
+                "feature policy": "frontend: {features: {profile: cpu_reference}}\n",
+                "loss policy": "train: {ssim_lambda: 0.4}\n",
+                "robot-only path": "paths: {workdir: /run, ublox_msgs_dir: /msgs}\n",
+            }
+            for label, body in forbidden_nested.items():
+                with self.subTest(layer="sequence", option=label):
+                    candidate = sequences / "nested_bad.yaml"
+                    prefix = "paths: {workdir: /run}\n" if not body.startswith("paths:") else ""
+                    candidate.write_text(prefix + body)
+                    with self.assertRaisesRegex(
+                        ValueError, "unknown configuration option"
+                    ):
+                        load_config(candidate)
+
+    def test_sequence_allows_only_documented_run_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            robots, sequences = self._layout(root)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            (profiles / "quality.yaml").write_text(
+                "depth: {min_z_m: 0.5, max_z_m: auto}\n"
+                "frontend:\n"
+                "  features: {profile: gpu}\n"
+                "  keyframes: {preset: balanced}\n"
+                "mapper: {max_rtk_median_error_m: 0.12}\n"
+                "train: {iterations: auto, max_gaussians: auto}\n"
+            )
+            (robots / "robot.yaml").write_text(
+                "topics: {left_image: /left}\n"
+                "pose: {source: gnss_course, time_offset_s: 0.0}\n"
+            )
+            sequence = sequences / "allowed.yaml"
+            sequence.write_text(
+                "profile: quality\n"
+                "robot: robot\n"
+                "paths: {workdir: /run}\n"
+                "pose: {time_offset_s: 0.04}\n"
+                "depth: {max_z_m: 18.0}\n"
+                "frontend:\n"
+                "  keyframes: {preset: all}\n"
+                "  pairs: {max_view_angle_deg: 110.0}\n"
+                "mapper: {max_rtk_median_error_m: 0.20}\n"
+                "train: {iterations: 50000, max_gaussians: 2000000}\n"
+            )
+
+            cfg = load_config(sequence)
+
+            self.assertEqual(cfg.frontend.features.profile, "gpu")
+            self.assertEqual(cfg.frontend.keyframes.preset, "all")
+            self.assertEqual(cfg.pose.time_offset_s, 0.04)
+            self.assertEqual(cfg.depth.max_z_m, 18.0)
+            self.assertEqual(cfg.mapper.max_rtk_median_error_m, 0.20)
+            self.assertEqual(cfg.train.iterations, 50000)
 
     def test_missing_profile_has_clear_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,6 +262,29 @@ class ConfigProfileTests(unittest.TestCase):
             sequence.write_text("robot: bad\npaths: {workdir: /run}\n")
             with self.assertRaisesRegex(ValueError, "invalid YAML"):
                 load_config(sequence)
+
+    def test_unknown_nested_option_is_rejected_before_a_stage_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "typo.yaml"
+            config.write_text(
+                "paths: {workdir: /run}\n"
+                "train: {iterrations: 30000}\n"
+            )
+            with self.assertRaisesRegex(
+                ValueError, r"unknown configuration option.*train\.iterrations"
+            ):
+                load_config(config)
+
+    def test_adapter_options_is_the_only_open_extension_namespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "plugin.yaml"
+            config.write_text(
+                "paths: {workdir: /run}\n"
+                "adapter_options:\n"
+                "  vendor_frame_policy: {arbitrary: true}\n"
+            )
+            cfg = load_config(config)
+            self.assertTrue(cfg.adapter_options.vendor_frame_policy.arbitrary)
 
     def test_monolithic_config_keeps_generic_path_behavior(self):
         with tempfile.TemporaryDirectory() as tmp:

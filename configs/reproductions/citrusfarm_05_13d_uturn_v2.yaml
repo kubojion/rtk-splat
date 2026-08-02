@@ -1,0 +1,240 @@
+# CitrusFarm sequence 05: a 192 s, approximately 229 m multi-row/U-turn
+# window. The window is relative to the first Piksi bag-log timestamp, not to
+# the first ZED header timestamp. Metric sampling intentionally determines the
+# frame count; no 1,440-frame assumption is encoded.
+robot: citrusfarm_jackal_zed2i_piksi
+
+paths:
+  workdir: ~/agromap4d_work/citrusfarm_05_13d_543_735_v2
+  dataset_root: /media/jion_kubo/Buffalo SSD/CitrusFarm
+  camera_bags:
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-05-13_0.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-05-42_1.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-06-11_2.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-06-39_3.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-07-08_4.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-07-37_5.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-08-06_6.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-08-35_7.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-09-03_8.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-09-32_9.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-10-01_10.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-10-30_11.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-10-59_12.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-11-27_13.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-11-56_14.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-12-25_15.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-12-54_16.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-13-23_17.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-13-51_18.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-14-20_19.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-14-49_20.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-15-18_21.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-15-47_22.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-16-15_23.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-16-44_24.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-17-13_25.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/zed_2023-07-16-17-17-42_26.bag
+  gnss_bags:
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/base_2023-07-16-17-05-13_0.bag
+    - /media/jion_kubo/Buffalo SSD/CitrusFarm/05_13D_Jackal/base_2023-07-16-17-13-40_1.bag
+  # Evaluation/window-selection evidence only; never an input pose source.
+  ground_truth_csv: /media/jion_kubo/Buffalo SSD/CitrusFarm/ground_truth/05_13D_Jackal/gt.csv
+
+pose:
+  # GNSS-header time = camera-header time + correction. Independently measured
+  # from the two streams' ROS bag-log timestamps over this window; the adapter
+  # re-estimates it and gates both disagreement and drift before ingest.
+  time_offset_s: 0.072548749
+
+segment:
+  window_s: [543.0, 735.0]
+  window_epoch_source: first_gnss_log
+  frame_spacing_m: 0.15
+  stereo_tolerance_s: 0.02
+  association_tolerance_s: 0.15
+  expected_camera_bag_count: 27
+  expected_gnss_bag_count: 2
+  maximum_bag_gap_s: 1.0
+  maximum_bag_overlap_s: 0.10
+  validation_every: 8
+  # Lossless output keeps the recorded raw RGB evidence free of an additional
+  # JPEG generation. Source bags remain read-only.
+  image_encoding: png_lossless
+
+timing:
+  # One constant camera-header -> GNSS-header correction, estimated from the
+  # two streams' independent ROS bag-log stamps and gated before ingest.
+  clock_model: ros_log_constant
+  maximum_offset_error_s: 0.015
+  maximum_window_drift_s: 0.015
+
+depth:
+  # The ZED depth/confidence streams are preserved in preflight provenance but
+  # withheld from this primary method. Publish computed stereo depth as a new
+  # immutable segment so this arm matches the headland RGB+stereo protocol.
+  backend: sgbm
+  min_z_m: 0.5
+  max_z_m: 20.0
+  sgbm:
+    num_disparities: 128
+    block_size: 5
+    uniqueness_ratio: 10
+    speckle_window: 100
+    speckle_range: 2
+
+frontend:
+  name: citrus-05-13d-543-735-all-gpu-v2
+  seed: 7
+  turn_rate_deg_s: 5.0
+  keyframes:
+    preset: all
+  features:
+    profile: gpu
+    max_image_size: -1
+    num_threads: 8
+    max_num_features: 8192
+    gpu_index: -1
+  matching:
+    use_gpu: true
+    gpu_index: -1
+    num_threads: 8
+  pairs:
+    temporal_max_distance_m: 1.5
+    temporal_max_seconds: 3.0
+    max_temporal_neighbors: 4
+    revisit_distance_m: 0.75
+    revisit_min_separation_s: 10.0
+    max_revisit_neighbors: 3
+    max_cross_frame_degree: 8
+    max_view_angle_deg: 110.0
+    registration_max_distance_m: 1.5
+    registration_max_seconds: 3.0
+    max_registration_neighbors: 2
+    match_right_camera_temporally: true
+
+mapper:
+  name: citrus-05-13d-543-735-global-bounded-v2
+  pose_artifact_name: citrus-05-13d-543-735-global-bounded-v2
+  backend: global
+  num_threads: 8
+  random_seed: 7
+  min_num_matches: 15
+  require_all_keyframes: true
+  require_all_frames: true
+  ba_num_iterations: 3
+  keep_max_num_tracks: 60000
+  track_required_tracks_per_view: 1000
+  skip_retriangulation: true
+  gp_use_gpu: false
+  ba_ceres_use_gpu: false
+  process_nice: 10
+  resource_sample_interval_s: 2.0
+  minimum_available_memory_gb: 4.0
+  low_memory_consecutive_samples: 2
+  minimum_free_space_gb: 15.0
+  minimum_runtime_free_space_gb: 5.0
+  max_reprojection_error_px: 2.0
+  min_mean_track_length: 2.0
+  alignment_ransac_threshold_m: 0.30
+  alignment_ransac_iterations: 5000
+  alignment_temporal_blocks: 5
+  max_rtk_median_error_m: 0.15
+  max_rtk_p95_inlier_error_m: 0.30
+  min_rtk_inlier_fraction: 0.80
+  # This recording publishes one static COVARIANCE_TYPE_APPROXIMATED matrix,
+  # not calibrated live per-epoch uncertainty. Keep chi-square consistency in
+  # the report, but let the independent metre/support limits decide export.
+  rtk_chi2_inlier_probability: 0.95
+  max_rtk_median_mahalanobis_sq: 4.108344935632312
+  min_rtk_chi2_inlier_fraction: 0.80
+  rtk_covariance_gate_mode: diagnostic_only
+
+# Optional mapper-neutral position-prior refinement parameters. The stage is
+# invoked explicitly; it is not part of the normal run unless requested.
+rtk_refinement:
+  name: citrus-05-13d-543-735-rtk-refined-v1
+  num_threads: 8
+  random_seed: 7
+  ba_global_max_num_iterations: 50
+  ba_global_max_refinements: 3
+  # Historical default. Experiments may explicitly override this to `fresh`,
+  # which omits the completed visual input model but changes nothing else.
+  initialization_mode: continuation
+  # Cauchy scale in whitened residual-norm units: sqrt(chi2_3(0.95)).
+  prior_position_loss_scale: 2.795
+  process_nice: 10
+  resource_sample_interval_s: 2.0
+  minimum_available_memory_gb: 4.0
+  low_memory_consecutive_samples: 2
+  minimum_free_space_gb: 10.0
+  minimum_runtime_free_space_gb: 5.0
+  max_reprojection_regression_px: 0.10
+  min_track_length_retention: 0.90
+  # Absolute topology gates used only for a newly built (`fresh`) track graph.
+  fresh_min_mean_track_length: 3.0
+  fresh_min_mean_observations_per_image: 500.0
+  max_trajectory_scale_deviation: 0.005
+  max_stereo_baseline_change_m: 5.0e-5
+  max_calibration_parameter_change: 1.0e-9
+  max_holdout_median_regression_m: 0.01
+  min_holdout_median_improvement_m: 0.005
+
+cloud:
+  pixel_stride: 6
+  voxel_m: 0.02
+  max_points: 4000000
+
+colmap:
+  executable: colmap
+
+train:
+  run_name: citrus-05-13d-543-735-gs-v2
+  seed: 0
+  max_gaussians: 2500000
+  iterations: 65000
+  ssim_lambda: 0.2
+  depth_lambda: 0.1
+  opacity_reg: 0.01
+  scale_reg: 0.01
+  holdout_every: 8
+  eval_every: 2000
+  sh_degree: 1
+  init_opacity: 0.1
+  init_scale_mult: 1.5
+  mask_dilate_px: 25
+  min_scale_m: 0.001
+  max_scale_m: 0.30
+  max_anisotropy: 8.0
+  export_prune_opacity: 0.05
+  export_crop: true
+  rasterize_mode: antialiased
+  refine_stop_frac: 0.8
+  means_lr_final_mult: 0.1
+  color_finetune_frac: 0.0
+  # Stereo is fully used for pose/metric depth. Keep the already measured
+  # left-only photometric policy for this first cross-dataset reproduction;
+  # right RGB remains an explicit later A/B, not an unmeasured default.
+  use_right_camera: false
+  pose_opt:
+    enabled: false
+    start_iter: 1000
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+    max_trans_m: 0.05
+    max_rot_deg: 1.0
+    trans_penalty: 1.0e-2
+    rot_penalty: 1.0e-3
+  exposure_opt:
+    enabled: true
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  eval_pose_align_steps: 200
+  eval_pose_align_lr: 2.0e-3
+  lr:
+    means: 1.6e-4
+    scales: 5.0e-3
+    quats: 1.0e-3
+    opacities: 5.0e-2
+    sh0: 2.5e-3
+    shN: 1.25e-4

@@ -11,6 +11,11 @@ import cv2
 import numpy as np
 
 from rtk_splat.core.depth import depth_from_pair, make_sgbm
+from rtk_splat.core.runtime_resolution import (
+    configuration_evidence,
+    runtime_resolution_plain,
+)
+from rtk_splat.workflows.runtime_config import resolve_depth_max_z
 from rtk_splat.core.segment import OBSERVATION_KINDS, SegmentReader, SegmentWriter
 
 
@@ -59,6 +64,7 @@ def derive_sgbm_depth(
     baseline_m = abs(float(transform[0, 3]))
     if baseline_m <= 0:
         raise ValueError("stereo baseline must be non-zero")
+    resolve_depth_max_z(cfg, reader.calibration)
 
     frames = reader.frames
     camera = reader.calibration["cameras"]["left"]
@@ -118,6 +124,8 @@ def derive_sgbm_depth(
             "baseline_m": baseline_m,
             "min_z_m": float(cfg.depth.min_z_m),
             "max_z_m": float(cfg.depth.max_z_m),
+            "runtime_resolution": runtime_resolution_plain(cfg),
+            "configuration": configuration_evidence(cfg),
         }
         writer.write_frames(output_frames)
         writer.write_calibration(reader.calibration)
