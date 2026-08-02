@@ -17,13 +17,15 @@ artifact or accepted metric:
   the real adapter/backend/diagnostic coupling; and
 - `7acd7b6` moved the sole installed namespace to `src/rtk_splat`, made
   provenance and golden verification wheel-safe, and updated every supported
-  launcher.
+  launcher;
+- `63b8a36` documented the final cleanup/runtime ownership; and
+- `abfa4c1` made the active Citrus controls data-derived and auditable.
 
-The final source-tree gate passes **237 tests plus 36 subtests**, shell and
-compile checks, and the historical verifier still passes **38/38 exact
-checks**. A clean wheel installs only the `rtk_splat` namespace and works
-outside a Git checkout. Existing editable environments must run
-`python -m pip install -e .` once after the layout move.
+The current source-tree gate passes **255 tests plus 35 subtests**, shell and
+compile checks. The historical incremental and Global verifiers still pass
+**38/38** and **42/42** exact checks. A clean wheel installs only the
+`rtk_splat` namespace and works outside a Git checkout. The editable
+`rtk-splat` environment was refreshed after the layout/entry-point move.
 
 ## Current reference result
 
@@ -191,6 +193,28 @@ The compact paired receipt is
 shows that stock whole-model pose-prior mapping is not sufficient; the next
 method-level pose experiment is bounded geodetic stereo submaps, not another
 loss or initialization sweep.
+
+### Explicit diagnostic-render continuation
+
+An opt-in visualization path is now implemented for candidates that pass exact
+stereo registration and visual-quality checks but fail the final held-out RTK
+georeferencing gates. The normal path remains fail-closed and the Citrus gates
+remain **0.15 m median / 0.30 m inlier p95**.
+
+`--render-on-georef-failure` selects separate pose and training names. A failed
+result is sealed as `diagnostic_render_only`, propagates the failed status and
+source hashes through pose, cloud, run, and PLY evidence, and exports only
+`splat.DIAGNOSTIC_ONLY.ply`. Cloud and training require the explicit permission
+again. The golden/publication verifier rejects diagnostic runs, mismatched
+sidecars, empty or hash-mismatched PLYs, and failed markers. This path permits
+local visual inspection only; it does not make a failed map eligible for a
+metric georeferencing claim.
+
+The real Citrus preflight passed on 2026-08-02 with the stable USB2 mount,
+**86 GiB** free on internal storage, a derived **0.10 m** sampling target,
+approximately **2,288** expected stereo pairs, a **0.119885 m** baseline, and
+all **7,593/7,593** selected NavSatFix samples associated with receiver-fixed
+RTK evidence. No end-to-end diagnostic run or GS artifact has been started yet.
 
 ## Contract-v2 work: Phase 0 accepted baseline
 

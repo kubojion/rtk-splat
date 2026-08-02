@@ -9,6 +9,11 @@ import cv2
 import numpy as np
 
 from rtk_splat.core.cloud import backproject, to_world, voxel_downsample
+from rtk_splat.backends.pose_evidence import (
+    canonical_georeferencing_json,
+    pose_georeferencing_evidence,
+    require_render_permission,
+)
 from rtk_splat.core.pose_artifacts import (
     cloud_path,
     load_pose_artifact,
@@ -19,11 +24,27 @@ from rtk_splat.core.segment import SegmentReader
 
 
 def construct_initial_cloud(
-    reader: SegmentReader, cfg
+    reader: SegmentReader,
+    cfg,
+    *,
+    allow_failed_georeferencing_for_render: bool = False,
 ) -> tuple[Path, int]:
     """Publish a pose-bound cloud without hiding orchestration in the CLI."""
     frames = reader.frames
-    viewmats, _ = load_pose_artifact(reader.root, cfg)
+    georeferencing = pose_georeferencing_evidence(reader.root, cfg)
+    require_render_permission(
+        georeferencing,
+        allow_failed_georeferencing_for_render=(
+            allow_failed_georeferencing_for_render
+        ),
+    )
+    viewmats, _ = load_pose_artifact(
+        reader.root,
+        cfg,
+        allow_failed_georeferencing_for_render=(
+            allow_failed_georeferencing_for_render
+        ),
+    )
     camera = reader.calibration["cameras"]["left"]
     k = np.asarray(camera["K"], dtype=float)
     intrinsics = {
@@ -73,6 +94,28 @@ def construct_initial_cloud(
                 rgb=rgb,
                 pose_fingerprint=np.asarray(pose_fingerprint(viewmats)),
                 pose_artifact=np.asarray(pose_artifact_name(cfg)),
+                georeferencing_json=np.asarray(
+                    canonical_georeferencing_json(georeferencing)
+                ),
+                artifact_class=np.asarray(
+                    georeferencing["artifact_class"]
+                ),
+                georeferencing_status=np.asarray(
+                    georeferencing["georeferencing_status"]
+                ),
+                metric_georeferencing_claim_eligible=np.asarray(
+                    georeferencing["metric_georeferencing_claim_eligible"],
+                    dtype=np.bool_,
+                ),
+                pose_quality_sha256=np.asarray(
+                    georeferencing["pose_quality_sha256"] or ""
+                ),
+                pose_manifest_sha256=np.asarray(
+                    georeferencing["pose_manifest_sha256"] or ""
+                ),
+                pose_georeferencing_sha256=np.asarray(
+                    georeferencing["pose_georeferencing_sha256"] or ""
+                ),
             )
             stream.flush()
             os.fsync(stream.fileno())

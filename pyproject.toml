@@ -29,7 +29,7 @@ test = ["pytest>=7.4"]
 
 [project.scripts]
 rtk-splat = "rtk_splat.workflows.cli:main"
-rtk-splat-verify = "rtk_splat.core.verify_golden:main"
+rtk-splat-verify = "rtk_splat.diagnostics.verify_golden:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

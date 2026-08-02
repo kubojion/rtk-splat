@@ -10,7 +10,7 @@ from unittest import mock
 import numpy as np
 
 from rtk_splat.core.pose_artifacts import pose_fingerprint
-from rtk_splat.core.verify_golden import (
+from rtk_splat.diagnostics.verify_golden import (
     discover_default_manifest,
     main,
     verify,
@@ -58,7 +58,7 @@ class GoldenVerifierTests(unittest.TestCase):
     def test_installed_verifier_requests_manifest_without_traceback(self):
         stderr = io.StringIO()
         with mock.patch(
-            "rtk_splat.core.verify_golden.discover_default_manifest",
+            "rtk_splat.diagnostics.verify_golden.discover_default_manifest",
             return_value=None,
         ), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
             main([])
@@ -138,6 +138,20 @@ class GoldenVerifierTests(unittest.TestCase):
             self.assertTrue(all(passed for passed, _ in checks))
             self.assertEqual(before, after)
 
+            quality_path = pose_dir / "quality.json"
+            quality = json.loads(quality_path.read_text())
+            quality.update({
+                "artifact_class": "diagnostic_render_only",
+                "georeferencing_status": "FAILED",
+                "metric_georeferencing_claim_eligible": False,
+            })
+            quality_path.write_text(json.dumps(quality))
+            rejected = verify(manifest, root, mode="exact")
+            self.assertTrue(any(
+                not passed and "ineligible" in description
+                for passed, description in rejected
+            ))
+
     def test_hash_mismatch_fails_exact_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -171,6 +185,102 @@ class GoldenVerifierTests(unittest.TestCase):
             }))
             checks = verify(manifest, root, mode="exact")
             self.assertTrue(any(not passed for passed, _ in checks))
+
+    def test_acceptance_rejects_diagnostic_run_with_production_pose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment = root / "segment"
+            pose_dir = segment / "pose_artifacts" / "poses"
+            run_dir = root / "runs" / "run"
+            pose_dir.mkdir(parents=True)
+            run_dir.mkdir(parents=True)
+            (segment / "segment_meta.json").write_text('{"n_frames": 2}\n')
+            viewmats = np.repeat(np.eye(4, dtype=np.float32)[None], 2, axis=0)
+            np.save(pose_dir / "viewmats.npy", viewmats)
+            np.save(pose_dir / "cam_centers.npy", np.zeros((2, 3)))
+            fingerprint = pose_fingerprint(viewmats)
+            pose_status = {
+                "artifact_class": "production",
+                "georeferencing_status": "PASSED",
+                "metric_georeferencing_claim_eligible": True,
+            }
+            (pose_dir / "quality.json").write_text(json.dumps({
+                "n_registered_left": 2,
+                "pose_fingerprint": fingerprint,
+                "rtk_alignment_passed": True,
+                **pose_status,
+            }))
+            (pose_dir / "georeferencing.json").write_text(
+                json.dumps(pose_status)
+            )
+            files = {}
+            for path in pose_dir.iterdir():
+                files[path.name] = {
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "size_bytes": path.stat().st_size,
+                }
+            (pose_dir / "manifest.json").write_text(json.dumps({
+                "name": "poses",
+                "files": files,
+            }))
+            np.savez(
+                pose_dir / "init_cloud.npz",
+                pose_fingerprint=np.asarray(fingerprint),
+            )
+            (run_dir / "metrics.json").write_text(json.dumps([{
+                "psnr_masked": 25.0,
+                "psnr_masked_cc": 26.0,
+                "lpips_cc": 0.2,
+                "ssim": 0.7,
+            }]))
+            diagnostic = {
+                "artifact_class": "diagnostic_render_only",
+                "georeferencing_status": "FAILED",
+                "metric_georeferencing_claim_eligible": False,
+                "pose_artifact": "poses",
+            }
+            (run_dir / "georeferencing.json").write_text(json.dumps(diagnostic))
+            (run_dir / "run_provenance.json").write_text(json.dumps({
+                "pose_artifact": "poses",
+                "georeferencing": diagnostic,
+            }))
+            ply = run_dir / "splat.DIAGNOSTIC_ONLY.ply"
+            ply.write_bytes(b"ply\n")
+            (run_dir / "splat.georeferencing.json").write_text(json.dumps({
+                **diagnostic,
+                "splat_file": ply.name,
+                "splat_sha256": hashlib.sha256(ply.read_bytes()).hexdigest(),
+            }))
+            (run_dir / "GEOREFERENCING_FAILED.json").write_text(
+                json.dumps(diagnostic)
+            )
+            manifest = root / "experiment.json"
+            manifest.write_text(json.dumps({
+                "artifact_layout": {
+                    "recorded_workdir": str(root),
+                    "pose_artifact": "poses",
+                    "run_name": "run",
+                },
+                "compact_files": [],
+                "expected": {
+                    "segment": {"n_frames": 2},
+                    "pose": {"pose_fingerprint": fingerprint, "scale_checks": []},
+                    "metrics": {},
+                    "exact_metric_fields": [],
+                    "acceptance_gates": {
+                        "psnr_masked_min": 24.0,
+                        "psnr_masked_cc_min": 25.0,
+                        "lpips_cc_max": 0.3,
+                        "ssim_min": 0.6,
+                    },
+                },
+            }))
+
+            checks = verify(manifest, root, mode="acceptance")
+            self.assertTrue(any(
+                not passed and "ineligible" in description
+                for passed, description in checks
+            ))
 
     def test_global_mapper_uses_declared_scale_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

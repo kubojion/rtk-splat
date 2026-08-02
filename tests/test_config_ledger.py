@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from rtk_splat.adapters.sampling import resolve_frame_stride
@@ -125,6 +126,72 @@ class ConfigLedgerTests(unittest.TestCase):
                 "--train-iters",
             )
             self.assertEqual(authored["segment"]["frame_stride"], "auto")
+
+    def test_failed_georeferencing_render_authorization_is_explicit(self):
+        args = cli.build_parser().parse_args(
+            [
+                "backend-export",
+                "--config",
+                "/does/not/need/to/exist.yaml",
+                "--allow-failed-georeferencing-for-render",
+            ]
+        )
+        self.assertTrue(args.allow_failed_georeferencing_for_render)
+        self.assertEqual(
+            cli._stage_overrides(args)[
+                "allow_failed_georeferencing_for_render"
+            ],
+            True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "valid only for backend-export, cloud, and train"
+        ):
+            cli.main(
+                [
+                    "validate",
+                    "--config",
+                    "/does/not/exist.yaml",
+                    "--allow-failed-georeferencing-for-render",
+                ]
+            )
+
+    def test_diagnostic_render_requires_separate_explicit_names(self):
+        cfg = SimpleNamespace(
+            mapper=SimpleNamespace(
+                name="production-backend",
+                pose_artifact_name="production-pose",
+            ),
+            pose=SimpleNamespace(artifact="production-pose"),
+            train=SimpleNamespace(run_name="production-run"),
+        )
+
+        def args(stage, pose_name=None, run_name=None):
+            return cli.build_parser().parse_args([
+                stage,
+                "--config", "/unused.yaml",
+                "--allow-failed-georeferencing-for-render",
+                *([] if pose_name is None else ["--pose-name", pose_name]),
+                *([] if run_name is None else ["--run-name", run_name]),
+            ])
+
+        with self.assertRaisesRegex(ValueError, "explicit --pose-name"):
+            cli._validate_diagnostic_render_names(args("cloud"), cfg)
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            cli._validate_diagnostic_render_names(
+                args("cloud", "production-pose"), cfg
+            )
+        with self.assertRaisesRegex(ValueError, "explicit --run-name"):
+            cli._validate_diagnostic_render_names(
+                args("train", "diagnostic-pose"), cfg
+            )
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            cli._validate_diagnostic_render_names(
+                args("train", "diagnostic-pose", "production-run"), cfg
+            )
+        cli._validate_diagnostic_render_names(
+            args("train", "diagnostic-pose", "diagnostic-run"), cfg
+        )
 
     def test_failed_stage_does_not_create_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:

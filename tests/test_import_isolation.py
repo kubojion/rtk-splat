@@ -102,7 +102,7 @@ class CoreIsolationTests(unittest.TestCase):
         self.assertFalse((REPOSITORY / "rtk_splat").exists())
 
     def test_runtime_modules_do_not_publish_checkout_root_constants(self):
-        from rtk_splat.core import verify_golden
+        from rtk_splat.diagnostics import verify_golden
         from rtk_splat.workflows import cli
 
         self.assertFalse(hasattr(cli, "REPO_ROOT"))

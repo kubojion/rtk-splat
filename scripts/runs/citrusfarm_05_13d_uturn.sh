@@ -19,8 +19,10 @@ readonly DATASET_ROOT="/media/jion_kubo/Buffalo SSD/CitrusFarm"
 readonly SEQUENCE_ROOT="$DATASET_ROOT/05_13D_Jackal"
 readonly FRONTEND_NAME="citrus-05-13d-543-735-auto-all-gpu-v1"
 readonly BACKEND_NAME="citrus-05-13d-543-735-auto-global-v1"
-readonly POSE_NAME="$BACKEND_NAME"
-readonly TRAIN_NAME="citrus-05-13d-543-735-auto-gs-v1"
+readonly PRODUCTION_POSE_NAME="$BACKEND_NAME"
+readonly PRODUCTION_TRAIN_NAME="citrus-05-13d-543-735-auto-gs-v1"
+readonly DIAGNOSTIC_POSE_NAME="${BACKEND_NAME}-diagnostic-render"
+readonly DIAGNOSTIC_TRAIN_NAME="citrus-05-13d-543-735-auto-gs-v1-diagnostic-render"
 readonly SOURCE_SEGMENT_NAME="citrus-05-13d-543-735-auto-rgb-v1"
 readonly DERIVED_SEGMENT_NAME="citrus-05-13d-543-735-auto-sgbm-v1"
 readonly MIN_OUTPUT_FREE_GIB=65
@@ -32,6 +34,7 @@ PYTHON="$DEFAULT_PYTHON"
 COLMAP="$DEFAULT_COLMAP"
 RESUME=0
 STORAGE_PROBE=1
+RENDER_ON_GEOREF_FAILURE=0
 
 die() {
     echo "FATAL: $*" >&2
@@ -52,12 +55,20 @@ Options:
   --python PATH          rtk-splat Python (default: $DEFAULT_PYTHON)
   --colmap PATH          COLMAP 4.1 executable (default: $DEFAULT_COLMAP)
   --resume-existing      Resume only verified completed stages in WORKDIR
+  --render-on-georef-failure
+                         Explicitly finish a visualization-only GS run even if
+                         held-out RTK georeferencing gates fail. Thresholds are
+                         unchanged; outputs use separate diagnostic names.
   --skip-storage-probe   Skip the small read-only Buffalo stability probe
   --dry-run              Alias for plan; no dataset or artifact I/O
   -h, --help             Show this help
 
 No process is launched in tmux. The source bags are read-only. A failed or
 partial training directory is never silently reused.
+
+By default, a failed georeferencing gate still stops before cloud and GS.
+Diagnostic rendering must be explicitly requested and is never eligible for a
+metric georeferencing claim.
 EOF
 }
 
@@ -85,12 +96,13 @@ Stages and conservative estimates on this machine:
   ingest through held-out pose gate    55-90 min
   pose-matched initialization cloud     5-20 min
   65k Gaussian training + final eval   3-5 h
-  total if every pose gate passes       approximately 5-8 h; allow 8-10 h
+  total through GS if visuals succeed   approximately 5-8 h; allow 8-10 h
 
 This is a new transfer test of runtime derivation, not a reproduction of the
 completed 0.15 m arm. The old arm is immutable under configs/reproductions/.
-The denser run may still stop honestly at the held-out RTK gate after about an
-hour; automatic resource settings do not hide a trajectory/GNSS disagreement.
+In default mode the run may still stop honestly at the held-out RTK gate after
+about an hour. Diagnostic mode can continue only with the failed status kept;
+automatic resource settings never hide a trajectory/GNSS disagreement.
 
 The headland 24.8 dB result is a regression reference, not a cross-dataset
 threshold: CitrusFarm has different cameras, resolution, motion, foliage and
@@ -99,10 +111,31 @@ gates and the same named high-quality policy; its PSNR is measured honestly.
 
 Nothing runs from plan. Start with:
   $SCRIPT_PATH preflight
-
-Then launch into a new internal directory:
-  $SCRIPT_PATH run --workdir $DEFAULT_WORKDIR
 EOF
+
+    if ((RENDER_ON_GEOREF_FAILURE)); then
+        cat <<EOF
+
+WARNING: diagnostic rendering is enabled.
+The 15 cm median and 30 cm p95 held-out RTK gates are NOT relaxed. If either
+gate fails, the run may still produce a visually useful PLY under separately
+named diagnostic artifacts, but it is visualization-only and cannot support a
+metric georeferencing claim.
+
+Launch the explicitly diagnostic run into a new internal directory:
+  $SCRIPT_PATH run --workdir $DEFAULT_WORKDIR --render-on-georef-failure
+EOF
+    else
+        cat <<EOF
+
+Default fail-closed mode is enabled. A failed held-out RTK gate publishes no
+pose, cloud, PLY, or GS run. Launch it into a new internal directory:
+  $SCRIPT_PATH run --workdir $DEFAULT_WORKDIR
+
+To request a separately labelled visualization instead:
+  $SCRIPT_PATH run --workdir $DEFAULT_WORKDIR --render-on-georef-failure
+EOF
+    fi
 }
 
 while (($#)); do
@@ -139,6 +172,10 @@ while (($#)); do
             RESUME=1
             shift
             ;;
+        --render-on-georef-failure)
+            RENDER_ON_GEOREF_FAILURE=1
+            shift
+            ;;
         --skip-storage-probe)
             STORAGE_PROBE=0
             shift
@@ -152,6 +189,14 @@ while (($#)); do
             ;;
     esac
 done
+
+if ((RENDER_ON_GEOREF_FAILURE)); then
+    POSE_NAME="$DIAGNOSTIC_POSE_NAME"
+    TRAIN_NAME="$DIAGNOSTIC_TRAIN_NAME"
+else
+    POSE_NAME="$PRODUCTION_POSE_NAME"
+    TRAIN_NAME="$PRODUCTION_TRAIN_NAME"
+fi
 
 [[ "$ACTION" == "plan" ]] && { print_plan; exit 0; }
 
@@ -513,6 +558,79 @@ command_digest() {
     printf '%q\000' "$@" | sha256sum | awk '{print $1}'
 }
 
+verify_pose_policy() {
+    "$PYTHON" - "$POSE" "$POSE_NAME" "$RENDER_ON_GEOREF_FAILURE" <<'PY'
+import sys
+from rtk_splat.backends.pose_evidence import verify_pose_georeferencing_artifact
+
+diagnostic_mode = bool(int(sys.argv[3]))
+evidence = verify_pose_georeferencing_artifact(
+    sys.argv[1], expected_name=sys.argv[2]
+)
+expected_class = "diagnostic_render_only" if diagnostic_mode else "production"
+expected_eligible = not diagnostic_mode
+if evidence["artifact_class"] != expected_class:
+    raise SystemExit("pose artifact class is inconsistent with launcher mode")
+if evidence["metric_georeferencing_claim_eligible"] is not expected_eligible:
+    raise SystemExit("pose metric-claim eligibility is inconsistent")
+status = evidence["georeferencing_status"]
+if status not in {"PASSED", "FAILED"}:
+    raise SystemExit(f"unknown georeferencing status: {status!r}")
+if not diagnostic_mode and status != "PASSED":
+    raise SystemExit("production pose did not pass georeferencing")
+PY
+}
+
+verify_cloud_policy() {
+    "$PYTHON" - "$POSE" "$POSE_NAME" "$CLOUD" "$RENDER_ON_GEOREF_FAILURE" <<'PY'
+import sys
+from rtk_splat.backends.pose_evidence import (
+    cloud_georeferencing_evidence,
+    verify_pose_georeferencing_artifact,
+)
+
+diagnostic_mode = bool(int(sys.argv[4]))
+expected = verify_pose_georeferencing_artifact(sys.argv[1], expected_name=sys.argv[2])
+stored = cloud_georeferencing_evidence(
+    sys.argv[3],
+    expected,
+    allow_failed_georeferencing_for_render=diagnostic_mode,
+)
+expected_class = "diagnostic_render_only" if diagnostic_mode else "production"
+if stored is None or stored["artifact_class"] != expected_class:
+    raise SystemExit("cloud artifact class is inconsistent with launcher mode")
+if stored["metric_georeferencing_claim_eligible"] is not (not diagnostic_mode):
+    raise SystemExit("cloud metric-claim eligibility is inconsistent")
+if not diagnostic_mode and stored["georeferencing_status"] != "PASSED":
+    raise SystemExit("production cloud did not pass georeferencing")
+PY
+}
+
+verify_training_policy() {
+    "$PYTHON" - "$POSE" "$POSE_NAME" "$TRAIN" "$RENDER_ON_GEOREF_FAILURE" <<'PY'
+import sys
+from rtk_splat.backends.pose_evidence import (
+    verify_pose_georeferencing_artifact,
+    verify_training_run_georeferencing,
+)
+
+diagnostic_mode = bool(int(sys.argv[4]))
+evidence = verify_pose_georeferencing_artifact(sys.argv[1], expected_name=sys.argv[2])
+verify_training_run_georeferencing(sys.argv[3], evidence)
+expected_class = "diagnostic_render_only" if diagnostic_mode else "production"
+expected_eligible = not diagnostic_mode
+if evidence["artifact_class"] != expected_class:
+    raise SystemExit("training artifact class is inconsistent with launcher mode")
+if evidence["metric_georeferencing_claim_eligible"] is not expected_eligible:
+    raise SystemExit("training metric-claim eligibility is inconsistent")
+status = evidence["georeferencing_status"]
+if status not in {"PASSED", "FAILED"}:
+    raise SystemExit(f"unknown training georeferencing status: {status!r}")
+if not diagnostic_mode and status != "PASSED":
+    raise SystemExit("production GS did not pass georeferencing")
+PY
+}
+
 verify_outputs() {
     local stage="$1"
     local -a required=()
@@ -553,18 +671,26 @@ verify_outputs() {
                 "$BACKEND/text_model_manifest.json") ;;
         backend-export)
             required=("$POSE/viewmats.npy" "$POSE/cam_centers.npy" \
-                "$POSE/quality.json") ;;
+                "$POSE/quality.json" "$POSE/alignment.json" \
+                "$POSE/provenance.json" "$POSE/manifest.json" \
+                "$POSE/georeferencing.json") ;;
         cloud)
             required=("$CLOUD") ;;
         train)
-            required=("$TRAIN/metrics.json" "$TRAIN/params.pt" "$TRAIN/splat.ply" \
-                "$TRAIN/run_provenance.json") ;;
+            required=("$TRAIN/metrics.json" "$TRAIN/params.pt" \
+                "$TRAIN/run_provenance.json" "$TRAIN/georeferencing.json" \
+                "$TRAIN/splat.georeferencing.json") ;;
         *) die "unknown stage verifier: $stage" ;;
     esac
     local path
     for path in "${required[@]}"; do
         [[ -s "$path" ]] || return 1
     done
+    case "$stage" in
+        backend-export) verify_pose_policy ;;
+        cloud) verify_cloud_policy ;;
+        train) verify_training_policy ;;
+    esac
 }
 
 run_stage() {
@@ -601,6 +727,15 @@ run_stage() {
 CLI=("$PYTHON" -m rtk_splat.workflows.cli)
 SOURCE_COMMON=(--config "$CONFIG" --workdir "$WORKDIR" --segment "$SOURCE_SEGMENT")
 COMMON=(--config "$CONFIG" --workdir "$WORKDIR" --segment "$SEGMENT")
+RENDER_AUTHORIZATION=()
+if ((RENDER_ON_GEOREF_FAILURE)); then
+    RENDER_AUTHORIZATION=(--allow-failed-georeferencing-for-render)
+    cat <<'EOF'
+WARNING: diagnostic-render authorization is active. Georeferencing gates are
+unchanged. Any failed-gate pose/cloud/PLY is visualization-only and is not
+eligible for a metric georeferencing claim.
+EOF
+fi
 
 run_stage ingest \
     "${CLI[@]}" ingest "${SOURCE_COMMON[@]}"
@@ -647,22 +782,41 @@ run_stage backend-quality \
     --backend global --backend-name "$BACKEND_NAME"
 run_stage backend-export \
     "${CLI[@]}" backend-export "${COMMON[@]}" \
-    --backend global --backend-name "$BACKEND_NAME" --pose-name "$POSE_NAME"
+    --backend global --backend-name "$BACKEND_NAME" --pose-name "$POSE_NAME" \
+    "${RENDER_AUTHORIZATION[@]}"
 
 run_stage cloud \
-    "${CLI[@]}" cloud "${COMMON[@]}" --pose-name "$POSE_NAME"
+    "${CLI[@]}" cloud "${COMMON[@]}" --pose-name "$POSE_NAME" \
+    "${RENDER_AUTHORIZATION[@]}"
 run_stage train \
     "${CLI[@]}" train "${COMMON[@]}" \
-    --pose-name "$POSE_NAME" --run-name "$TRAIN_NAME"
+    --pose-name "$POSE_NAME" --run-name "$TRAIN_NAME" \
+    "${RENDER_AUTHORIZATION[@]}"
 
-"$PYTHON" - "$TRAIN/metrics.json" "$BACKEND/reports/quality.json" <<'PY'
+"$PYTHON" - \
+    "$TRAIN/metrics.json" \
+    "$BACKEND/reports/quality.json" \
+    "$POSE/quality.json" \
+    "$TRAIN/georeferencing.json" <<'PY'
 import json
 import sys
 metrics = json.load(open(sys.argv[1]))[-1]
-quality = json.load(open(sys.argv[2]))
+visual_quality = json.load(open(sys.argv[2]))
+pose_quality = json.load(open(sys.argv[3]))
+georef = json.load(open(sys.argv[4]))
+residual = pose_quality["holdout_rtk_residual_m"]
 summary = {
-    "registration_fraction": quality["registration_fraction"],
-    "quality_passed": quality["passed"],
+    "visual_registration_fraction": visual_quality["registration_fraction"],
+    "visual_geometry_quality_passed": visual_quality["passed"],
+    "georeferencing_status": georef["georeferencing_status"],
+    "heldout_rtk_median_residual_m": residual["median"],
+    "heldout_rtk_p95_inlier_residual_m": residual[
+        "p95_euclidean_inliers"
+    ],
+    "metric_georeferencing_claim_eligible": georef[
+        "metric_georeferencing_claim_eligible"
+    ],
+    "artifact_class": georef["artifact_class"],
     "psnr": metrics["psnr"],
     "psnr_masked": metrics["psnr_masked"],
     "psnr_masked_cc": metrics["psnr_masked_cc"],
@@ -673,6 +827,13 @@ summary = {
 if "psnr_masked_aligned" in metrics:
     summary["psnr_masked_aligned"] = metrics["psnr_masked_aligned"]
 print(json.dumps(summary, indent=2, sort_keys=True))
+if not georef["metric_georeferencing_claim_eligible"]:
+    print(
+        "\n*** VISUALIZATION ONLY: NOT ELIGIBLE FOR A METRIC "
+        "GEOREFERENCING CLAIM ***\n"
+        "The render/PLY may be inspected for local visual quality, but the "
+        "held-out RTK acceptance result remains failed or diagnostic-only."
+    )
 PY
 
 echo "COMPLETE: $WORKDIR"

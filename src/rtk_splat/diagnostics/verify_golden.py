@@ -16,7 +16,11 @@ from typing import Any
 
 import numpy as np
 
-from .pose_artifacts import pose_fingerprint
+from rtk_splat.backends.pose_evidence import (
+    verify_pose_georeferencing_artifact,
+    verify_training_run_georeferencing,
+)
+from rtk_splat.core.pose_artifacts import pose_fingerprint
 
 
 _DEFAULT_MANIFEST = Path("docs/experiments/golden/headland_stereo_ba.json")
@@ -26,8 +30,15 @@ def discover_default_manifest(source_file: str | Path | None = None) -> Path | N
     """Return the repository golden manifest only in a source checkout."""
     source = Path(source_file or __file__).resolve()
     for root in source.parents:
-        owns_source = any(source.is_relative_to(root / item) for item in ("src/rtk_splat", "rtk_splat"))
-        if owns_source and (root / "pyproject.toml").is_file() and (root / _DEFAULT_MANIFEST).is_file():
+        owns_source = any(
+            source.is_relative_to(root / item)
+            for item in ("src/rtk_splat", "rtk_splat")
+        )
+        if (
+            owns_source
+            and (root / "pyproject.toml").is_file()
+            and (root / _DEFAULT_MANIFEST).is_file()
+        ):
             return root / _DEFAULT_MANIFEST
     return None
 
@@ -85,6 +96,72 @@ def _check_max(
     )
 
 
+def _modern_georeferencing_check(
+    pose_dir: Path,
+    run_dir: Path,
+    quality: dict[str, Any],
+) -> tuple[bool, str] | None:
+    """Reject diagnostic/tampered modern outputs without changing legacy checks."""
+    provenance_path = run_dir / "run_provenance.json"
+    try:
+        provenance = (
+            json.loads(provenance_path.read_text())
+            if provenance_path.is_file()
+            else {}
+        )
+    except (OSError, json.JSONDecodeError):
+        provenance = {}
+    if not isinstance(provenance, dict):
+        provenance = {}
+    modern = (
+        any(
+            key in quality
+            for key in (
+                "artifact_class",
+                "georeferencing_status",
+                "metric_georeferencing_claim_eligible",
+            )
+        )
+        or (pose_dir / "georeferencing.json").is_file()
+        or (run_dir / "georeferencing.json").is_file()
+        or (run_dir / "splat.georeferencing.json").is_file()
+        or isinstance(provenance.get("georeferencing"), dict)
+        or (pose_dir / "GEOREFERENCING_FAILED.json").exists()
+        or (run_dir / "GEOREFERENCING_FAILED.json").exists()
+        or (run_dir / "splat.DIAGNOSTIC_ONLY.ply").exists()
+    )
+    if not modern:
+        return None
+    try:
+        evidence = verify_pose_georeferencing_artifact(
+            pose_dir, expected_name=pose_dir.name
+        )
+        verify_training_run_georeferencing(run_dir, evidence)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return (
+            False,
+            "modern output is ineligible for golden/publication acceptance: "
+            f"{exc}",
+        )
+    expected = {
+        "artifact_class": "production",
+        "georeferencing_status": "PASSED",
+        "metric_georeferencing_claim_eligible": True,
+    }
+    errors = [
+        f"{key}={evidence.get(key)!r}"
+        for key, value in expected.items()
+        if evidence.get(key) != value
+    ]
+    if errors:
+        return (
+            False,
+            "modern output is ineligible for golden/publication acceptance: "
+            + "; ".join(errors),
+        )
+    return True, "modern georeferencing evidence: production/PASSED/eligible"
+
+
 def verify(
     manifest_path: Path,
     workdir: Path | None = None,
@@ -139,6 +216,11 @@ def verify(
     )
 
     quality = json.loads(quality_path.read_text())
+    modern_georeferencing = _modern_georeferencing_check(
+        pose_dir, run_dir, quality
+    )
+    if modern_georeferencing is not None:
+        checks.append(modern_georeferencing)
     registered = int(quality["n_registered_left"])
     checks.append(
         (

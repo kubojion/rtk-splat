@@ -140,6 +140,26 @@ publish a normal pose artifact consumable by cloud construction or training.
 The output artifact also records image IDs, exact timestamps, names, quality,
 and provenance.
 
+### Explicit visualization-only export
+
+The default above remains fail-closed. For visual diagnosis only, an operator
+may explicitly pass `--allow-failed-georeferencing-for-render` to
+`backend-export`, `cloud`, and `train`, using new pose and run names. This does
+not change an RTK threshold or turn a failed check into a pass. It allows the
+already evaluated fixed-scale alignment to reach rendering while preserving
+the failed checks. Direct CLI use must provide an explicit pose name for all
+three stages and an explicit run name for training; names configured for the
+production path are rejected.
+
+Such a pose is stamped `artifact_class: diagnostic_render_only` and
+`metric_georeferencing_claim_eligible: false` in its manifest, quality,
+alignment, provenance, and georeferencing sidecar. A failed pose also carries
+`GEOREFERENCING_FAILED.json`. Cloud and training refuse to consume it unless
+the same explicit flag is repeated. Training writes
+`splat.DIAGNOSTIC_ONLY.ply`, never `splat.ply`, and propagates the status into
+the run and PLY sidecars. The diagnostic result may support a local rendering
+inspection; it cannot support a metric georeferencing claim.
+
 ## Historical measured headland control
 
 The historical experiment used 2,688 rectified images (1,344 stereo pairs),

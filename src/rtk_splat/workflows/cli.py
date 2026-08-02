@@ -420,6 +420,9 @@ def cmd_backend_export(cfg, args) -> None:
             if args.refinement_name is not None
             else None
         ),
+        allow_failed_georeferencing_for_render=(
+            bool(getattr(args, "allow_failed_georeferencing_for_render", False))
+        ),
     )
     print(f"fixed-scale ENU pose artifact -> {output}")
 
@@ -430,7 +433,13 @@ def cmd_cloud(cfg, args) -> None:
     reader = _reader(cfg, args)
     if args.pose_name:
         cfg.pose.artifact = args.pose_name
-    output, point_count = construct_initial_cloud(reader, cfg)
+    output, point_count = construct_initial_cloud(
+        reader,
+        cfg,
+        allow_failed_georeferencing_for_render=(
+            bool(getattr(args, "allow_failed_georeferencing_for_render", False))
+        ),
+    )
     print(f"initial cloud: {point_count:,} points -> {output}")
 
 
@@ -446,7 +455,14 @@ def cmd_train(cfg, args) -> None:
     reader = _reader(cfg, args)
     resolve_training_controls(cfg, reader, cloud_path(reader.root, cfg))
     run = Path(cfg.paths.workdir) / "runs" / str(cfg.train.run_name)
-    result = train_tile(reader.root, run, cfg)
+    result = train_tile(
+        reader.root,
+        run,
+        cfg,
+        allow_failed_georeferencing_for_render=(
+            bool(getattr(args, "allow_failed_georeferencing_for_render", False))
+        ),
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -514,6 +530,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-iters", type=int)
     parser.add_argument("--expected-frames", type=int)
     parser.add_argument(
+        "--allow-failed-georeferencing-for-render",
+        action="store_true",
+        help=(
+            "explicitly consume or publish a diagnostic-render-only pose "
+            "whose held-out georeferencing gate failed; valid only for "
+            "backend-export, cloud, and train"
+        ),
+    )
+    parser.add_argument(
         "--skip-image-quality",
         action="store_true",
         help="skip image decoding only for planning smoke tests",
@@ -536,7 +561,44 @@ def _stage_overrides(args) -> dict[str, Any]:
     }
     if args.skip_image_quality:
         result["skip_image_quality"] = True
+    if args.allow_failed_georeferencing_for_render:
+        result["allow_failed_georeferencing_for_render"] = True
     return result
+
+
+def _validate_diagnostic_render_names(args, cfg) -> None:
+    """Keep visualization-only outputs outside configured production names."""
+    if not args.allow_failed_georeferencing_for_render:
+        return
+    if args.pose_name is None:
+        raise ValueError(
+            "--allow-failed-georeferencing-for-render requires an explicit "
+            "--pose-name"
+        )
+    if args.stage == "backend-export":
+        configured_pose = str(
+            getattr(_section(cfg, "mapper"), "pose_artifact_name", None)
+            or _backend_name(cfg, args)
+        )
+    else:
+        configured_pose = str(getattr(_section(cfg, "pose"), "artifact", "rtk"))
+    if args.pose_name == configured_pose:
+        raise ValueError(
+            "diagnostic --pose-name must differ from the configured production "
+            "pose name"
+        )
+    if args.stage == "train":
+        if args.run_name is None:
+            raise ValueError(
+                "--allow-failed-georeferencing-for-render requires an explicit "
+                "--run-name for train"
+            )
+        configured_run = str(getattr(_section(cfg, "train"), "run_name", "default"))
+        if args.run_name == configured_run:
+            raise ValueError(
+                "diagnostic --run-name must differ from the configured production "
+                "run name"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -559,7 +621,16 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(
             "--initialization-mode is valid only for backend-refine-rtk"
         )
+    if (
+        args.allow_failed_georeferencing_for_render
+        and args.stage not in {"backend-export", "cloud", "train"}
+    ):
+        raise ValueError(
+            "--allow-failed-georeferencing-for-render is valid only for "
+            "backend-export, cloud, and train"
+        )
     cfg = load_config(args.config, config_root=args.config_root)
+    _validate_diagnostic_render_names(args, cfg)
     authored_config = authored_config_plain(cfg)
     if args.workdir is not None:
         cfg.paths.workdir = args.workdir.expanduser()

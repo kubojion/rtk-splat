@@ -43,9 +43,19 @@ from .gsplat_cameras import (
     align_eval_pose,
     right_c2w,
 )
-from rtk_splat.core.pose_artifacts import (cloud_path, load_pose_artifact,
-                                      pose_artifact_name, pose_fingerprint,
-                                      verify_cloud_matches_poses)
+from rtk_splat.backends.pose_evidence import (
+    cloud_georeferencing_evidence,
+    pose_georeferencing_evidence,
+    require_render_permission,
+    splat_output_name,
+)
+from rtk_splat.core.pose_artifacts import (
+    cloud_path,
+    load_pose_artifact,
+    pose_artifact_name,
+    pose_fingerprint,
+    verify_cloud_matches_poses,
+)
 from rtk_splat.core.segment import SegmentReader
 from rtk_splat.core.runtime_resolution import configuration_evidence
 
@@ -224,7 +234,14 @@ def _masked_psnr(rgb, rgb_gt, mask):
     return float(-10.0 * torch.log10(mse))
 
 
-def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
+def train_tile(
+    seg_dir: Path,
+    run_dir: Path,
+    cfg,
+    device="cuda",
+    *,
+    allow_failed_georeferencing_for_render: bool = False,
+):
     seed = int(getattr(cfg.train, "seed", 0))
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -238,7 +255,20 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     k_mat = torch.tensor([[intr[0, 0], 0, intr[0, 2]],
                           [0, intr[1, 1], intr[1, 2]],
                           [0, 0, 1]], dtype=torch.float32, device=device)
-    viewmats_np, _ = load_pose_artifact(seg_dir, cfg)
+    georeferencing = pose_georeferencing_evidence(seg_dir, cfg)
+    require_render_permission(
+        georeferencing,
+        allow_failed_georeferencing_for_render=(
+            allow_failed_georeferencing_for_render
+        ),
+    )
+    viewmats_np, _ = load_pose_artifact(
+        seg_dir,
+        cfg,
+        allow_failed_georeferencing_for_render=(
+            allow_failed_georeferencing_for_render
+        ),
+    )
     viewmats = torch.tensor(viewmats_np,
                             dtype=torch.float32, device=device)
     c2ws = torch.linalg.inv(viewmats)
@@ -257,13 +287,31 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     init_cloud = cloud_path(seg_dir, cfg)
     verify_cloud_matches_poses(
         init_cloud, viewmats_np,
-        require_fingerprint=pose_artifact_name(cfg) != "rtk")
+        require_fingerprint=pose_artifact_name(cfg) != "rtk",
+    )
+    cloud_georeferencing_evidence(
+        init_cloud,
+        georeferencing,
+        allow_failed_georeferencing_for_render=(
+            allow_failed_georeferencing_for_render
+        ),
+    )
     try:
         run_dir.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
         raise FileExistsError(
             f"refusing to reuse existing training run: {run_dir}") from exc
     (run_dir / "renders").mkdir()
+    georeferencing_text = json.dumps(
+        georeferencing, indent=2, sort_keys=True
+    ) + "\n"
+    (run_dir / "georeferencing.json").write_text(
+        georeferencing_text, encoding="utf-8"
+    )
+    if georeferencing["georeferencing_status"] == "FAILED":
+        (run_dir / "GEOREFERENCING_FAILED.json").write_text(
+            georeferencing_text, encoding="utf-8"
+        )
     params = init_params(init_cloud, cfg, device)
     optimizers = make_optimizers(params, cfg)
     # Annealing (upstream practice we previously missed): stop MCMC
@@ -313,6 +361,7 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
         "max_gaussians": int(cfg.train.max_gaussians),
         "pose_artifact": pose_artifact_name(cfg),
         "pose_fingerprint": pose_fingerprint(viewmats_np),
+        "georeferencing": georeferencing,
         "initial_cloud_sha256": _sha256_file(init_cloud),
         "manifest_sha256": _sha256_file(seg_dir / "manifest.json"),
         "frames_sha256": _sha256_file(seg_dir / "frames.npz"),
@@ -445,7 +494,13 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
                   flush=True)
 
     (run_dir / "metrics.json").write_text(json.dumps(history, indent=2))
-    export_pruned(params, run_dir, cfg, seg_dir)
+    export_pruned(
+        params,
+        run_dir,
+        cfg,
+        seg_dir,
+        georeferencing=georeferencing,
+    )
     save = {k: v.detach().cpu() for k, v in params.items()}
     if pose_adj is not None:
         save["pose_deltas_raw"] = pose_adj.raw.weight.detach().cpu()
@@ -453,7 +508,14 @@ def train_tile(seg_dir: Path, run_dir: Path, cfg, device="cuda"):
     return history[-1] if history else None
 
 
-def export_pruned(params, run_dir: Path, cfg, seg_dir: Path = None):
+def export_pruned(
+    params,
+    run_dir: Path,
+    cfg,
+    seg_dir: Path = None,
+    *,
+    georeferencing: dict | None = None,
+):
     """Viewer PLY without near-invisible Gaussians, cropped to the supervised
     core region (the periphery is unsupervised mush that ruins free orbit).
     Raw log/logit spaces -- exporter and viewers apply exp/sigmoid."""
@@ -466,13 +528,25 @@ def export_pruned(params, run_dir: Path, cfg, seg_dir: Path = None):
                           dtype=torch.float32, device=params["means"].device)
         m = params["means"].detach()
         keep &= ((m > lo) & (m < hi)).all(dim=1)
+    output_name = splat_output_name(georeferencing or {})
+    output_path = run_dir / output_name
     export_splats(
         params["means"].detach()[keep],
         params["scales"].detach()[keep],
         torch.nn.functional.normalize(params["quats"].detach()[keep], dim=-1),
         params["opacities"].detach()[keep],
         params["sh0"].detach()[keep], params["shN"].detach()[keep],
-        format="ply", save_to=str(run_dir / "splat.ply"))
+        format="ply", save_to=str(output_path))
+    if georeferencing is not None:
+        splat_evidence = {
+            **georeferencing,
+            "splat_file": output_name,
+            "splat_sha256": _sha256_file(output_path),
+        }
+        (run_dir / "splat.georeferencing.json").write_text(
+            json.dumps(splat_evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(f"exported {int(keep.sum())}/{len(keep)} Gaussians "
           f"(pruned opacity <= {cfg.train.export_prune_opacity})")
 

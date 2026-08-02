@@ -453,6 +453,13 @@ class MapperBackendTests(unittest.TestCase):
                 (pose_artifact / "provenance.json").read_text()
             )
             self.assertEqual(provenance["backend"], "global")
+            self.assertEqual(provenance["artifact_class"], "production")
+            self.assertEqual(provenance["georeferencing_status"], "PASSED")
+            self.assertTrue(
+                provenance["metric_georeferencing_claim_eligible"]
+            )
+            self.assertFalse(provenance["diagnostic_export_requested"])
+            self.assertFalse(provenance["diagnostic_export_override_used"])
             alignment = json.loads(
                 (pose_artifact / "alignment.json").read_text()
             )
@@ -465,6 +472,49 @@ class MapperBackendTests(unittest.TestCase):
             )
             self.assertEqual(
                 provenance["source_backend_workspace"], str(workspace)
+            )
+            georeferencing = json.loads(
+                (pose_artifact / "georeferencing.json").read_text()
+            )
+            self.assertEqual(georeferencing["artifact_class"], "production")
+            self.assertEqual(georeferencing["georeferencing_status"], "PASSED")
+            self.assertTrue(
+                georeferencing["metric_georeferencing_claim_eligible"]
+            )
+            self.assertIsNone(georeferencing["warning"])
+            self.assertFalse(
+                (pose_artifact / "GEOREFERENCING_FAILED.json").exists()
+            )
+
+            diagnostic_pass = export_pose_artifact(
+                workspace,
+                "global-balanced-diagnostic",
+                output_root=pose_root,
+                allow_failed_georeferencing_for_render=True,
+            )
+            diagnostic_pass_quality = json.loads(
+                (diagnostic_pass / "quality.json").read_text()
+            )
+            self.assertEqual(
+                diagnostic_pass_quality["artifact_class"],
+                "diagnostic_render_only",
+            )
+            self.assertEqual(
+                diagnostic_pass_quality["georeferencing_status"], "PASSED"
+            )
+            self.assertFalse(
+                diagnostic_pass_quality[
+                    "metric_georeferencing_claim_eligible"
+                ]
+            )
+            self.assertTrue(
+                diagnostic_pass_quality["diagnostic_export_requested"]
+            )
+            self.assertFalse(
+                diagnostic_pass_quality["diagnostic_export_override_used"]
+            )
+            self.assertFalse(
+                (diagnostic_pass / "GEOREFERENCING_FAILED.json").exists()
             )
             with self.assertRaises(FileExistsError):
                 export_pose_artifact(
@@ -536,6 +586,86 @@ class MapperBackendTests(unittest.TestCase):
             )
             self.assertFalse((pose_root / "rejected").exists())
             self.assertFalse(list(pose_root.glob(".rejected.writing-*")))
+
+    def test_failed_pose_gate_opt_in_publishes_sealed_diagnostic_only_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frontend, names = _frontend(
+                root,
+                prior_offsets_m={
+                    2: np.array([0.5, 0.0, 0.0]),
+                    4: np.array([0.5, 0.0, 0.0]),
+                },
+            )
+            workspace = prepare_mapper_backend(frontend, root / "backend")
+            runner = _ColmapRunner(names)
+            run_mapper_solve(workspace, "colmap", runner=runner)
+            run_image_registration(workspace, "colmap", runner=runner)
+            run_quality_summary(workspace, "colmap", runner=runner)
+
+            pose = export_pose_artifact(
+                workspace,
+                "failed-georeferencing-render",
+                output_root=root / "pose_artifacts",
+                allow_failed_georeferencing_for_render=True,
+            )
+            expected_status = {
+                "artifact_class": "diagnostic_render_only",
+                "georeferencing_status": "FAILED",
+                "metric_georeferencing_claim_eligible": False,
+                "diagnostic_export_requested": True,
+                "diagnostic_export_override_used": True,
+            }
+            records = {
+                filename: json.loads((pose / filename).read_text())
+                for filename in (
+                    "manifest.json",
+                    "quality.json",
+                    "alignment.json",
+                    "provenance.json",
+                    "georeferencing.json",
+                    "GEOREFERENCING_FAILED.json",
+                )
+            }
+            for filename, record in records.items():
+                for field, expected in expected_status.items():
+                    self.assertEqual(
+                        record[field], expected, f"{field} in {filename}"
+                    )
+            self.assertFalse(records["quality.json"]["rtk_alignment_passed"])
+            self.assertFalse(
+                records["georeferencing.json"]["rtk_alignment_passed"]
+            )
+            self.assertIn(
+                "Do not use this artifact for metric georeferencing claims",
+                records["GEOREFERENCING_FAILED.json"]["warning"],
+            )
+            np.testing.assert_array_equal(
+                np.load(pose / "frame_ids.npy"), np.arange(6)
+            )
+            self.assertEqual(np.load(pose / "viewmats.npy").shape, (6, 4, 4))
+
+            manifest = records["manifest.json"]
+            self.assertIn("GEOREFERENCING_FAILED.json", manifest["files"])
+            self.assertIn("georeferencing.json", manifest["files"])
+            for filename, evidence in manifest["files"].items():
+                path = pose / filename
+                self.assertEqual(sha256_file(path), evidence["sha256"])
+                self.assertEqual(path.stat().st_size, evidence["size_bytes"])
+
+            reports = list(
+                (workspace / "reports").glob(
+                    "pose_export_alignment_failed-georeferencing-render_*.json"
+                )
+            )
+            self.assertEqual(len(reports), 1)
+            diagnostic = json.loads(reports[0].read_text(encoding="utf-8"))
+            self.assertFalse(diagnostic["passed"])
+            self.assertTrue(
+                diagnostic["inputs"][
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
 
     def test_failed_solve_cleans_partial_output_and_can_resume(self):
         with tempfile.TemporaryDirectory() as tmp:

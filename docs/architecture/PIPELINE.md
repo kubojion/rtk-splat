@@ -194,8 +194,12 @@ control. Both backends use the same lifecycle:
 5. Optionally, `backend-refine-rtk` clones the completed backend, removes
    temporal holdout priors, runs position-prior BA, and checks visual quality,
    stereo scale/rig integrity, and blocks absent from its optimizer factors.
-6. `backend-export` publishes a new pose artifact only after the selected
-   mapper/refinement path passes every gate.
+6. `backend-export` normally publishes a new pose artifact only after the
+   selected mapper/refinement path passes every gate. An explicitly authorized,
+   separately named diagnostic-render artifact may preserve a failed
+   georeferencing result for visualization, but is marked ineligible for
+   metric claims and cannot enter cloud/training without repeated explicit
+   authorization.
 
 The corresponding Python API is `MapperConfig`,
 `prepare_mapper_backend()`, `run_mapper_solve()`,
@@ -316,6 +320,15 @@ launches COLMAP, calibration, or an experimental sidecar.
 second workflow API. It invokes the explicit commands above in order, requires
 a new internal-disk work directory unless verified resume is requested, and
 does not start `tmux`.
+
+The launcher is fail-closed by default. Its
+`--render-on-georef-failure` operator mode keeps every georeferencing gate
+unchanged, selects separate diagnostic pose/run names, and passes the narrow
+authorization only to export, cloud, and training. A strict run that stopped
+at export under the same code/config snapshot can therefore resume its verified
+earlier stages with that option. Source changes deliberately invalidate resume.
+The resulting `splat.DIAGNOSTIC_ONLY.ply` is visualization-only; provenance and
+sidecars continue to report the failed RTK residuals.
 
 `scripts/runs/refine_existing_backend.sh` runs the optional refinement and then
 attempts refined export against an already completed named backend. It never

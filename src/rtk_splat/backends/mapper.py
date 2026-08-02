@@ -603,8 +603,16 @@ def export_pose_artifact(
     *,
     output_root: str | Path,
     refinement_workspace: str | Path | None = None,
+    allow_failed_georeferencing_for_render: bool = False,
 ) -> Path:
-    """Publish one named, provenance-complete left-camera pose artifact."""
+    """Publish one named, provenance-complete left-camera pose artifact.
+
+    The default remains fail-closed: a candidate that fails the held-out RTK
+    gates is not published.  The explicit diagnostic override permits an
+    *evaluated* but rejected fixed-scale alignment to be consumed for visual
+    rendering.  It does not bypass registration, visual-quality,
+    observability, or pose-array integrity checks.
+    """
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         raise ValueError(f"invalid pose artifact name: {name!r}")
     root, plan, config = _workspace_context(workspace)
@@ -710,6 +718,9 @@ def export_pose_artifact(
     )
     inputs = {
         "name": name,
+        "allow_failed_georeferencing_for_render": bool(
+            allow_failed_georeferencing_for_render
+        ),
         "quality_marker_sha256": sha256_file(quality_marker),
         "text_model_manifest_sha256": sha256_file(text_manifest_path),
         "frame_manifest_sha256": sha256_file(frontend / "frame_manifest.json"),
@@ -750,6 +761,30 @@ def export_pose_artifact(
         for check in rtk_checks.values()
         if check["authoritative"]
     )
+    diagnostic_export_requested = bool(
+        allow_failed_georeferencing_for_render
+    )
+    diagnostic_export_override_used = bool(
+        diagnostic_export_requested and not rtk_alignment_passed
+    )
+    artifact_class = (
+        "diagnostic_render_only"
+        if diagnostic_export_requested
+        else "production"
+    )
+    georeferencing_status = "PASSED" if rtk_alignment_passed else "FAILED"
+    metric_georeferencing_claim_eligible = bool(
+        rtk_alignment_passed and not diagnostic_export_requested
+    )
+    artifact_status = {
+        "artifact_class": artifact_class,
+        "georeferencing_status": georeferencing_status,
+        "metric_georeferencing_claim_eligible": (
+            metric_georeferencing_claim_eligible
+        ),
+        "diagnostic_export_requested": diagnostic_export_requested,
+        "diagnostic_export_override_used": diagnostic_export_override_used,
+    }
     backfilled_fields = sorted(
         set(_LEGACY_EVALUATION_DEFAULTS) - set(plan["config"])
     )
@@ -804,6 +839,7 @@ def export_pose_artifact(
         "stage": "pose_export_rtk_alignment_evaluation",
         "pose_artifact_name": name,
         "passed": rtk_alignment_passed,
+        **artifact_status,
         "inputs": inputs,
         "gate_policy": gate_policy,
         "n_calibration_priors": int(evaluation.calibration_mask.sum()),
@@ -827,7 +863,7 @@ def export_pose_artifact(
         diagnostic_root, f"pose_export_alignment_{name}_{diagnostic_identity}"
     )
     _atomic_json(diagnostic_path, diagnostic_report)
-    if not rtk_alignment_passed:
+    if not rtk_alignment_passed and not diagnostic_export_requested:
         raise ArtifactError(
             "fixed-scale ENU alignment failed RTK residual gates; "
             f"diagnostics: {diagnostic_path}"
@@ -851,6 +887,7 @@ def export_pose_artifact(
         _atomic_save_npy(staging / "left_image_names.npy", np.asarray(left_names))
         export_quality = {
             "schema_version": 1,
+            **artifact_status,
             "source_quality_report_sha256": sha256_file(
                 quality_report_path
             ),
@@ -887,6 +924,7 @@ def export_pose_artifact(
         }
         alignment_record = {
             "schema_version": 1,
+            **artifact_status,
             "method": (
                 "covariance_weighted_ransac_fixed_scale_se3_"
                 "with_temporal_holdout"
@@ -941,6 +979,7 @@ def export_pose_artifact(
         }
         provenance = {
             "schema_version": 1,
+            **artifact_status,
             "frontend_artifact": str(frontend),
             "source_backend_workspace": str(root),
             "frontend_inputs": plan["frontend_inputs"],
@@ -974,9 +1013,43 @@ def export_pose_artifact(
                 "world_alignment": "fixed_scale_SE3_only",
             },
         }
+        georeferencing_record = {
+            "schema_version": 1,
+            **artifact_status,
+            "fixed_scale_se3_applied": True,
+            "rtk_alignment_passed": rtk_alignment_passed,
+            "diagnostic_report": str(diagnostic_path),
+            "diagnostic_report_sha256": sha256_file(diagnostic_path),
+            "checks": rtk_checks,
+            "warning": (
+                "Diagnostic render only: the held-out RTK georeferencing "
+                "acceptance gates failed. Do not use this artifact for metric "
+                "georeferencing claims."
+                if diagnostic_export_override_used
+                else (
+                    "Diagnostic render only: export was explicitly requested "
+                    "in diagnostic mode. Do not use this artifact for metric "
+                    "georeferencing claims."
+                    if diagnostic_export_requested
+                    else None
+                )
+            ),
+        }
         _atomic_json(staging / "quality.json", export_quality)
         _atomic_json(staging / "alignment.json", alignment_record)
         _atomic_json(staging / "provenance.json", provenance)
+        _atomic_json(staging / "georeferencing.json", georeferencing_record)
+        if diagnostic_export_override_used:
+            _atomic_json(
+                staging / "GEOREFERENCING_FAILED.json",
+                {
+                    "schema_version": 1,
+                    **artifact_status,
+                    "warning": georeferencing_record["warning"],
+                    "diagnostic_report": str(diagnostic_path),
+                    "diagnostic_report_sha256": sha256_file(diagnostic_path),
+                },
+            )
         file_evidence = {
             path.name: {
                 "sha256": sha256_file(path),
@@ -991,6 +1064,7 @@ def export_pose_artifact(
                 "schema_version": 1,
                 "name": name,
                 "n_frames": len(frame_ids),
+                **artifact_status,
                 "files": file_evidence,
             },
         )

@@ -283,6 +283,25 @@ all-frame OpenCV view matrices, ENU camera centres, exact frame IDs and
 timestamps, alignment diagnostics, quality gates, and provenance under
 `<workdir>/pose_artifacts/<pose-name>/`.
 
+Normal export remains fail-closed on held-out RTK gates. A rejected candidate
+can be rendered only through an explicit, separately named diagnostic path:
+
+```bash
+bash scripts/runs/citrusfarm_05_13d_uturn.sh run \
+  --workdir /home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_auto_v1 \
+  --render-on-georef-failure
+```
+
+This does not loosen the 15 cm/30 cm gates. A failed result is labelled
+`diagnostic_render_only`, propagates its failed RTK checks through pose, cloud,
+and run provenance, and writes `splat.DIAGNOSTIC_ONLY.ply` rather than
+`splat.ply`. It is suitable for visual inspection only and is not eligible for
+a metric georeferencing claim. If a default run made with the same source and
+launcher snapshot already stopped at pose export, add `--resume-existing` with
+the same workdir and diagnostic option; the verified COLMAP stages are reused.
+Runs made before this feature was added intentionally fail the source-identity
+check and require a fresh workdir.
+
 Cloud construction and training remain explicit:
 
 ```bash

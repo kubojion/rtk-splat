@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -11,15 +12,11 @@ import numpy as np
 from .segment import SegmentReader
 
 
-_RAW_NAMES = {"", "rtk", "raw_rtk"}
-_SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-
-
 def pose_artifact_name(cfg) -> str:
     name = str(getattr(cfg.pose, "artifact", "rtk"))
-    if name in _RAW_NAMES:
+    if name in {"", "rtk", "raw_rtk"}:
         return "rtk"
-    if not _SAFE_NAME.fullmatch(name):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         raise ValueError(f"invalid pose artifact name {name!r}")
     return name
 
@@ -66,6 +63,17 @@ def pose_fingerprint(viewmats: np.ndarray) -> str:
     return h.hexdigest()
 
 
+def _requires_render_only_permission(root: Path) -> bool:
+    declaration = root / "georeferencing.json"
+    if not declaration.is_file():
+        return False
+    value = json.loads(declaration.read_text(encoding="utf-8"))
+    return (
+        value.get("artifact_class") == "diagnostic_render_only"
+        or value.get("georeferencing_status") == "FAILED"
+    )
+
+
 def _validate_viewmats(viewmats: np.ndarray, expected_n: int | None) -> None:
     if viewmats.ndim != 3 or viewmats.shape[1:] != (4, 4):
         raise ValueError(f"pose array must have shape (N,4,4), got {viewmats.shape}")
@@ -76,15 +84,20 @@ def _validate_viewmats(viewmats: np.ndarray, expected_n: int | None) -> None:
     if not np.allclose(viewmats[:, 3], [0, 0, 0, 1], atol=1e-5):
         raise ValueError("pose matrices have invalid homogeneous last row")
     rotations = viewmats[:, :3, :3]
-    eye = np.eye(3)
-    if not np.allclose(rotations @ np.swapaxes(rotations, 1, 2), eye,
-                       atol=2e-4):
+    if not np.allclose(
+        rotations @ np.swapaxes(rotations, 1, 2), np.eye(3), atol=2e-4
+    ):
         raise ValueError("pose matrices contain non-orthonormal rotations")
     if not np.allclose(np.linalg.det(rotations), 1.0, atol=2e-4):
         raise ValueError("pose matrices contain improper rotations")
 
 
-def load_pose_artifact(seg_dir: Path, cfg) -> tuple[np.ndarray, np.ndarray]:
+def load_pose_artifact(
+    seg_dir: Path,
+    cfg,
+    *,
+    allow_failed_georeferencing_for_render: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
     """Return validated OpenCV world-to-camera matrices and camera centres."""
     reader = SegmentReader(seg_dir)
     expected_n = int(reader.meta["n_frames"])
@@ -117,6 +130,12 @@ def load_pose_artifact(seg_dir: Path, cfg) -> tuple[np.ndarray, np.ndarray]:
             centers.astype(np.float32, copy=False),
         )
 
+    root = pose_artifact_dir(seg_dir, cfg)
+    if (
+        _requires_render_only_permission(root)
+        and not allow_failed_georeferencing_for_render
+    ):
+        raise ValueError("pose artifact requires explicit render-only permission")
     view_path, center_path = pose_paths(seg_dir, cfg)
     if not view_path.exists():
         raise FileNotFoundError(
@@ -134,22 +153,30 @@ def load_pose_artifact(seg_dir: Path, cfg) -> tuple[np.ndarray, np.ndarray]:
             raise ValueError(f"camera centres disagree with poses in {view_path}")
     else:
         centers = derived
-    return viewmats.astype(np.float32, copy=False), centers.astype(np.float32,
-                                                                   copy=False)
+    return (
+        viewmats.astype(np.float32, copy=False),
+        centers.astype(np.float32, copy=False),
+    )
 
 
-def verify_cloud_matches_poses(cloud_file: Path, viewmats: np.ndarray,
-                               require_fingerprint: bool) -> None:
+def verify_cloud_matches_poses(
+    cloud_file: Path,
+    viewmats: np.ndarray,
+    require_fingerprint: bool,
+) -> None:
     if not cloud_file.exists():
         raise FileNotFoundError(
-            f"pose-specific initial cloud is missing: {cloud_file}; run cloud first")
-    with np.load(cloud_file) as cloud:
+            f"pose-specific initial cloud is missing: {cloud_file}; run cloud first"
+        )
+    with np.load(cloud_file, allow_pickle=False) as cloud:
         if "pose_fingerprint" not in cloud:
             if require_fingerprint:
-                raise ValueError(f"{cloud_file} predates pose provenance; rebuild it")
+                raise ValueError(
+                    f"{cloud_file} predates pose provenance; rebuild it"
+                )
             return
         stored = str(cloud["pose_fingerprint"].item())
-    current = pose_fingerprint(viewmats)
-    if stored != current:
+    if stored != pose_fingerprint(viewmats):
         raise ValueError(
-            f"{cloud_file} was built from different poses; rebuild the cloud")
+            f"{cloud_file} was built from different poses; rebuild the cloud"
+        )

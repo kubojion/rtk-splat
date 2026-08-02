@@ -114,7 +114,43 @@ class CitrusRunConfigurationTests(unittest.TestCase):
         self.assertIn("iterations/cap derived", planned.stdout)
         self.assertIn("bounded Global Mapper", planned.stdout)
         self.assertIn("Nothing runs from plan", planned.stdout)
+        self.assertIn("Default fail-closed mode is enabled", planned.stdout)
+        self.assertIn("--render-on-georef-failure", planned.stdout)
         self.assertNotIn("tmux", planned.stdout.split("Stages", 1)[0])
+
+        diagnostic = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "plan",
+                "--render-on-georef-failure",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(diagnostic.returncode, 0, diagnostic.stderr)
+        self.assertIn("diagnostic rendering is enabled", diagnostic.stdout)
+        self.assertIn("are NOT relaxed", diagnostic.stdout)
+        self.assertIn("visualization-only", diagnostic.stdout)
+        self.assertIn("cannot support a", diagnostic.stdout)
+        self.assertIn("metric georeferencing claim", diagnostic.stdout)
+
+    def test_launcher_separates_and_propagates_diagnostic_outputs(self):
+        contents = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'DIAGNOSTIC_POSE_NAME="${BACKEND_NAME}-diagnostic-render"',
+            contents,
+        )
+        self.assertIn(
+            'DIAGNOSTIC_TRAIN_NAME="citrus-05-13d-543-735-auto-gs-v1-diagnostic-render"',
+            contents,
+        )
+        self.assertIn("--allow-failed-georeferencing-for-render", contents)
+        self.assertIn("verify_pose_georeferencing_artifact", contents)
+        self.assertIn("verify_training_run_georeferencing", contents)
+        self.assertIn("metric_georeferencing_claim_eligible", contents)
+        self.assertIn("VISUALIZATION ONLY", contents)
 
 
 if __name__ == "__main__":
