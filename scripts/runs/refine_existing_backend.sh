@@ -64,7 +64,7 @@ POSE="$WORKDIR/pose_artifacts/$POSE_NAME"
 [[ ! -e "$POSE" ]] \
     || die "pose artifact already exists; refusing an unverifiable shortcut: $POSE"
 
-export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export COLMAP_BIN="$COLMAP"
 mkdir -p "$WORKDIR/logs"
 LOG="$WORKDIR/logs/rtk-refine-${REFINEMENT_NAME}-$(date '+%Y%m%d_%H%M%S').log"

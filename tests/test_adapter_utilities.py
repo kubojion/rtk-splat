@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import unittest
@@ -9,6 +10,7 @@ import cv2
 import numpy as np
 
 import rtk_splat.adapters.ros2_zed_ublox as ros2_adapter
+from rtk_splat.core.runtime_resolution import runtime_resolution_plain
 from rtk_splat.adapters.image_decode import (
     ImageDecodeError,
     decode_compressed_image,
@@ -176,8 +178,32 @@ import rtk_splat.adapters.ros1_citrusfarm
             check=False,
             capture_output=True,
             text=True,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(
+                    Path(ros2_adapter.__file__).resolve().parents[2]
+                )
+                + (f":{os.environ['PYTHONPATH']}" if os.environ.get("PYTHONPATH") else ""),
+            },
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
+class AdapterRuntimeDefaultTests(unittest.TestCase):
+    def test_ros2_default_stride_has_auditable_constructed_origin(self):
+        cfg = SimpleNamespace(segment=SimpleNamespace())
+        configured = ros2_adapter.runtime_control_value(
+            cfg,
+            "frame_stride",
+            getattr(cfg.segment, "frame_stride", 1),
+            config_path="segment.frame_stride",
+        )
+        ros2_adapter.record_override(cfg, "frame_stride", int(configured))
+
+        record = runtime_resolution_plain(cfg)["derivations"]["frame_stride"]
+        self.assertEqual(record["source"], "override")
+        self.assertEqual(record["chosen_value"], 1)
+        self.assertEqual(record["origin"]["layer"], "constructed")
 
 
 class Ros2EvidenceTests(unittest.TestCase):

@@ -1,19 +1,70 @@
 import hashlib
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 from rtk_splat.core.pose_artifacts import pose_fingerprint
-from rtk_splat.core.verify_golden import verify
+from rtk_splat.core.verify_golden import (
+    discover_default_manifest,
+    main,
+    verify,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class GoldenVerifierTests(unittest.TestCase):
+    def test_default_manifest_is_discovered_only_in_source_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src" / "rtk_splat" / "core" / "verify_golden.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("")
+            self.assertIsNone(discover_default_manifest(source))
+
+            (root / "pyproject.toml").write_text("[project]\n")
+            manifest = (
+                root
+                / "docs"
+                / "experiments"
+                / "golden"
+                / "headland_stereo_ba.json"
+            )
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("{}")
+            self.assertEqual(discover_default_manifest(source), manifest)
+
+            installed = (
+                root
+                / ".venv"
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "rtk_splat"
+                / "core"
+                / "verify_golden.py"
+            )
+            installed.parent.mkdir(parents=True)
+            installed.write_text("")
+            self.assertIsNone(discover_default_manifest(installed))
+
+    def test_installed_verifier_requests_manifest_without_traceback(self):
+        stderr = io.StringIO()
+        with mock.patch(
+            "rtk_splat.core.verify_golden.discover_default_manifest",
+            return_value=None,
+        ), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            main([])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--manifest is required outside", stderr.getvalue())
+
     def test_exact_and_acceptance_checks_are_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

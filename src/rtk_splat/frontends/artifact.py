@@ -7,6 +7,7 @@ extraction, pair selection, matching, and mapper execution live elsewhere.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -246,6 +247,76 @@ def collect_git_state(repo_root: str | Path) -> dict[str, Any]:
     }
 
 
+def collect_package_state(
+    package_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return a path-stable identity for the installed Python implementation.
+
+    Git metadata is valuable in a source checkout, but it is unavailable in a
+    normal wheel installation.  This digest uses paths relative to the
+    ``rtk_splat`` package, so moving the package below a conventional ``src/``
+    directory does not by itself change the identity.
+    """
+    root = Path(
+        package_root
+        if package_root is not None
+        else Path(__file__).resolve().parents[1]
+    ).resolve()
+    if not (root / "__init__.py").is_file():
+        raise ArtifactError(f"invalid rtk_splat package root: {root}")
+    sources = sorted(
+        path for path in root.rglob("*.py") if path.is_file() and not path.is_symlink()
+    )
+    if not sources:
+        raise ArtifactError(f"rtk_splat package contains no Python sources: {root}")
+    state = bytearray(b"rtk-splat-python-package-v1\0")
+    for path in sources:
+        relative = path.relative_to(root).as_posix()
+        state.extend(relative.encode("utf-8"))
+        state.extend(b"\0")
+        state.extend(sha256_file(path).encode("ascii"))
+        state.extend(b"\0")
+    try:
+        version = importlib.metadata.version("rtk-splat")
+    except importlib.metadata.PackageNotFoundError:
+        from rtk_splat import __version__
+
+        version = __version__
+    return {
+        "distribution": "rtk-splat",
+        "version": version,
+        "package_root": str(root),
+        "python_file_count": len(sources),
+        "python_tree_sha256": hashlib.sha256(state).hexdigest(),
+    }
+
+
+def discover_source_repository(
+    package_root: str | Path | None = None,
+) -> Path | None:
+    """Find the checkout that directly owns this package, if there is one.
+
+    Merely finding a parent ``.git`` directory is insufficient: a wheel may be
+    installed in ``repo/.venv`` and must not inherit that unrelated checkout's
+    state.  Only the supported flat and ``src`` package locations qualify.
+    """
+    package = Path(
+        package_root
+        if package_root is not None
+        else Path(__file__).resolve().parents[1]
+    ).resolve()
+    for candidate in package.parents:
+        if not (candidate / ".git").exists():
+            continue
+        owned_locations = (
+            candidate / "src" / "rtk_splat",
+            candidate / "rtk_splat",
+        )
+        if any(location.resolve() == package for location in owned_locations):
+            return candidate.resolve()
+    return None
+
+
 def probe_colmap_identity(
     executable: str | Path,
     *,
@@ -364,7 +435,7 @@ def collect_provenance(
     configuration: Mapping[str, Any] | None = None,
     colmap: Mapping[str, Any] | str | Path,
     seed: int,
-    repo_root: str | Path,
+    repo_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Collect the immutable evidence needed to reproduce one frontend."""
     reader = SegmentReader(segment).validate()
@@ -381,9 +452,19 @@ def collect_provenance(
         "version",
     } <= set(colmap_record):
         raise ArtifactError("COLMAP identity needs executable and version")
+    source_repository = (
+        Path(repo_root).expanduser().resolve()
+        if repo_root is not None
+        else discover_source_repository()
+    )
     return {
         "schema_version": 1,
-        "git": collect_git_state(repo_root),
+        "source": collect_package_state(),
+        "git": (
+            collect_git_state(source_repository)
+            if source_repository is not None
+            else None
+        ),
         "resolved_config": _normal(resolved_config),
         "resolved_config_sha256": canonical_hash(resolved_config),
         "configuration": _normal(

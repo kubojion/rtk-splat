@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -12,9 +13,11 @@ from rtk_splat.frontends.artifact import (
     ArtifactError,
     FrontendArtifactBuilder,
     StageLedger,
+    collect_package_state,
     collect_git_state,
     collect_provenance,
     create_database_snapshot,
+    discover_source_repository,
     probe_colmap_identity,
     stage_fingerprint,
 )
@@ -314,6 +317,61 @@ class FrontendArtifactTests(unittest.TestCase):
 
 
 class ProvenanceTests(unittest.TestCase):
+    def test_package_identity_is_independent_of_install_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first" / "rtk_splat"
+            second = root / "second" / "rtk_splat"
+            for package in (first, second):
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text('__version__ = "0.1.0"\n')
+                (package / "module.py").write_text("VALUE = 1\n")
+            a = collect_package_state(first)
+            b = collect_package_state(second)
+            self.assertEqual(a["python_file_count"], 2)
+            self.assertEqual(a["python_tree_sha256"], b["python_tree_sha256"])
+            self.assertNotEqual(a["package_root"], b["package_root"])
+
+    def test_repository_discovery_rejects_wheel_inside_unrelated_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp) / "repo"
+            (repository / ".git").mkdir(parents=True)
+            wheel_package = (
+                repository / ".venv" / "site-packages" / "rtk_splat"
+            )
+            wheel_package.mkdir(parents=True)
+            (wheel_package / "__init__.py").write_text("")
+            self.assertIsNone(discover_source_repository(wheel_package))
+
+            source_package = repository / "src" / "rtk_splat"
+            source_package.mkdir(parents=True)
+            (source_package / "__init__.py").write_text("")
+            self.assertEqual(
+                discover_source_repository(source_package), repository.resolve()
+            )
+
+    def test_provenance_remains_complete_without_git_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            segment = _segment(Path(tmp) / "segment")
+            with mock.patch(
+                "rtk_splat.frontends.artifact.discover_source_repository",
+                return_value=None,
+            ):
+                provenance = collect_provenance(
+                    segment,
+                    resolved_config={"frontend": {"seed": 7}},
+                    colmap={
+                        "executable": "/opt/colmap",
+                        "version": "COLMAP 4.1.1",
+                    },
+                    seed=7,
+                )
+            self.assertIsNone(provenance["git"])
+            self.assertEqual(provenance["source"]["distribution"], "rtk-splat")
+            self.assertRegex(
+                provenance["source"]["python_tree_sha256"], r"^[0-9a-f]{64}$"
+            )
+
     def test_git_state_covers_tracked_and_untracked_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = _git_repo(Path(tmp) / "repo")

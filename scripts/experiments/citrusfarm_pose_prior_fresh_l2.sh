@@ -119,7 +119,7 @@ MEMORY_AVAILABLE_KIB="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
 ((MEMORY_AVAILABLE_KIB >= MINIMUM_AVAILABLE_MEMORY_KIB)) ||
     die "at least 16 GiB MemAvailable is required before starting"
 
-export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export COLMAP_BIN="$COLMAP"
 
 # This audit intentionally hashes only small sealed control records. The core

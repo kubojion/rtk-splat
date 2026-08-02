@@ -32,6 +32,7 @@ from rtk_splat.core.segment import SegmentReader
 from rtk_splat.core.runtime_resolution import (
     configuration_evidence,
     record_override,
+    runtime_control_value,
     runtime_resolution_plain,
 )
 
@@ -357,7 +358,15 @@ def ingest_config_v2(
     if not np.isclose(clock_offset_float, clock_offset_ns, atol=1.0e-6):
         raise ValueError("pose.time_offset_s must be exactly representable in ns")
     offset_s = clock_offset_ns * 1.0e-9
-    configured_stride = getattr(cfg.segment, "frame_stride", 1)
+    # Capture even the constructed default as an immutable runtime origin.
+    # Without this, a minimal robot config that omits frame_stride reaches
+    # record_override() without auditable provenance.
+    configured_stride = runtime_control_value(
+        cfg,
+        "frame_stride",
+        getattr(cfg.segment, "frame_stride", 1),
+        config_path="segment.frame_stride",
+    )
     if isinstance(configured_stride, str) and configured_stride.strip().lower() == "auto":
         camera_rate_hz = measure_camera_header_rate(
             cfg.paths.bags,

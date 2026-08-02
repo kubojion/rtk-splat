@@ -94,7 +94,7 @@ if [[ ! -e "$CANDIDATE" ]]; then
         die "at least 15 GiB free is required to create candidate B"
 fi
 
-export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export COLMAP_BIN="$COLMAP"
 LOG="$WORKDIR/logs/citrus-rtk-loss-b-$(date '+%Y%m%d_%H%M%S').log"
 CLI=("$PYTHON" -m rtk_splat.workflows.cli)

@@ -19,7 +19,17 @@ import numpy as np
 from .pose_artifacts import pose_fingerprint
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_MANIFEST = Path("docs/experiments/golden/headland_stereo_ba.json")
+
+
+def discover_default_manifest(source_file: str | Path | None = None) -> Path | None:
+    """Return the repository golden manifest only in a source checkout."""
+    source = Path(source_file or __file__).resolve()
+    for root in source.parents:
+        owns_source = any(source.is_relative_to(root / item) for item in ("src/rtk_splat", "rtk_splat"))
+        if owns_source and (root / "pyproject.toml").is_file() and (root / _DEFAULT_MANIFEST).is_file():
+            return root / _DEFAULT_MANIFEST
+    return None
 
 
 def _sha256(path: Path) -> str:
@@ -63,9 +73,8 @@ def _exact_number(actual: Any, expected: Any) -> bool:
 def _check_min(
     checks: list[tuple[bool, str]], name: str, value: float, minimum: float
 ) -> None:
-    checks.append(
-        (value >= minimum, f"{name}: {value:.9g} (minimum {minimum:.9g})")
-    )
+    message = f"{name}: {value:.9g} (minimum {minimum:.9g})"
+    checks.append((value >= minimum, message))
 
 
 def _check_max(
@@ -235,25 +244,32 @@ def verify(
     return checks
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Read-only verification of an RTK-Splat golden result"
-    )
-    default_manifest = (
-        REPOSITORY_ROOT
-        / "docs/experiments/golden/headland_stereo_ba.json"
-    )
-    parser.add_argument("--manifest", type=Path, default=default_manifest)
-    parser.add_argument("--workdir", type=Path)
+        description="Read-only verification of an RTK-Splat golden result")
     parser.add_argument(
-        "--mode", choices=("exact", "acceptance"), default="exact"
+        "--manifest",
+        type=Path,
+        help=(
+            "experiment manifest to verify; the repository headland manifest "
+            "is selected automatically only from a source checkout"
+        ),
     )
+    parser.add_argument("--workdir", type=Path)
+    parser.add_argument("--mode", choices=("exact", "acceptance"), default="exact")
     parser.add_argument("--pose-artifact")
     parser.add_argument("--run")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    manifest = args.manifest or discover_default_manifest()
+    if manifest is None:
+        parser.error("--manifest is required outside an RTK-Splat source checkout")
+    manifest = manifest.expanduser()
+    if not manifest.is_file():
+        parser.error(f"manifest does not exist: {manifest}")
 
     checks = verify(
-        args.manifest,
+        manifest,
         args.workdir,
         args.mode,
         args.pose_artifact,

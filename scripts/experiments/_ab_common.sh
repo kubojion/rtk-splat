@@ -420,6 +420,7 @@ ab_prepare() {
     fi
     export PYTHONNOUSERSITE=1
     export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH="$AB_REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
     cd "$AB_REPO_ROOT"
     ab_validate_cli
     ab_validate_tools

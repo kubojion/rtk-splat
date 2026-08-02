@@ -21,6 +21,7 @@
 set -Eeuo pipefail
 
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+export PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
 CONFIG="$REPO/configs/reproductions/headland_stereo_ba.yaml"
 SEGMENT="${RTK_SPLAT_SEGMENT:-$HOME/agromap4d_work/field_turn_contract_v2_normalized/segment}"
 ARM="${RTK_SPLAT_ARM:-$HOME/agromap4d_work/headland_feature_ab_03/arms/gpu}"

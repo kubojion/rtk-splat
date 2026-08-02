@@ -303,7 +303,7 @@ probe_storage() {
 verify_environment() {
     PYTHON="$(resolve_executable "$PYTHON")"
     COLMAP="$(resolve_executable "$COLMAP")"
-    export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
     export COLMAP_BIN="$COLMAP"
     "$PYTHON" - <<'PY'
 import importlib
@@ -478,7 +478,7 @@ mkdir -p "$LOG_DIR" "$STATE_DIR"
 
 CONFIG_FINGERPRINT="$({
     sha256sum "$CONFIG" "$ROBOT_CONFIG" "$SCRIPT_PATH"
-    find "$REPO_ROOT/rtk_splat" -type f -name '*.py' -print0 \
+    find "$REPO_ROOT/src/rtk_splat" -type f -name '*.py' -print0 \
         | sort -z | xargs -0 sha256sum
     git -C "$REPO_ROOT" rev-parse HEAD
     git -C "$REPO_ROOT" diff --no-ext-diff --binary

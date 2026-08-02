@@ -6,13 +6,12 @@ from pathlib import Path
 
 import rtk_splat
 import rtk_splat.core
-from rtk_splat.core.verify_golden import REPOSITORY_ROOT
-from rtk_splat.workflows.cli import REPO_ROOT
 
 
 PACKAGE = Path(rtk_splat.__file__).resolve().parent
 CORE = Path(rtk_splat.core.__file__).resolve().parent
-REPOSITORY = PACKAGE.parent
+REPOSITORY = Path(__file__).resolve().parents[1]
+SOURCE = REPOSITORY / "src"
 FORBIDDEN_IMPORT_ROOTS = {
     "adapters",
     "backends",
@@ -87,6 +86,8 @@ class CoreIsolationTests(unittest.TestCase):
         package_section = project.split(
             "[tool.setuptools.packages.find]", maxsplit=1
         )[1].split("\n[tool.", maxsplit=1)[0]
+        self.assertIn('package-dir = {"" = "src"}', project)
+        self.assertIn('where = ["src"]', package_section)
         self.assertIn('include = ["rtk_splat*"]', package_section)
         for name in LEGACY_TOP_LEVEL_PACKAGES:
             self.assertNotIn(f'"{name}*"', package_section)
@@ -96,9 +97,16 @@ class CoreIsolationTests(unittest.TestCase):
         ]
         self.assertEqual(present, [])
 
-    def test_repository_roots_survive_the_nested_package_layout(self):
-        self.assertEqual(REPO_ROOT, REPOSITORY)
-        self.assertEqual(REPOSITORY_ROOT, REPOSITORY)
+    def test_package_uses_src_layout(self):
+        self.assertTrue((SOURCE / "rtk_splat" / "__init__.py").is_file())
+        self.assertFalse((REPOSITORY / "rtk_splat").exists())
+
+    def test_runtime_modules_do_not_publish_checkout_root_constants(self):
+        from rtk_splat.core import verify_golden
+        from rtk_splat.workflows import cli
+
+        self.assertFalse(hasattr(cli, "REPO_ROOT"))
+        self.assertFalse(hasattr(verify_golden, "REPOSITORY_ROOT"))
 
     def test_old_flat_modules_are_deleted(self):
         present = sorted(path.name for path in CORE.glob("*.py") if path.name in MOVED_MODULES)

@@ -894,7 +894,7 @@ class MapperBackendTests(unittest.TestCase):
     def test_module_has_no_ros_dataset_or_segment_dependency(self):
         source = (
             Path(__file__).parents[1]
-            / "rtk_splat" / "backends" / "mapper.py"
+            / "src" / "rtk_splat" / "backends" / "mapper.py"
         ).read_text(encoding="utf-8")
         self.assertNotIn("rosbag", source)
         self.assertNotIn("sensor_msgs", source)

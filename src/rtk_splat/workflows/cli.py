@@ -27,9 +27,6 @@ from rtk_splat.workflows.config_ledger import (
 from rtk_splat.core.segment import SegmentReader
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
 def _plain(value: Any) -> Any:
     if isinstance(value, SimpleNamespace):
         return {key: _plain(item) for key, item in sorted(vars(value).items())}
@@ -267,7 +264,6 @@ def cmd_frontend_build(cfg, args) -> None:
         configuration=configuration_evidence(cfg),
         colmap=_colmap(cfg),
         seed=seed,
-        repo_root=REPO_ROOT,
     )
     artifact = FrontendArtifactBuilder(
         reader.root, cfg.paths.workdir, _frontend_name(cfg, args)

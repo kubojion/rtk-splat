@@ -1,0 +1,6 @@
+include README.md
+include PROGRESS.md
+recursive-include configs *.md *.yaml *.yml
+recursive-include docs *.json *.md
+recursive-include scripts *.sh
+recursive-include tests *.py
