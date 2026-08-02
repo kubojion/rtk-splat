@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "experiment": "pose_prior_mapper_initialization_ab",
+  "status": "fresh_candidate_rejected_by_existing_gates",
+  "candidate": {
+    "initialization_mode": "fresh",
+    "loss": "trivial",
+    "quality": {
+      "calibration_parameter_max_change": 1.3877787807814457e-17,
+      "failed_checks": [
+        "heldout_rtk_absolute_gates",
+        "trajectory_similarity_scale"
+      ],
+      "heldout_rtk_full_p95_m": 0.3134894792158207,
+      "heldout_rtk_inlier_p95_m": 0.3113811669818755,
+      "heldout_rtk_median_m": 0.19595021930973217,
+      "heldout_rtk_support_fraction": 0.9916387959866221,
+      "mean_observations_per_image": 2229.311371,
+      "mean_reprojection_error_px": 0.683789,
+      "mean_track_length": 6.16329,
+      "passed_all_existing_gates": false,
+      "points": 1081507,
+      "registered_images": 2990,
+      "registration_fraction": 1.0,
+      "stereo_baseline_max_change_m": 1.0977330155981235e-14,
+      "trajectory_similarity_scale": 1.007523782938757
+    },
+    "quality_marker_sha256": "46541ba6435f8a8b5e5de23228cedfe4d0fb5afa24125e01f0c702aacac4a0f3",
+    "refinement_plan_sha256": "658106d1113337dcef3f207ef8efb0819ddb7ba7cc09a6d71c9edc20c8f58b14"
+  },
+  "control": {
+    "initialization_mode": "continuation",
+    "loss": "trivial",
+    "quality": {
+      "calibration_parameter_max_change": 1.3877787807814457e-17,
+      "failed_checks": [
+        "heldout_rtk_absolute_gates",
+        "track_length_retention"
+      ],
+      "heldout_rtk_full_p95_m": 0.33374978006698963,
+      "heldout_rtk_inlier_p95_m": 0.31752361320645967,
+      "heldout_rtk_median_m": 0.22837666598784703,
+      "heldout_rtk_support_fraction": 0.9531772575250836,
+      "mean_observations_per_image": 1573.354181,
+      "mean_reprojection_error_px": 0.674378,
+      "mean_track_length": 6.839636,
+      "passed_all_existing_gates": false,
+      "points": 687804,
+      "registered_images": 2990,
+      "registration_fraction": 1.0,
+      "stereo_baseline_max_change_m": 3.805289416902724e-14,
+      "trajectory_similarity_scale": 1.0048754842914767
+    },
+    "quality_marker_sha256": "c236c670501d26362669aebaaaace0c529fb3d5cca0255aecd39f20ec56aca4e",
+    "refinement_plan_sha256": "7db96a4b67b426b9141c29fbda2adaf45f2ec85e829b30b0b1befc174ac631ca"
+  },
+  "diagnostic_quality_deltas": {
+    "candidate_minus_control": {
+      "calibration_parameter_max_change": 0.0,
+      "heldout_rtk_full_p95_m": -0.020260300851168922,
+      "heldout_rtk_inlier_p95_m": -0.006142446224584153,
+      "heldout_rtk_median_m": -0.03242644667811487,
+      "heldout_rtk_support_fraction": 0.038461538461538436,
+      "mean_observations_per_image": 655.9571899999999,
+      "mean_reprojection_error_px": 0.009410999999999947,
+      "mean_track_length": -0.6763459999999997,
+      "points": 393703,
+      "registered_images": 0,
+      "registration_fraction": 0.0,
+      "stereo_baseline_max_change_m": -2.7075564013046005e-14,
+      "trajectory_similarity_scale_deviation": 0.002648298647280445
+    },
+    "interpretation": "Negative reprojection and RTK-residual deltas are improvements; positive registration, track, observation, and support deltas are improvements. Existing acceptance gates remain authoritative."
+  },
+  "integrity": {
+    "both_quality_audits_sealed": true,
+    "colmap_executable": "/home/jion_kubo/miniconda3/envs/colmap-rtk/bin/colmap",
+    "colmap_executable_current_sha256": "0f48cab4aa671569ef2a4be6dc4ecadd2027b08f8fa9128430b2661aad8a9fd9",
+    "commands_identical_after_declared_removal": true,
+    "counts": {
+      "calibration_priors": 897,
+      "evaluation_priors": 1495,
+      "frames": 1495,
+      "holdout_priors": 598,
+      "images": 2990
+    },
+    "only_meaningful_solver_difference": "initialization_mode: continuation -> fresh; mapper --input_path pair removed",
+    "passed": true,
+    "runtime_binary_hash_was_sealed": false,
+    "source_frontend_factor_holdout_and_rig_evidence_identical": true,
+    "split": {
+      "all_images_sha256": "9286efbf7f5a2d4beebb141308585665abcf70a8fe6874bc6d36cdf18f02ef68",
+      "calibration_block_ids": [0, 2, 4],
+      "calibration_names_sha256": "e3f62e8533ad1e97dcbafc8cda8b0467e98c1aa55c1faaddd944f3dd57561003",
+      "holdout_block_ids": [1, 3],
+      "holdout_names_sha256": "472931fdb491a7edf3c8b3d57603bc8022ab361df0119f8e68a7de9be1f64c5f",
+      "method": "contiguous_rank_blocks_alternating_v1",
+      "prior_split_sha256": "a5d15af07d21f8c939d5ffe96dc74ecda1b428d9c6c149a356f3c3e75db9efa5"
+    }
+  },
+  "downstream": {
+    "candidate_eligible_for_separate_manual_export_review": false,
+    "pose_export_cloud_training_or_ply_started_by_this_experiment": false
+  },
+  "source_receipt": {
+    "path": "/home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_v1/experiment_reports/citrusfarm_pose_prior_initialization_ab_v1.json",
+    "sha256": "26c4ca3c516bdeeaf57365166bcd3c572d257f16354f82f703234141db4fb06b"
+  }
+}

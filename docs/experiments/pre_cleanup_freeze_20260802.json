@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-02",
+  "purpose": "Immutable pre-cleanup source and regression baseline",
+  "git": {
+    "branch": "main",
+    "commit": "8dff16192751d7be090fd6eab39abe3b42f13888",
+    "worktree_before_freeze_documentation": "clean"
+  },
+  "tests": {
+    "command": "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /home/jion_kubo/miniconda3/envs/rtk-splat/bin/python -m pytest -q",
+    "result": "207 passed, 31 subtests passed",
+    "wall_time_s": 61.72,
+    "python": "3.10.20",
+    "pytest": "9.1.1"
+  },
+  "golden": {
+    "command": "python3 -m rtk_splat.core.verify_golden",
+    "result": "38/38 checks passed",
+    "headland_stereo_ba_manifest_sha256": "8131f34ab191c4435270dfc896fdb85595a57433449923816227b279f338e66a",
+    "headland_global_mapper_manifest_sha256": "6fb822df029aeca8d5059215eaef8666f3ba5f90b0ba1942ee68772147a1690d"
+  },
+  "citrus_fresh_initialization": {
+    "status": "rejected_by_existing_gates",
+    "receipt": "docs/experiments/citrusfarm_pose_prior_initialization_ab_v1.json",
+    "source_receipt_sha256": "26c4ca3c516bdeeaf57365166bcd3c572d257f16354f82f703234141db4fb06b",
+    "registered_images": 2990,
+    "mean_reprojection_error_px": 0.683789,
+    "heldout_rtk_median_m": 0.19595021930973217,
+    "heldout_rtk_inlier_p95_m": 0.3113811669818755,
+    "heldout_rtk_support_fraction": 0.9916387959866221,
+    "trajectory_similarity_scale": 1.007523782938757,
+    "pose_cloud_gs_or_ply_started": false
+  },
+  "environment": {
+    "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+    "numpy": "2.2.6",
+    "scipy": "1.15.3",
+    "opencv_python_headless": "5.0.0.93",
+    "pymap3d": "3.2.0",
+    "pyyaml": "6.0.3",
+    "rosbags": "0.11.2"
+  }
+}

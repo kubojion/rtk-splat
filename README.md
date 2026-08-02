@@ -324,23 +324,12 @@ The controlled cached loss experiment completed. Its quadratic arm improved
 held-out median RTK residual to 0.2284 m and support to 95.32%, but still failed
 the 0.15 m median and 0.30 m inlier-p95 gates, so it remains rejected.
 
-The next overnight test asks whether using those same quadratic RTK priors
-from the beginning of incremental reconstruction fixes the coherent early-row
-error. Its preflight has passed on the current cache:
-
-```bash
-bash scripts/experiments/citrusfarm_pose_prior_fresh_l2.sh preflight
-bash scripts/experiments/citrusfarm_pose_prior_fresh_l2.sh run
-```
-
-It reuses all 2,990 images, cached features/matches, the fixed stereo rig, and
-the exact 897/598 factor/holdout split. Compared with the completed L2 control,
-the fresh mapper command removes only `--input_path`. Budget approximately
-4--10 hours and 7--12 GiB. The launcher writes a paired diagnostic report and
-deliberately performs no pose export, cloud construction, GS training, or PLY
-generation. A separate export and training decision is allowed only after the
-fresh arm passes every existing metric/RTK gate and its absolute track-graph
-gates.
+The fresh-initialization arm has also completed. It registered all 2,990 images
+at 0.684 px and improved the held-out median to 0.196 m with 99.16% support,
+but failed the unchanged 0.15 m median, 0.30 m p95 and 0.5% scale gates. It
+therefore remains a rejected experimental baseline and produced no pose,
+cloud, GS model or PLY. Its sealed paired receipt is
+`docs/experiments/citrusfarm_pose_prior_initialization_ab_v1.json`.
 
 ## Migration status
 

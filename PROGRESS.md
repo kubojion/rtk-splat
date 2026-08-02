@@ -139,7 +139,7 @@ The compact rejected-run receipt, including sealed artifact hashes, exact
 resource use, and the predeclared pass/fail values, is
 `docs/experiments/citrusfarm_rtk_refinement_v1.json`.
 
-### Completed RTK-loss diagnostic and prepared fresh-mapper test
+### Completed RTK-loss and fresh-initialization diagnostics
 
 The cached quadratic/L2 arm completed without replaying bags, depth, features,
 matching, Global Mapper, or GS. It used the same covariance whitening,
@@ -151,31 +151,26 @@ and support from 67.22% to **95.32%**. It still failed the 0.15 m median and
 track-retention gate. It therefore remains rejected and produced no pose,
 cloud, GS run, or PLY.
 
-That result narrows the next test to initialization rather than loss weighting.
-A new sealed launcher reuses the same cached frontend, private-prior protocol,
-quadratic loss, and completed L2 continuation arm, but starts COLMAP's
-`pose_prior_mapper` without `--input_path`. RTK calibration-block factors are
-therefore active while the mapper builds its tracks, rather than only after a
-finished visual model is supplied. The command must otherwise be identical.
-Fresh topology is judged by absolute graph gates (mean track length at least
-3 and mean observations per image at least 500), not by an invalid
-track-by-track retention comparison to the continuation model. Registration,
-reprojection, metric scale, stereo rig, calibration, and held-out RTK gates
-remain unchanged.
+The sealed fresh-initialization arm then completed on 2026-08-02. It reused the
+same cached frontend, private-prior protocol, quadratic loss, 897/598
+factor/holdout split and fixed stereo rig as the continuation control. Its only
+meaningful solver change was removing `--input_path`, so RTK calibration-block
+factors were active while `pose_prior_mapper` built the reconstruction.
 
-The real preflight passed with 2,990 images, 1,495 frames, 897 calibration
-priors, 598 physical factor holdouts, two cameras, one rig, the pinned COLMAP
-binary, 52 GiB free disk, and 18 GiB available memory. Both old completed arms
-also resumed without changing any sealed plan, marker, or report. The fresh
-candidate has not been started. Run it with:
+The candidate registered **2,990/2,990 images**, with **0.683789 px** mean
+reprojection error, 6.163 mean track length and 2,229 mean observations per
+image. Held-out RTK median improved from the L2 continuation's 0.22838 m to
+**0.19595 m**, support improved from 95.32% to **99.16%**, and inlier p95
+improved from 0.31752 m to **0.31138 m**. It nevertheless failed the unchanged
+0.15 m median / 0.30 m p95 absolute gates and the 0.5% trajectory-scale gate
+(source-relative scale **1.007524**). It is therefore a useful negative result,
+not an accepted pose. No pose export, cloud, GS run or PLY was started.
 
-```bash
-bash scripts/experiments/citrusfarm_pose_prior_fresh_l2.sh run
-```
-
-Budget approximately **4--10 hours** and **7--12 GiB** additional storage.
-The launcher stops after mapping, fail-closed quality audit, and a paired JSON
-report. It never exports poses or starts cloud construction or GS.
+The compact paired receipt is
+`docs/experiments/citrusfarm_pose_prior_initialization_ab_v1.json`. The result
+shows that stock whole-model pose-prior mapping is not sufficient; the next
+method-level pose experiment is bounded geodetic stereo submaps, not another
+loss or initialization sweep.
 
 ## Contract-v2 work: Phase 0 accepted baseline
 
@@ -576,13 +571,9 @@ Not implemented or verified:
 1. Preserve both the successful visual reconstruction and the rejected
    position-prior refinement. Do not reinterpret the 1.72 cm aggregate median
    gain as acceptance.
-2. Run the prepared fresh pose-prior mapper arm on the cached evidence. It
-   reuses the completed quadratic continuation arm as control and changes only
-   initialization: no finished model is supplied to COLMAP. Accept it only if
-   every registration, visual, absolute track-graph, rig, scale, and held-out
-   RTK gate passes; do not train GS as part of this experiment.
-3. If from-start stock pose-prior mapping still rejects the coherent early
-   block, implement bounded
+2. Preserve the completed fresh pose-prior mapper arm as a rejected baseline;
+   it improved held-out geometry but failed the existing RTK and scale gates.
+3. Implement bounded
    RTK-anchored local submaps with robust temporal/block consistency and an
    RTK-constrained submap graph. That is the method-level path; repeatedly
    rerunning a whole-model COLMAP refinement is not.
