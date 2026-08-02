@@ -12,12 +12,16 @@ georeferencing and held-out evaluation. They do not constrain GlobalMapper.
 
 from __future__ import annotations
 
+import csv
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -25,6 +29,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+from scipy.stats import chi2
 
 from rtk_splat.frontends.artifact import (
     ArtifactError,
@@ -39,6 +44,7 @@ from rtk_splat.frontends.artifact import (
 
 
 MapperKind = Literal["global", "incremental"]
+CovarianceGateMode = Literal["diagnostic_only", "enforce"]
 Runner = Callable[..., Any]
 
 _REQUIRED_FRONTEND_FILES = (
@@ -90,6 +96,18 @@ class MapperConfig:
     num_threads: int = 8
     random_seed: int = 7
     min_num_matches: int = 15
+    ba_num_iterations: int = 3
+    keep_max_num_tracks: int = 60_000
+    track_required_tracks_per_view: int = 1_000
+    skip_retriangulation: bool = True
+    gp_use_gpu: bool = False
+    ba_ceres_use_gpu: bool = False
+    process_nice: int = 10
+    resource_sample_interval_s: float = 2.0
+    minimum_available_memory_gb: float = 4.0
+    low_memory_consecutive_samples: int = 2
+    minimum_free_space_gb: float = 15.0
+    minimum_runtime_free_space_gb: float = 5.0
     require_all_keyframes: bool = True
     require_all_frames: bool = True
     max_reprojection_error_px: float = 2.0
@@ -100,6 +118,10 @@ class MapperConfig:
     max_rtk_median_error_m: float = 0.08
     max_rtk_p95_inlier_error_m: float = 0.15
     min_rtk_inlier_fraction: float = 0.80
+    rtk_chi2_inlier_probability: float = 0.95
+    max_rtk_median_mahalanobis_sq: float = 4.108344935632312
+    min_rtk_chi2_inlier_fraction: float = 0.80
+    rtk_covariance_gate_mode: CovarianceGateMode = "diagnostic_only"
 
     def __post_init__(self) -> None:
         if self.backend not in ("global", "incremental"):
@@ -107,6 +129,10 @@ class MapperConfig:
         for name in (
             "num_threads",
             "min_num_matches",
+            "ba_num_iterations",
+            "keep_max_num_tracks",
+            "track_required_tracks_per_view",
+            "low_memory_consecutive_samples",
             "alignment_ransac_iterations",
             "alignment_temporal_blocks",
         ):
@@ -119,18 +145,65 @@ class MapperConfig:
             self.random_seed, int
         ):
             raise ValueError("random_seed must be an integer")
+        if (
+            isinstance(self.process_nice, bool)
+            or not isinstance(self.process_nice, int)
+            or not 0 <= self.process_nice <= 19
+        ):
+            raise ValueError("process_nice must be an integer in [0, 19]")
+        for name in (
+            "skip_retriangulation",
+            "gp_use_gpu",
+            "ba_ceres_use_gpu",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
         for name in (
             "max_reprojection_error_px",
             "min_mean_track_length",
             "alignment_ransac_threshold_m",
             "max_rtk_median_error_m",
             "max_rtk_p95_inlier_error_m",
+            "resource_sample_interval_s",
+            "minimum_available_memory_gb",
+            "minimum_free_space_gb",
+            "minimum_runtime_free_space_gb",
+            "max_rtk_median_mahalanobis_sq",
         ):
             value = float(getattr(self, name))
-            if not value > 0:
-                raise ValueError(f"{name} must be positive")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.minimum_runtime_free_space_gb > self.minimum_free_space_gb:
+            raise ValueError(
+                "minimum_runtime_free_space_gb cannot exceed "
+                "minimum_free_space_gb"
+            )
         if not 0 < self.min_rtk_inlier_fraction <= 1:
             raise ValueError("min_rtk_inlier_fraction must be in (0, 1]")
+        if not 0 < self.rtk_chi2_inlier_probability < 1:
+            raise ValueError("rtk_chi2_inlier_probability must be in (0, 1)")
+        if not 0 < self.min_rtk_chi2_inlier_fraction <= 1:
+            raise ValueError("min_rtk_chi2_inlier_fraction must be in (0, 1]")
+        if self.rtk_covariance_gate_mode not in ("diagnostic_only", "enforce"):
+            raise ValueError(
+                "rtk_covariance_gate_mode must be 'diagnostic_only' or 'enforce'"
+            )
+
+
+# These controls affect only post-solve RTK evaluation.  A backend prepared
+# before they existed may safely use their recorded defaults without changing
+# its visual solve, database, or registered model.  No mapper/solve option is
+# eligible for this compatibility path.
+_LEGACY_EVALUATION_DEFAULTS = {
+    "rtk_chi2_inlier_probability": MapperConfig.rtk_chi2_inlier_probability,
+    "max_rtk_median_mahalanobis_sq": (
+        MapperConfig.max_rtk_median_mahalanobis_sq
+    ),
+    "min_rtk_chi2_inlier_fraction": (
+        MapperConfig.min_rtk_chi2_inlier_fraction
+    ),
+    "rtk_covariance_gate_mode": MapperConfig.rtk_covariance_gate_mode,
+}
 
 
 @dataclass(frozen=True)
@@ -156,10 +229,76 @@ class TemporalAlignmentResult:
     holdout_block_ids: tuple[int, ...]
     calibration_mask: np.ndarray
     holdout_mask: np.ndarray
+    residual_vectors_m: np.ndarray
     residuals_m: np.ndarray
     thresholds_m: np.ndarray
     calibration_inlier_mask: np.ndarray
     holdout_inlier_mask: np.ndarray
+
+
+@dataclass(frozen=True)
+class TemporalBlockSplit:
+    """Deterministic alternating calibration/holdout time blocks."""
+
+    block_ids: np.ndarray
+    calibration_block_ids: tuple[int, ...]
+    holdout_block_ids: tuple[int, ...]
+    calibration_mask: np.ndarray
+    holdout_mask: np.ndarray
+
+
+def temporal_block_split(
+    timestamps_ns: np.ndarray,
+    *,
+    temporal_blocks: int = 5,
+) -> TemporalBlockSplit:
+    """Assign strictly ordered timestamps without inspecting pose residuals.
+
+    This is shared by post-solve evaluation and RTK-constrained refinement so
+    an optimizer can never consume a prior later described as held out.
+    """
+    if (
+        isinstance(temporal_blocks, bool)
+        or not isinstance(temporal_blocks, int)
+        or temporal_blocks < 3
+    ):
+        raise ValueError("temporal_blocks must be an integer of at least 3")
+    timestamps = np.asarray(timestamps_ns)
+    if (
+        timestamps.ndim != 1
+        or not len(timestamps)
+        or timestamps.dtype.kind not in "iuf"
+        or not np.isfinite(timestamps).all()
+        or np.any(np.diff(timestamps) <= 0)
+    ):
+        raise ValueError(
+            "alignment timestamps must be finite, one-dimensional, and "
+            "strictly increasing"
+        )
+    block_count = min(temporal_blocks, len(timestamps))
+    block_ids = (
+        np.arange(len(timestamps), dtype=np.int64) * block_count
+        // len(timestamps)
+    )
+    unique_blocks = tuple(int(value) for value in np.unique(block_ids))
+    holdout_blocks = tuple(value for value in unique_blocks if value % 2 == 1)
+    calibration_blocks = tuple(
+        value for value in unique_blocks if value % 2 == 0
+    )
+    calibration_mask = np.isin(block_ids, calibration_blocks)
+    holdout_mask = np.isin(block_ids, holdout_blocks)
+    if calibration_mask.sum() < 3 or not holdout_mask.any():
+        raise ArtifactError(
+            "temporal holdout requires at least three calibration priors and "
+            "one untouched holdout prior"
+        )
+    return TemporalBlockSplit(
+        block_ids=block_ids,
+        calibration_block_ids=calibration_blocks,
+        holdout_block_ids=holdout_blocks,
+        calibration_mask=calibration_mask,
+        holdout_mask=holdout_mask,
+    )
 
 
 def _alignment_inputs(
@@ -342,43 +481,18 @@ def estimate_temporal_heldout_alignment(
     Odd-numbered blocks are sealed holdouts. Their target positions are not
     passed to the SE(3) or diagnostic Sim(3) estimators.
     """
-    if (
-        isinstance(temporal_blocks, bool)
-        or not isinstance(temporal_blocks, int)
-        or temporal_blocks < 3
-    ):
-        raise ValueError("temporal_blocks must be an integer of at least 3")
     covariance_supplied = covariance_m2 is not None
     source, target, covariance, weight_sigma = _alignment_inputs(
         source_centers_m, target_centers_m, covariance_m2
     )
     timestamps = np.asarray(timestamps_ns)
-    if (
-        timestamps.shape != (len(source),)
-        or timestamps.dtype.kind not in "iuf"
-        or not np.isfinite(timestamps).all()
-        or np.any(np.diff(timestamps) <= 0)
-    ):
-        raise ValueError(
-            "alignment timestamps must be finite, one-dimensional, and "
-            "strictly increasing"
-        )
-    block_count = min(temporal_blocks, len(source))
-    block_ids = (
-        np.arange(len(source), dtype=np.int64) * block_count // len(source)
+    if timestamps.shape != (len(source),):
+        raise ValueError("alignment timestamps must match the pose count")
+    split = temporal_block_split(
+        timestamps, temporal_blocks=temporal_blocks
     )
-    unique_blocks = tuple(int(value) for value in np.unique(block_ids))
-    holdout_blocks = tuple(value for value in unique_blocks if value % 2 == 1)
-    calibration_blocks = tuple(
-        value for value in unique_blocks if value % 2 == 0
-    )
-    calibration_mask = np.isin(block_ids, calibration_blocks)
-    holdout_mask = np.isin(block_ids, holdout_blocks)
-    if calibration_mask.sum() < 3 or not holdout_mask.any():
-        raise ArtifactError(
-            "temporal holdout requires at least three calibration priors and "
-            "one untouched holdout prior"
-        )
+    calibration_mask = split.calibration_mask
+    holdout_mask = split.holdout_mask
 
     alignment = estimate_rigid_alignment(
         source[calibration_mask],
@@ -388,26 +502,214 @@ def estimate_temporal_heldout_alignment(
         ransac_iterations=ransac_iterations,
         random_seed=random_seed,
     )
-    residuals = np.linalg.norm(
-        source @ alignment.rotation.T + alignment.translation - target,
-        axis=1,
+    residual_vectors = (
+        source @ alignment.rotation.T + alignment.translation - target
     )
+    residuals = np.linalg.norm(residual_vectors, axis=1)
     thresholds = np.maximum(ransac_threshold_m, 3.0 * weight_sigma[:, 1])
     calibration_inliers = np.zeros(len(source), dtype=bool)
     calibration_inliers[calibration_mask] = alignment.inlier_mask
     holdout_inliers = holdout_mask & (residuals <= thresholds)
     return TemporalAlignmentResult(
         alignment=alignment,
-        temporal_block_ids=block_ids,
-        calibration_block_ids=calibration_blocks,
-        holdout_block_ids=holdout_blocks,
+        temporal_block_ids=split.block_ids,
+        calibration_block_ids=split.calibration_block_ids,
+        holdout_block_ids=split.holdout_block_ids,
         calibration_mask=calibration_mask,
         holdout_mask=holdout_mask,
+        residual_vectors_m=residual_vectors,
         residuals_m=residuals,
         thresholds_m=thresholds,
         calibration_inlier_mask=calibration_inliers,
         holdout_inlier_mask=holdout_inliers,
     )
+
+
+def squared_mahalanobis_residuals(
+    residual_vectors_m: np.ndarray,
+    covariance_m2: np.ndarray,
+) -> np.ndarray:
+    """Return ``r.T @ covariance^-1 @ r`` for every 3-D residual.
+
+    Stored covariance is interpreted in the residual/target coordinate frame.
+    A strictly positive-definite covariance is required: silently adding an
+    arbitrary numerical variance would turn the receiver's declared accuracy
+    into an undocumented gate parameter.
+    """
+    residuals = np.asarray(residual_vectors_m, dtype=np.float64)
+    covariance = np.asarray(covariance_m2, dtype=np.float64)
+    if (
+        residuals.ndim != 2
+        or residuals.shape[1:] != (3,)
+        or not len(residuals)
+        or not np.isfinite(residuals).all()
+        or covariance.shape != (len(residuals), 3, 3)
+        or not np.isfinite(covariance).all()
+    ):
+        raise ValueError(
+            "RTK residuals/covariances must have finite shapes (N, 3) and "
+            "(N, 3, 3)"
+        )
+    covariance = 0.5 * (covariance + np.swapaxes(covariance, 1, 2))
+    try:
+        factors = np.linalg.cholesky(covariance)
+        whitened = np.linalg.solve(factors, residuals[..., None])[..., 0]
+    except np.linalg.LinAlgError as exc:
+        raise ArtifactError(
+            "RTK covariance must be strictly positive definite for "
+            "covariance-normalized evaluation"
+        ) from exc
+    values = np.einsum("ni,ni->n", whitened, whitened)
+    if not np.isfinite(values).all() or np.any(values < 0):
+        raise ArtifactError("covariance-normalized RTK residuals are invalid")
+    return values
+
+
+def rtk_residual_quality(
+    residual_vectors_m: np.ndarray,
+    covariance_m2: np.ndarray,
+    euclidean_inlier_mask: np.ndarray,
+    *,
+    config: MapperConfig = MapperConfig(),
+) -> dict[str, Any]:
+    """Evaluate held-out RTK residuals in metres and covariance units.
+
+    The chi-square checks use three degrees of freedom because each held-out
+    observation contributes one 3-D camera-centre residual.  They do not use
+    six SE(3) degrees of freedom: the fitted transform is calibrated on
+    different temporal blocks and is not the observation being tested here.
+    Absolute metre caps remain independent so a receiver cannot make an
+    arbitrarily inaccurate result pass merely by declaring large covariance.
+    """
+    residual_vectors = np.asarray(residual_vectors_m, dtype=np.float64)
+    inlier_mask = np.asarray(euclidean_inlier_mask)
+    if (
+        inlier_mask.shape != (len(residual_vectors),)
+        or inlier_mask.dtype.kind != "b"
+    ):
+        raise ValueError("euclidean_inlier_mask must be a boolean vector")
+    squared_mahalanobis = squared_mahalanobis_residuals(
+        residual_vectors, covariance_m2
+    )
+    residuals_m = np.linalg.norm(residual_vectors, axis=1)
+    euclidean_inlier_residuals = residuals_m[inlier_mask]
+    residual_median = float(np.median(residuals_m))
+    residual_p95 = float(np.percentile(residuals_m, 95))
+    inlier_p95 = (
+        float(np.percentile(euclidean_inlier_residuals, 95))
+        if euclidean_inlier_residuals.size
+        else None
+    )
+    inlier_maximum = (
+        float(euclidean_inlier_residuals.max())
+        if euclidean_inlier_residuals.size
+        else None
+    )
+    euclidean_inlier_fraction = float(inlier_mask.mean())
+
+    chi2_threshold = float(
+        chi2.ppf(config.rtk_chi2_inlier_probability, df=3)
+    )
+    chi2_inlier_mask = squared_mahalanobis <= chi2_threshold
+    chi2_inlier_fraction = float(chi2_inlier_mask.mean())
+    median_mahalanobis_sq = float(np.median(squared_mahalanobis))
+    expected_median_mahalanobis_sq = float(chi2.ppf(0.5, df=3))
+    normalized_authoritative = config.rtk_covariance_gate_mode == "enforce"
+
+    checks = {
+        "median_holdout_rtk_residual_m": {
+            "kind": "independent_absolute_cap",
+            "authoritative": True,
+            "value": residual_median,
+            "maximum": config.max_rtk_median_error_m,
+            "passed": residual_median <= config.max_rtk_median_error_m,
+        },
+        "p95_holdout_inlier_rtk_residual_m": {
+            "kind": "independent_absolute_cap",
+            "authoritative": True,
+            "value": inlier_p95,
+            "maximum": config.max_rtk_p95_inlier_error_m,
+            "passed": bool(
+                inlier_p95 is not None
+                and inlier_p95 <= config.max_rtk_p95_inlier_error_m
+            ),
+        },
+        "holdout_rtk_inlier_fraction": {
+            "kind": "robust_absolute_support",
+            "authoritative": True,
+            "value": euclidean_inlier_fraction,
+            "minimum": config.min_rtk_inlier_fraction,
+            "passed": euclidean_inlier_fraction
+            >= config.min_rtk_inlier_fraction,
+        },
+        "median_holdout_rtk_mahalanobis_sq": {
+            "kind": "covariance_normalized_aggregate",
+            "authoritative": normalized_authoritative,
+            "value": median_mahalanobis_sq,
+            "expected_chi2_3_median": expected_median_mahalanobis_sq,
+            "maximum": config.max_rtk_median_mahalanobis_sq,
+            "maximum_chi2_3_cdf": float(
+                chi2.cdf(config.max_rtk_median_mahalanobis_sq, df=3)
+            ),
+            "passed": median_mahalanobis_sq
+            <= config.max_rtk_median_mahalanobis_sq,
+        },
+        "holdout_rtk_chi2_inlier_fraction": {
+            "kind": "covariance_normalized_coverage",
+            "authoritative": normalized_authoritative,
+            "value": chi2_inlier_fraction,
+            "minimum": config.min_rtk_chi2_inlier_fraction,
+            "point_probability": config.rtk_chi2_inlier_probability,
+            "maximum_mahalanobis_sq": chi2_threshold,
+            "degrees_of_freedom": 3,
+            "passed": chi2_inlier_fraction
+            >= config.min_rtk_chi2_inlier_fraction,
+        },
+    }
+    return {
+        "schema_version": 1,
+        "covariance_model": (
+            "stored_per_observation_camera_centre_position_covariance_only"
+        ),
+        "covariance_limitations": [
+            (
+                "gate authority must be configured from upstream covariance "
+                "provenance"
+            ),
+            (
+                "stored covariance may omit visual-pose and alignment-fit "
+                "uncertainty"
+            ),
+            (
+                "heading-by-lever-arm and timing uncertainty must be "
+                "propagated upstream"
+            ),
+        ],
+        "covariance_gate_mode": config.rtk_covariance_gate_mode,
+        "degrees_of_freedom": 3,
+        "n_residuals": len(residuals_m),
+        "residual_m": {
+            "median": residual_median,
+            "p95": residual_p95,
+            "p95_euclidean_inliers": inlier_p95,
+            "maximum_euclidean_inliers": inlier_maximum,
+        },
+        "mahalanobis_sq": {
+            "median": median_mahalanobis_sq,
+            "expected_chi2_3_median": expected_median_mahalanobis_sq,
+            "p95": float(np.percentile(squared_mahalanobis, 95)),
+            "maximum": float(squared_mahalanobis.max()),
+            "values": squared_mahalanobis.tolist(),
+        },
+        "euclidean_inlier_mask": inlier_mask.tolist(),
+        "chi2_inlier_mask": chi2_inlier_mask.tolist(),
+        "checks": checks,
+        "passed": all(
+            check["passed"]
+            for check in checks.values()
+            if check["authoritative"]
+        ),
+    }
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -578,9 +880,20 @@ def _workspace_context(
     root = Path(workspace).expanduser().resolve()
     plan = _json(root / "backend_plan.json")
     try:
-        config = MapperConfig(**plan["config"])
+        raw_config = plan["config"]
+        if not isinstance(raw_config, dict):
+            raise TypeError("backend config must be an object")
+        effective_config = dict(raw_config)
+        for field, default in _LEGACY_EVALUATION_DEFAULTS.items():
+            effective_config.setdefault(field, default)
+        config = MapperConfig(**effective_config)
     except (KeyError, TypeError, ValueError) as exc:
         raise ArtifactError("invalid backend plan configuration") from exc
+    if effective_config != asdict(config):
+        raise ArtifactError(
+            "backend plan predates the current mapper configuration schema; "
+            "prepare a new backend artifact instead of resuming it"
+        )
     frontend = Path(str(plan.get("frontend_artifact", ""))).resolve()
     seal = verify_frontend_seal(frontend)
     current = _frontend_hashes(frontend)
@@ -742,6 +1055,8 @@ def build_mapper_command(
     if config.backend == "global":
         shared.extend(
             [
+                "--log_target",
+                "stdout",
                 "--GlobalMapper.image_list_path",
                 str(root / "solve_images.txt"),
                 "--GlobalMapper.num_threads",
@@ -750,6 +1065,18 @@ def build_mapper_command(
                 str(config.random_seed),
                 "--GlobalMapper.min_num_matches",
                 str(config.min_num_matches),
+                "--GlobalMapper.decompose_relative_pose",
+                "1",
+                "--GlobalMapper.ba_num_iterations",
+                str(config.ba_num_iterations),
+                "--GlobalMapper.gp_optimize_positions",
+                "1",
+                "--GlobalMapper.gp_optimize_points",
+                "1",
+                "--GlobalMapper.gp_optimize_scales",
+                "1",
+                "--GlobalMapper.gp_use_gpu",
+                "1" if config.gp_use_gpu else "0",
                 "--GlobalMapper.ba_refine_focal_length",
                 "0",
                 "--GlobalMapper.ba_refine_principal_point",
@@ -758,6 +1085,18 @@ def build_mapper_command(
                 "0",
                 "--GlobalMapper.refine_sensor_from_rig",
                 "0",
+                "--GlobalMapper.ba_refine_rig_from_world",
+                "1",
+                "--GlobalMapper.ba_refine_points3D",
+                "1",
+                "--GlobalMapper.ba_ceres_use_gpu",
+                "1" if config.ba_ceres_use_gpu else "0",
+                "--GlobalMapper.keep_max_num_tracks",
+                str(config.keep_max_num_tracks),
+                "--GlobalMapper.track_required_tracks_per_view",
+                str(config.track_required_tracks_per_view),
+                "--GlobalMapper.skip_retriangulation",
+                "1" if config.skip_retriangulation else "0",
             ]
         )
     else:
@@ -866,6 +1205,345 @@ def _execute(command: Sequence[str], runner: Runner, *, capture: bool = False) -
     return runner(list(command), **kwargs)
 
 
+def _meminfo_bytes() -> dict[str, int]:
+    """Read Linux memory counters without invoking another process."""
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ArtifactError("the mapper resource guard requires /proc/meminfo") from exc
+    result: dict[str, int] = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        name, raw = line.split(":", 1)
+        fields = raw.strip().split()
+        if fields:
+            result[name] = int(fields[0]) * 1024
+    if "MemAvailable" not in result:
+        raise ArtifactError("/proc/meminfo has no MemAvailable counter")
+    return result
+
+
+def _process_memory_bytes(pid: int) -> tuple[int, int]:
+    """Return resident and high-water memory for one threaded COLMAP process."""
+    try:
+        lines = (Path("/proc") / str(pid) / "status").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    except FileNotFoundError:
+        return 0, 0
+    except OSError:
+        return 0, 0
+    values = {"VmRSS": 0, "VmHWM": 0}
+    for line in lines:
+        name = line.split(":", 1)[0]
+        if name in values:
+            values[name] = int(line.split()[1]) * 1024
+    return values["VmRSS"], values["VmHWM"]
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[Any], log, reason: str
+) -> None:
+    """Terminate the isolated mapper process group, escalating if necessary."""
+    log.write(f"\nRESOURCE GUARD: {reason}\n")
+    log.flush()
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+class _MonitoredProcessInterrupted(RuntimeError):
+    def __init__(self, message: str, usage: Mapping[str, Any]):
+        super().__init__(message)
+        self.usage = dict(usage)
+
+
+def _next_solve_attempt(root: Path) -> Path:
+    attempts = root / "attempts" / "solve"
+    attempts.mkdir(parents=True, exist_ok=True)
+    for index in range(1, 10_000):
+        candidate = attempts / f"attempt-{index:04d}"
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise ArtifactError("too many mapper solve attempts")
+
+
+def _resource_sample(
+    root: Path, pid: int, elapsed_s: float
+) -> dict[str, int | float]:
+    rss, hwm = _process_memory_bytes(pid)
+    memory = _meminfo_bytes()
+    return {
+        "elapsed_s": elapsed_s,
+        "pid": pid,
+        "process_rss_bytes": rss,
+        "process_hwm_bytes": hwm,
+        "mem_available_bytes": memory["MemAvailable"],
+        "swap_free_bytes": memory.get("SwapFree", 0),
+        "disk_free_bytes": shutil.disk_usage(root).free,
+    }
+
+
+def _run_monitored_mapper(
+    command: Sequence[str], attempt: Path, config: MapperConfig
+) -> dict[str, Any]:
+    """Run Global Mapper in its own process group with Linux safety guards."""
+    csv_path = attempt / "resource_samples.csv"
+    usage_path = attempt / "resource_usage.json"
+    log_path = attempt / "colmap.log"
+    started_unix_s = time.time()
+    started = time.monotonic()
+    initial_free = shutil.disk_usage(attempt).free
+    initial_floor = int(config.minimum_free_space_gb * 1024**3)
+    if initial_free < initial_floor:
+        usage = {
+            "schema_version": 1,
+            "monitor": "linux-process-group",
+            "launched": False,
+            "returncode": None,
+            "safety_aborted": True,
+            "safety_abort_reason": (
+                "free disk is below the configured launch floor of "
+                f"{config.minimum_free_space_gb:.1f} GiB"
+            ),
+            "started_unix_s": started_unix_s,
+            "ended_unix_s": time.time(),
+            "wall_time_s": 0.0,
+            "peak_process_rss_bytes": 0,
+            "minimum_system_available_bytes": _meminfo_bytes()["MemAvailable"],
+            "minimum_disk_free_bytes": initial_free,
+            "samples_csv": str(csv_path.relative_to(attempt.parents[2])),
+            "log": str(log_path.relative_to(attempt.parents[2])),
+        }
+        with csv_path.open("x", newline="", encoding="utf-8") as stream:
+            csv.writer(stream).writerow(
+                (
+                    "elapsed_s",
+                    "pid",
+                    "process_rss_bytes",
+                    "process_hwm_bytes",
+                    "mem_available_bytes",
+                    "swap_free_bytes",
+                    "disk_free_bytes",
+                )
+            )
+        _atomic_json(usage_path, usage)
+        raise _MonitoredProcessInterrupted(usage["safety_abort_reason"], usage)
+
+    def set_nice() -> None:
+        if config.process_nice:
+            os.nice(config.process_nice)
+
+    peak_rss = 0
+    minimum_available = math.inf
+    minimum_disk = math.inf
+    low_memory_samples = 0
+    abort_reason: str | None = None
+    interrupted: BaseException | None = None
+    returncode: int | None = None
+    process: subprocess.Popen[Any] | None = None
+    old_handlers: dict[int, Any] = {}
+
+    def interrupt(signum, _frame) -> None:
+        raise InterruptedError(f"received signal {signum}")
+
+    with log_path.open("x", encoding="utf-8") as log, csv_path.open(
+        "x", newline="", encoding="utf-8"
+    ) as sample_stream:
+        log.write("$ " + " ".join(command) + "\n")
+        log.flush()
+        writer = csv.DictWriter(
+            sample_stream,
+            fieldnames=(
+                "elapsed_s",
+                "pid",
+                "process_rss_bytes",
+                "process_hwm_bytes",
+                "mem_available_bytes",
+                "swap_free_bytes",
+                "disk_free_bytes",
+            ),
+        )
+        writer.writeheader()
+        process = subprocess.Popen(
+            list(command),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+            preexec_fn=set_nice,
+        )
+        monitored_signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            monitored_signals.append(signal.SIGHUP)
+        try:
+            for signum in monitored_signals:
+                old_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, interrupt)
+            while True:
+                sample = _resource_sample(
+                    attempt, process.pid, time.monotonic() - started
+                )
+                writer.writerow(sample)
+                sample_stream.flush()
+                peak_rss = max(
+                    peak_rss,
+                    int(sample["process_rss_bytes"]),
+                    int(sample["process_hwm_bytes"]),
+                )
+                available = int(sample["mem_available_bytes"])
+                disk_free = int(sample["disk_free_bytes"])
+                minimum_available = min(minimum_available, available)
+                minimum_disk = min(minimum_disk, disk_free)
+                returncode = process.poll()
+                if returncode is not None:
+                    break
+                memory_floor = int(config.minimum_available_memory_gb * 1024**3)
+                low_memory_samples = (
+                    low_memory_samples + 1 if available < memory_floor else 0
+                )
+                if low_memory_samples >= config.low_memory_consecutive_samples:
+                    abort_reason = (
+                        "MemAvailable stayed below "
+                        f"{config.minimum_available_memory_gb:.1f} GiB for "
+                        f"{low_memory_samples} consecutive samples"
+                    )
+                    _terminate_process_group(process, log, abort_reason)
+                    returncode = process.wait()
+                    break
+                runtime_floor = int(
+                    config.minimum_runtime_free_space_gb * 1024**3
+                )
+                if disk_free < runtime_floor:
+                    abort_reason = (
+                        "free disk fell below the configured runtime floor of "
+                        f"{config.minimum_runtime_free_space_gb:.1f} GiB"
+                    )
+                    _terminate_process_group(process, log, abort_reason)
+                    returncode = process.wait()
+                    break
+                time.sleep(config.resource_sample_interval_s)
+        except BaseException as exc:
+            interrupted = exc
+            if process.poll() is None:
+                _terminate_process_group(
+                    process,
+                    log,
+                    f"monitor interrupted by {type(exc).__name__}: {exc}",
+                )
+        finally:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+            if process.poll() is None:
+                _terminate_process_group(
+                    process, log, "monitor exited while COLMAP was still running"
+                )
+            returncode = process.wait()
+
+    ended_unix_s = time.time()
+    usage = {
+        "schema_version": 1,
+        "monitor": "linux-process-group",
+        "launched": True,
+        "returncode": int(returncode),
+        "safety_aborted": abort_reason is not None,
+        "safety_abort_reason": abort_reason,
+        "started_unix_s": started_unix_s,
+        "ended_unix_s": ended_unix_s,
+        "wall_time_s": time.monotonic() - started,
+        "peak_process_rss_bytes": int(peak_rss),
+        "minimum_system_available_bytes": int(
+            minimum_available if math.isfinite(minimum_available) else 0
+        ),
+        "minimum_disk_free_bytes": int(
+            minimum_disk if math.isfinite(minimum_disk) else initial_free
+        ),
+        "samples_csv": str(csv_path.relative_to(attempt.parents[2])),
+        "log": str(log_path.relative_to(attempt.parents[2])),
+    }
+    _atomic_json(usage_path, usage)
+    if interrupted is not None:
+        raise _MonitoredProcessInterrupted(
+            f"Global Mapper monitor was interrupted: {interrupted}", usage
+        ) from interrupted
+    if abort_reason is not None:
+        raise _MonitoredProcessInterrupted(abort_reason, usage)
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, list(command))
+    return usage
+
+
+def _run_injected_mapper(
+    command: Sequence[str], attempt: Path, runner: Runner
+) -> dict[str, Any]:
+    """Keep deterministic evidence when a unit-test runner replaces COLMAP."""
+    csv_path = attempt / "resource_samples.csv"
+    usage_path = attempt / "resource_usage.json"
+    started = time.time()
+    with csv_path.open("x", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("elapsed_s", "pid", "process_rss_bytes"))
+        writer.writerow(("0.000", os.getpid(), 0))
+    try:
+        _execute(command, runner)
+    except BaseException as exc:
+        usage = {
+            "schema_version": 1,
+            "monitor": "injected-runner",
+            "returncode": None,
+            "exception": type(exc).__name__,
+            "wall_time_s": time.time() - started,
+            "samples_csv": str(csv_path.relative_to(attempt.parents[2])),
+        }
+        _atomic_json(usage_path, usage)
+        raise
+    usage = {
+        "schema_version": 1,
+        "monitor": "injected-runner",
+        "returncode": 0,
+        "wall_time_s": time.time() - started,
+        "samples_csv": str(csv_path.relative_to(attempt.parents[2])),
+    }
+    _atomic_json(usage_path, usage)
+    return usage
+
+
+def _solve_resource_paths(root: Path, usage: Mapping[str, Any]) -> tuple[Path, Path]:
+    samples = root / str(usage["samples_csv"])
+    return samples, samples.with_name("resource_usage.json")
+
+
+def _latest_solve_resources(root: Path) -> dict[str, Any]:
+    candidates = sorted(
+        (root / "attempts" / "solve").glob("attempt-*/resource_usage.json")
+    )
+    if not candidates:
+        raise ArtifactError(
+            "published solve model has no resource evidence; prepare a new "
+            "backend artifact"
+        )
+    usage = _json(candidates[-1])
+    if int(usage.get("returncode", -1)) != 0:
+        raise ArtifactError("published solve model has no successful resource record")
+    samples, usage_path = _solve_resource_paths(root, usage)
+    if not samples.is_file() or usage_path != candidates[-1]:
+        raise ArtifactError("mapper resource evidence is incomplete")
+    return usage
+
+
 def _analyze_model(
     model: Path, executable: str | Path, runner: Runner
 ) -> dict[str, int | float]:
@@ -939,11 +1617,14 @@ def _complete_stage(
     report: Mapping[str, Any],
     manifest_name: str,
     manifest: Mapping[str, Any],
+    extra_outputs: Sequence[str | Path] = (),
 ) -> dict[str, Any]:
     report_path = _report_path(root, stage)
     _atomic_json(report_path, report)
     _atomic_json(root / manifest_name, manifest)
-    ledger.complete(stage, inputs, [report_path, manifest_name])
+    ledger.complete(
+        stage, inputs, [report_path, manifest_name, *extra_outputs]
+    )
     return dict(report)
 
 
@@ -971,12 +1652,23 @@ def run_mapper_solve(
         return _json(_report_path(root, "solve"))
 
     incomplete = root / "solve.incomplete"
+    resources: dict[str, Any] | None = None
     if not published.exists():
         if incomplete.exists():
             shutil.rmtree(incomplete)
         incomplete.mkdir()
         try:
-            _execute(command, runner)
+            if config.backend == "global":
+                attempt = _next_solve_attempt(root)
+                resources = (
+                    _run_monitored_mapper(command, attempt, config)
+                    if runner is subprocess.run
+                    else _run_injected_mapper(command, attempt, runner)
+                )
+            else:
+                # The fallback command and execution semantics intentionally
+                # remain unchanged by the Global Mapper resource policy.
+                _execute(command, runner)
             candidates = _model_candidates(incomplete)
             if not candidates:
                 raise ArtifactError("mapper produced no valid COLMAP model")
@@ -1006,6 +1698,8 @@ def run_mapper_solve(
             shutil.rmtree(incomplete, ignore_errors=True)
             raise
     else:
+        if config.backend == "global":
+            resources = _latest_solve_resources(root)
         candidates = _model_candidates(published)
         analyses = [
             {
@@ -1036,7 +1730,11 @@ def run_mapper_solve(
         "all_keyframes_registered": (
             selected["stats"]["registered_images"] == plan["n_solve_images"]
         ),
+        **({"resources": resources} if resources is not None else {}),
     }
+    resource_outputs: tuple[Path, ...] = ()
+    if resources is not None:
+        resource_outputs = _solve_resource_paths(root, resources)
     return _complete_stage(
         root,
         ledger,
@@ -1045,6 +1743,7 @@ def run_mapper_solve(
         report,
         "solve_model_manifest.json",
         _tree_manifest(published),
+        resource_outputs,
     )
 
 
@@ -1121,21 +1820,22 @@ def registered_names_from_images_txt(path: str | Path) -> tuple[str, ...]:
     """Read registered image names from a COLMAP text model."""
     names: list[str] = []
     expect_pose = True
-    for raw in Path(path).read_text(encoding="utf-8").splitlines():
-        stripped = raw.strip()
-        if stripped.startswith("#"):
-            continue
-        if expect_pose:
-            if not stripped:
+    with Path(path).open(encoding="utf-8") as stream:
+        for raw in stream:
+            stripped = raw.strip()
+            if stripped.startswith("#"):
                 continue
-            fields = stripped.split()
-            if len(fields) < 10:
-                raise ArtifactError("malformed COLMAP images.txt pose row")
-            names.append(fields[9])
-            expect_pose = False
-        else:
-            # The observation row may legitimately be empty.
-            expect_pose = True
+            if expect_pose:
+                if not stripped:
+                    continue
+                fields = stripped.split()
+                if len(fields) < 10:
+                    raise ArtifactError("malformed COLMAP images.txt pose row")
+                names.append(fields[9])
+                expect_pose = False
+            else:
+                # The observation row may legitimately be empty.
+                expect_pose = True
     if not expect_pose:
         raise ArtifactError("COLMAP images.txt ends before an observation row")
     if len(names) != len(set(names)):
@@ -1162,35 +1862,38 @@ def _quaternion_rotation(qw: float, qx: float, qy: float, qz: float) -> np.ndarr
 def _poses_from_images_txt(path: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     expect_pose = True
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        stripped = raw.strip()
-        if stripped.startswith("#"):
-            continue
-        if not expect_pose:
-            expect_pose = True
-            continue
-        if not stripped:
-            continue
-        fields = stripped.split()
-        if len(fields) < 10:
-            raise ArtifactError("malformed COLMAP images.txt pose row")
-        try:
-            quaternion = [float(value) for value in fields[1:5]]
-            translation = np.asarray(
-                [float(value) for value in fields[5:8]], dtype=np.float64
-            )
-        except ValueError as exc:
-            raise ArtifactError("COLMAP pose row contains non-numeric values") from exc
-        name = fields[9]
-        if name in poses:
-            raise ArtifactError(f"duplicate COLMAP pose for {name}")
-        rotation = _quaternion_rotation(*quaternion)
-        viewmat = np.eye(4, dtype=np.float64)
-        viewmat[:3, :3] = rotation
-        viewmat[:3, 3] = translation
-        center = -(rotation.T @ translation)
-        poses[name] = (viewmat, center)
-        expect_pose = False
+    with path.open(encoding="utf-8") as stream:
+        for raw in stream:
+            stripped = raw.strip()
+            if stripped.startswith("#"):
+                continue
+            if not expect_pose:
+                expect_pose = True
+                continue
+            if not stripped:
+                continue
+            fields = stripped.split()
+            if len(fields) < 10:
+                raise ArtifactError("malformed COLMAP images.txt pose row")
+            try:
+                quaternion = [float(value) for value in fields[1:5]]
+                translation = np.asarray(
+                    [float(value) for value in fields[5:8]], dtype=np.float64
+                )
+            except ValueError as exc:
+                raise ArtifactError(
+                    "COLMAP pose row contains non-numeric values"
+                ) from exc
+            name = fields[9]
+            if name in poses:
+                raise ArtifactError(f"duplicate COLMAP pose for {name}")
+            rotation = _quaternion_rotation(*quaternion)
+            viewmat = np.eye(4, dtype=np.float64)
+            viewmat[:3, :3] = rotation
+            viewmat[:3, 3] = translation
+            center = -(rotation.T @ translation)
+            poses[name] = (viewmat, center)
+            expect_pose = False
     if not expect_pose:
         raise ArtifactError("COLMAP images.txt ends before an observation row")
     return poses
@@ -1303,15 +2006,51 @@ def export_pose_artifact(
     name: str,
     *,
     output_root: str | Path,
+    refinement_workspace: str | Path | None = None,
 ) -> Path:
     """Publish one named, provenance-complete left-camera pose artifact."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         raise ValueError(f"invalid pose artifact name: {name!r}")
     root, plan, config = _workspace_context(workspace)
     quality_marker = root / "stages" / "quality.json"
+    quality_report_path = _report_path(root, "quality")
+    text_model = root / "registered_text"
+    text_manifest_path = root / "text_model_manifest.json"
+    binary_manifest_path = root / "registered_model_manifest.json"
+    diagnostic_root = root
+    pose_prior_role = (
+        "post_solve_georeferencing_and_heldout_evaluation_only"
+    )
+    pose_priors_constrain_mapper = False
+    pose_priors_constrain_refinement = False
+    refinement_provenance: dict[str, Any] = {}
+    if refinement_workspace is not None:
+        from rtk_splat.backends.rtk_refinement import refinement_export_context
+
+        refined = refinement_export_context(refinement_workspace)
+        if refined["source_backend"] != root:
+            raise ArtifactError(
+                "RTK refinement was prepared from a different mapper backend"
+            )
+        quality_marker = refined["quality_marker"]
+        quality_report_path = refined["quality_report"]
+        quality_report = refined["quality"]["visual_quality"]
+        text_model = refined["text_model"]
+        text_manifest_path = refined["text_model_manifest"]
+        binary_manifest_path = refined["binary_model_manifest"]
+        diagnostic_root = refined["workspace"]
+        pose_prior_role = refined["pose_prior_role"]
+        pose_priors_constrain_mapper = refined[
+            "pose_priors_constrain_mapper"
+        ]
+        pose_priors_constrain_refinement = refined[
+            "pose_priors_constrain_refinement"
+        ]
+        refinement_provenance = refined["provenance"]
+    else:
+        quality_report = _json(quality_report_path)
     if not quality_marker.is_file():
         raise ArtifactError("run the exact-registration quality stage before export")
-    quality_report = _json(_report_path(root, "quality"))
     if (
         quality_report.get("missing_images")
         or quality_report.get("unexpected_images")
@@ -1320,8 +2059,8 @@ def export_pose_artifact(
         raise ArtifactError("pose export requires exact left+right registration")
     if not quality_report.get("passed"):
         raise ArtifactError("refusing to export a pose artifact that failed quality")
-    text_manifest = _json(root / "text_model_manifest.json")
-    _verify_tree(root / "registered_text", text_manifest)
+    text_manifest = _json(text_manifest_path)
+    _verify_tree(text_model, text_manifest)
     frontend = Path(plan["frontend_artifact"])
     output = Path(output_root).expanduser().resolve()
     destination = output / name
@@ -1334,7 +2073,7 @@ def export_pose_artifact(
             )
     manifest = _json(frontend / "frame_manifest.json")
     rows = manifest["frames"]
-    poses = _poses_from_images_txt(root / "registered_text" / "images.txt")
+    poses = _poses_from_images_txt(text_model / "images.txt")
     left_names = [row["left_image"]["name"] for row in rows]
     missing = sorted(set(left_names) - set(poses))
     if missing:
@@ -1373,44 +2112,130 @@ def export_pose_artifact(
         alignment.rotation,
         alignment.translation,
     )
-    holdout_residuals = evaluation.residuals_m[evaluation.holdout_mask]
-    holdout_inlier_residuals = evaluation.residuals_m[
-        evaluation.holdout_inlier_mask
-    ]
-    if not holdout_inlier_residuals.size:
-        raise ArtifactError(
-            "fixed-scale ENU alignment has no RTK inlier in held-out blocks"
-        )
-    residual_median = float(np.median(holdout_residuals))
-    residual_p95 = float(np.percentile(holdout_residuals, 95))
-    inlier_p95 = float(np.percentile(holdout_inlier_residuals, 95))
-    inlier_fraction = float(
-        evaluation.holdout_inlier_mask.sum() / evaluation.holdout_mask.sum()
+    inputs = {
+        "name": name,
+        "quality_marker_sha256": sha256_file(quality_marker),
+        "text_model_manifest_sha256": sha256_file(text_manifest_path),
+        "frame_manifest_sha256": sha256_file(frontend / "frame_manifest.json"),
+        "backend_plan_sha256": sha256_file(root / "backend_plan.json"),
+        "pose_model_source": (
+            "rtk_refinement" if refinement_workspace is not None else "mapper"
+        ),
+        **refinement_provenance,
+        "pose_prior_assignment_sha256": canonical_hash(
+            [
+                {
+                    "name": prior_name,
+                    "position_m": priors[prior_name][0],
+                    "covariance_m2": priors[prior_name][1],
+                }
+                for prior_name in prior_names
+            ]
+        ),
+    }
+    holdout_quality = rtk_residual_quality(
+        evaluation.residual_vectors_m[evaluation.holdout_mask],
+        covariance[evaluation.holdout_mask],
+        evaluation.holdout_inlier_mask[evaluation.holdout_mask],
+        config=config,
     )
     rtk_checks = {
         "fixed_scale_se3_applied": {
+            "kind": "metric_integrity",
+            "authoritative": True,
             "value": 1.0,
             "expected": 1.0,
             "passed": True,
         },
-        "median_holdout_rtk_residual_m": {
-            "value": residual_median,
-            "maximum": config.max_rtk_median_error_m,
-            "passed": residual_median <= config.max_rtk_median_error_m,
-        },
-        "p95_holdout_inlier_rtk_residual_m": {
-            "value": inlier_p95,
-            "maximum": config.max_rtk_p95_inlier_error_m,
-            "passed": inlier_p95 <= config.max_rtk_p95_inlier_error_m,
-        },
-        "holdout_rtk_inlier_fraction": {
-            "value": inlier_fraction,
-            "minimum": config.min_rtk_inlier_fraction,
-            "passed": inlier_fraction >= config.min_rtk_inlier_fraction,
-        },
+        **holdout_quality["checks"],
     }
-    if not all(check["passed"] for check in rtk_checks.values()):
-        raise ArtifactError("fixed-scale ENU alignment failed RTK residual gates")
+    rtk_alignment_passed = all(
+        check["passed"]
+        for check in rtk_checks.values()
+        if check["authoritative"]
+    )
+    backfilled_fields = sorted(
+        set(_LEGACY_EVALUATION_DEFAULTS) - set(plan["config"])
+    )
+    gate_policy = {
+        "schema_version": 1,
+        "normalized_model": "chi_square_3d_camera_centre_residual",
+        "covariance": "stored_position_covariance_in_target_frame",
+        "covariance_gate_mode": config.rtk_covariance_gate_mode,
+        "covariance_provenance_requirement": (
+            "enforce only when upstream evidence establishes calibrated "
+            "effective camera-centre covariance"
+        ),
+        "effective_config": {
+            field: asdict(config)[field]
+            for field in (
+                "max_rtk_median_error_m",
+                "max_rtk_p95_inlier_error_m",
+                "min_rtk_inlier_fraction",
+                "rtk_chi2_inlier_probability",
+                "max_rtk_median_mahalanobis_sq",
+                "min_rtk_chi2_inlier_fraction",
+                "rtk_covariance_gate_mode",
+            )
+        },
+        "legacy_backfilled_evaluation_fields": backfilled_fields,
+        "absolute_caps_are_independent": True,
+    }
+    holdout_block_ids = evaluation.temporal_block_ids[
+        evaluation.holdout_mask
+    ]
+    holdout_residuals = evaluation.residuals_m[evaluation.holdout_mask]
+    holdout_mahalanobis_sq = np.asarray(
+        holdout_quality["mahalanobis_sq"]["values"], dtype=np.float64
+    )
+    block_summaries = []
+    for block_id in evaluation.holdout_block_ids:
+        block_mask = holdout_block_ids == block_id
+        block_summaries.append(
+            {
+                "block_id": block_id,
+                "n_residuals": int(block_mask.sum()),
+                "median_residual_m": float(
+                    np.median(holdout_residuals[block_mask])
+                ),
+                "median_mahalanobis_sq": float(
+                    np.median(holdout_mahalanobis_sq[block_mask])
+                ),
+            }
+        )
+    diagnostic_report = {
+        "schema_version": 1,
+        "stage": "pose_export_rtk_alignment_evaluation",
+        "pose_artifact_name": name,
+        "passed": rtk_alignment_passed,
+        "inputs": inputs,
+        "gate_policy": gate_policy,
+        "n_calibration_priors": int(evaluation.calibration_mask.sum()),
+        "n_holdout_priors": int(evaluation.holdout_mask.sum()),
+        "holdout_block_summaries": block_summaries,
+        "holdout_residual_vectors_m": evaluation.residual_vectors_m[
+            evaluation.holdout_mask
+        ].tolist(),
+        "holdout_quality": holdout_quality,
+        "checks": rtk_checks,
+        "sim3_scale_diagnostic": alignment.sim3_scale_diagnostic,
+    }
+    diagnostic_identity = canonical_hash(
+        {
+            "inputs": inputs,
+            "gate_policy": gate_policy,
+            "temporal_block_ids": evaluation.temporal_block_ids,
+        }
+    )[:12]
+    diagnostic_path = _report_path(
+        diagnostic_root, f"pose_export_alignment_{name}_{diagnostic_identity}"
+    )
+    _atomic_json(diagnostic_path, diagnostic_report)
+    if not rtk_alignment_passed:
+        raise ArtifactError(
+            "fixed-scale ENU alignment failed RTK residual gates; "
+            f"diagnostics: {diagnostic_path}"
+        )
     if (
         np.any(np.diff(frame_ids) <= 0)
         or np.any(np.diff(timestamps) <= 0)
@@ -1419,25 +2244,6 @@ def export_pose_artifact(
     ):
         raise ArtifactError("exported pose arrays failed integrity checks")
 
-    inputs = {
-        "name": name,
-        "quality_marker_sha256": sha256_file(quality_marker),
-        "text_model_manifest_sha256": sha256_file(
-            root / "text_model_manifest.json"
-        ),
-        "frame_manifest_sha256": sha256_file(frontend / "frame_manifest.json"),
-        "backend_plan_sha256": sha256_file(root / "backend_plan.json"),
-        "pose_prior_assignment_sha256": canonical_hash(
-            [
-                {
-                    "name": name,
-                    "position_m": priors[name][0],
-                    "covariance_m2": priors[name][1],
-                }
-                for name in prior_names
-            ]
-        ),
-    }
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.parent / f".{name}.writing-{uuid.uuid4().hex}"
     staging.mkdir()
@@ -1450,7 +2256,7 @@ def export_pose_artifact(
         export_quality = {
             "schema_version": 1,
             "source_quality_report_sha256": sha256_file(
-                _report_path(root, "quality")
+                quality_report_path
             ),
             "n_frames": len(frame_ids),
             "all_left_camera_poses_present": True,
@@ -1472,16 +2278,14 @@ def export_pose_artifact(
             "n_holdout_rtk_inliers": int(
                 evaluation.holdout_inlier_mask.sum()
             ),
-            "holdout_rtk_residual_m": {
-                "median": residual_median,
-                "p95": residual_p95,
-                "p95_inliers": inlier_p95,
-                "maximum_inliers": float(holdout_inlier_residuals.max()),
-            },
+            "holdout_rtk_residual_m": holdout_quality["residual_m"],
+            "holdout_rtk_mahalanobis_sq": holdout_quality[
+                "mahalanobis_sq"
+            ],
+            "rtk_gate_policy": gate_policy,
             "rtk_alignment_checks": rtk_checks,
-            "rtk_alignment_passed": all(
-                check["passed"] for check in rtk_checks.values()
-            ),
+            "rtk_alignment_passed": rtk_alignment_passed,
+            "rtk_alignment_diagnostic_report": str(diagnostic_path),
             "sim3_scale_diagnostic": alignment.sim3_scale_diagnostic,
             "sim3_scale_applied": False,
         }
@@ -1493,10 +2297,11 @@ def export_pose_artifact(
             ),
             "source_frame": "colmap_sfm_world",
             "target_frame": "local_enu_cartesian_pose_priors",
-            "pose_prior_role": (
-                "post_solve_georeferencing_and_heldout_evaluation_only"
+            "pose_prior_role": pose_prior_role,
+            "pose_priors_constrain_mapper": pose_priors_constrain_mapper,
+            "pose_priors_constrain_refinement": (
+                pose_priors_constrain_refinement
             ),
-            "pose_priors_constrain_mapper": False,
             "production_scale": 1.0,
             "sim3_scale_diagnostic": alignment.sim3_scale_diagnostic,
             "sim3_scale_fit_membership": "calibration_blocks_only",
@@ -1531,7 +2336,11 @@ def export_pose_artifact(
             ),
             "holdout_inlier_mask": evaluation.holdout_inlier_mask.tolist(),
             "residuals_m": evaluation.residuals_m.tolist(),
+            "residual_vectors_m": evaluation.residual_vectors_m.tolist(),
             "ransac_thresholds_m": evaluation.thresholds_m.tolist(),
+            "gate_policy": gate_policy,
+            "holdout_quality": holdout_quality,
+            "diagnostic_report": str(diagnostic_path),
             "checks": rtk_checks,
         }
         provenance = {
@@ -1541,6 +2350,8 @@ def export_pose_artifact(
             "frontend_inputs": plan["frontend_inputs"],
             "backend": config.backend,
             "backend_config": plan["config"],
+            "backend_config_effective": asdict(config),
+            "legacy_backfilled_evaluation_fields": backfilled_fields,
             "database_snapshot_sha256": plan["database_sha256"],
             "solve_marker_sha256": sha256_file(root / "stages" / "solve.json"),
             "register_marker_sha256": sha256_file(
@@ -1553,9 +2364,12 @@ def export_pose_artifact(
                 "pose_prior_assignment_sha256"
             ],
             "registered_model_manifest_sha256": sha256_file(
-                root / "registered_model_manifest.json"
+                binary_manifest_path
             ),
             "text_model_manifest_sha256": inputs["text_model_manifest_sha256"],
+            **refinement_provenance,
+            "rtk_alignment_diagnostic_report": str(diagnostic_path),
+            "rtk_alignment_diagnostic_sha256": sha256_file(diagnostic_path),
             "pose_convention": {
                 "viewmats": "world_to_left_camera",
                 "viewmat_camera_axes": "OpenCV_x_right_y_down_z_forward",

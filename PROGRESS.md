@@ -1,6 +1,6 @@
 # RTK-Splat Progress
 
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 This is the current source of truth for this repository. Superseded plans are
 kept under `docs/archive/`.
@@ -52,6 +52,130 @@ The run began while the stereo implementation was uncommitted. Git commit
 source snapshot, not a falsely claimed clean run-time checkout. Exact hashes
 and artifact statistics are in
 [headland_stereo_ba.json](docs/experiments/golden/headland_stereo_ba.json).
+
+## CitrusFarm full-window pose attempt
+
+The first complete 543--735 s Citrus pose attempt reached the held-out export
+gate on 2026-08-01. It did not reach cloud construction or GS training.
+
+- Published **1,495 stereo pairs** over approximately 229 m.
+- Registered **2,990 / 2,990 images** in one visual Global Mapper model.
+- Mean reprojection error: **0.973 px**; mean track length: **30.43**.
+- Diagnostic fixed-stereo Sim(3) scale: **1.001315**; scale was not applied.
+- Measured wall time from ingest start to the rejected export: about **42 min**.
+
+The original absolute-only export error was replaced by a covariance-normalized,
+temporally held-out report. It uses full stored 3x3 position matrices and a
+chi-square residual diagnostic, while retaining independent absolute metre and
+support caps. Normalized checks are not authoritative for this recording because
+its NavSatFix covariance is a static, driver-configured `APPROXIMATED` matrix and
+the current camera-centre covariance still omits heading-times-lever-arm, timing,
+visual-pose, and alignment-fit uncertainty.
+
+The cached solve still fails honestly:
+
+| Held-out quantity | Result | Gate |
+|---|---:|---:|
+| Median position residual | **0.2663 m** | <= 0.15 m |
+| Absolute inlier support | **59.20%** | >= 80% |
+| Inlier p95 | **0.3151 m** | <= 0.30 m |
+| Median Mahalanobis squared (diagnostic) | **9.2416** | <= 4.1083 |
+| 95% chi-square coverage (diagnostic) | **40.13%** | >= 80% |
+
+The two untouched temporal blocks differ materially: **0.5135 m** versus
+**0.1937 m** median. This is not explained by a single global scale or by simply
+calling the receiver "worse RTK". No pose or staging artifact was published;
+the immutable rejection report is retained beside the backend evidence.
+
+A separate receiver-state audit decoded the bag-embedded Piksi message without a
+ROS installation. It associated **1,920 / 1,920** NavSatFix samples within
+10.115 ms to **2,496** receiver states. Every state reports `FIXED_RTK`, agrees
+with `rtk_mode_fix=true`, and has no receiver error flag. Future ingest now
+preserves this complete evidence and fails closed when it is required. The old
+sealed v1 segment remains truthfully labelled from its retained evidence and is
+not relabelled after the fact; a new immutable ingest is required for a
+publication-grade receiver-confirmed reproduction.
+
+### Optional RTK pose-refinement A/B
+
+A generic, separately named `rtk_refinement` backend was implemented and run
+against the cached Citrus v1 reconstruction on 2026-08-01. It cloned the
+backend database, physically removed alternating temporal holdouts, and ran
+COLMAP 4.1.1 pose-prior refinement with frozen cameras and stereo rig. Exactly
+**897 calibration priors** entered optimization; **598 priors** remained
+absent from the refinement factors and alignment fit. The source backend was
+not modified. This is a refinement-factor holdout, not an end-to-end
+GNSS-independent split: upstream RTK-guided frame/pair planning had access to
+the full track.
+
+The refinement was safe but did not pass:
+
+| Quantity | Visual source | RTK refinement | Gate |
+|---|---:|---:|---:|
+| Registered images | 2,990/2,990 | **2,990/2,990** | exact |
+| Reprojection error | 0.9727 px | **0.6744 px** | <= 2.0 px |
+| Held-out RTK median | 0.2663 m | **0.2490 m** | <= 0.15 m |
+| Held-out RTK support | 59.20% | **67.22%** | >= 80% |
+| Held-out inlier p95 | 0.3151 m | **0.3034 m** | <= 0.30 m |
+| Source-to-refined scale | -- | **1.003986** | within 0.5% |
+| Maximum stereo-baseline change | -- | **1.4e-14 m** | <= 5e-5 m |
+
+The 31.7-minute COLMAP solve peaked at **6.94 GB RSS**. It retained the
+0.119885166 m rig baseline to numerical precision and changed no intrinsic or
+rig parameter. It also retriangulated far more short tracks: reprojection and
+observation count improved, while mean track length fell from 30.43 to 6.84.
+That change remains visible and fails the deliberately conservative relative
+track-retention gate.
+
+More importantly, the refinement-factor holdout RTK gates fail even without that track
+gate. Per-block analysis explains the limited gain. The difficult first
+calibration/holdout pair improved from **0.622/0.514 m** median to
+**0.517/0.397 m**, while the later held-out block was essentially unchanged
+(0.194 to 0.191 m). Stock Cauchy pose-prior BA therefore helped but treated a
+large coherent early trajectory disagreement too weakly to correct it. No pose,
+cloud, GS model, or rendering claim was published.
+
+The compact rejected-run receipt, including sealed artifact hashes, exact
+resource use, and the predeclared pass/fail values, is
+`docs/experiments/citrusfarm_rtk_refinement_v1.json`.
+
+### Completed RTK-loss diagnostic and prepared fresh-mapper test
+
+The cached quadratic/L2 arm completed without replaying bags, depth, features,
+matching, Global Mapper, or GS. It used the same covariance whitening,
+897/598 calibration/holdout split, seed, iteration limits, frozen cameras, and
+frozen stereo rig as the Cauchy control. Its 32.3-minute solve registered all
+2,990 images and improved held-out median error from 0.2490 m to **0.2284 m**
+and support from 67.22% to **95.32%**. It still failed the 0.15 m median and
+0.30 m inlier-p95 gates (0.3175 m), as well as the continuation-only relative
+track-retention gate. It therefore remains rejected and produced no pose,
+cloud, GS run, or PLY.
+
+That result narrows the next test to initialization rather than loss weighting.
+A new sealed launcher reuses the same cached frontend, private-prior protocol,
+quadratic loss, and completed L2 continuation arm, but starts COLMAP's
+`pose_prior_mapper` without `--input_path`. RTK calibration-block factors are
+therefore active while the mapper builds its tracks, rather than only after a
+finished visual model is supplied. The command must otherwise be identical.
+Fresh topology is judged by absolute graph gates (mean track length at least
+3 and mean observations per image at least 500), not by an invalid
+track-by-track retention comparison to the continuation model. Registration,
+reprojection, metric scale, stereo rig, calibration, and held-out RTK gates
+remain unchanged.
+
+The real preflight passed with 2,990 images, 1,495 frames, 897 calibration
+priors, 598 physical factor holdouts, two cameras, one rig, the pinned COLMAP
+binary, 52 GiB free disk, and 18 GiB available memory. Both old completed arms
+also resumed without changing any sealed plan, marker, or report. The fresh
+candidate has not been started. Run it with:
+
+```bash
+bash scripts/experiments/citrusfarm_pose_prior_fresh_l2.sh run
+```
+
+Budget approximately **4--10 hours** and **7--12 GiB** additional storage.
+The launcher stops after mapping, fail-closed quality audit, and a paired JSON
+report. It never exports poses or starts cloud construction or GS.
 
 ## Contract-v2 work: Phase 0 accepted baseline
 
@@ -126,7 +250,7 @@ remain at their priors. The new diagnostic artifact is
 `rtk_stereo_metric_integrity_global_v1_strict`; it publishes no poses and is
 not consumed by training.
 
-## Completed implementation: Phases 1, 3, and 4
+## Completed implementation: Phases 1, 3, and 4, plus Citrus preparation
 
 The following describes code and test status. It does not imply that a new
 COLMAP or GS experiment has completed.
@@ -141,7 +265,7 @@ Implemented and covered by unit/synthetic tests:
   frontends, backends, workflows, and diagnostics are explicit subpackages;
   the former collision-prone global package names no longer exist.
 - Dataset-specific ingestion lives under `rtk_splat/adapters/`; the registry
-  currently supports ROS 2 ZED/u-blox and AgriGS.
+  supports ROS 2 ZED/u-blox, ROS 1 CitrusFarm, and AgriGS.
 - Calibration ROS topics, u-blox message registration, message decoding, and
   bounded MCAP reading moved into `rtk_splat/adapters/calibration_bag.py`.
   Diagnostics retain only plain records, numerical analysis, COLMAP parsing,
@@ -198,6 +322,15 @@ Implemented and unit-tested:
   calibration blocks and enforces RTK gates on untouched blocks. Sim(3) is fit
   on calibration data only, is diagnostic only, and cannot silently rescale
   metric stereo geometry.
+- The canonical `mapper:` profile now exposes the exact bounded Global Mapper
+  controls used by the accepted reduced solve: three BA iterations, 60,000
+  tracks maximum, 1,000 retained tracks per view, no final retriangulation,
+  and CPU global-position/BA solving. Obsolete `global_mapper:` plans are
+  rejected instead of being interpreted under new defaults.
+- Each real Global solve runs in an isolated process group. It records
+  per-attempt logs and CSV/JSON resource samples, lowers process priority, and
+  terminates the group without publishing a pose when configured memory or
+  disk floors are crossed. The incremental fallback path is unchanged.
 
 The retained database position priors are evidence and can assist compatible
 COLMAP behavior. The integrated Global Mapper solve remains visual and does
@@ -229,12 +362,95 @@ graph with maximum degree 8 plus registration paths for every frame. It did
 not create a COLMAP database, terminal frontend seal, pose, cloud, or GS run;
 it verifies real-data planning and artifact publication only.
 
-Phases 5--7—RTK-factor submaps, CitrusFarm support, and rendering-quality
-changes—are outside this implementation.
+Bounded RTK-factor submaps and rendering-quality changes remain outside this
+implementation. A mapper-neutral, position-prior RTK refinement sidecar is now
+implemented and real-data tested, but it failed the Citrus acceptance gates.
+CitrusFarm source support is implemented, has passed a
+real read-only preflight and bounded ingest/SGBM/sealed-frontend smoke, and has
+completed one full-window visual reconstruction. That attempt failed the
+held-out RTK export gate, so it produced no accepted pose or GS result.
 
-After integration, the committed repository suite passes **157 tests**. The
-dataset-neutral core contains **1,932 lines**, below the enforced 2,000-line
-budget.
+The dataset-neutral core remains below its enforced 2,000-line budget.
+
+## CitrusFarm ROS 1 candidate
+
+The new `ros1_citrusfarm` adapter keeps dataset behavior at the ingestion
+boundary. It reads an explicit ordered chain of 27 ZED ROS 1 bags and two
+Piksi/base bags without requiring ROS, validates topics and chunk continuity,
+decodes raw rectified stereo to lossless PNG, preserves sensor and bag-log
+timestamps plus complete `NavSatFix` covariance/status, estimates observable
+single-antenna course heading, and samples frames by travelled distance. Robot
+geometry and topic names are configuration facts, not mapper conditionals.
+
+The prepared sequence profile covers 543--735 s relative to the first GNSS
+bag-log timestamp. Real read-only preflight evidence is:
+
+- adapter preflight: **127.3 s**, **156.8 MB** reported maximum RSS;
+- GNSS path length: **228.725603 m**;
+- 0.15 m metric sampling estimate: **about 1,525 stereo pairs** (the ingest
+  result, not this estimate, will be authoritative);
+- recorded rectified stereo baseline: **0.119885166 m**;
+- estimated camera-to-GNSS header correction: **+72.548749 ms**;
+- final per-sequence configured correction: **+72.548749 ms** (zero residual);
+  and
+- estimated clock drift across the window: **-2.580854 ms**.
+
+The configured offset and measured drift pass the configured 15 ms gates. The
+configured camera/GPS transform composes the published UCR camera/lidar/GPS
+calibrations; because one receiver supplies no orientation measurement, its
+GPS axes are explicitly assumed body/lidar-aligned and the translation prior
+retains 5 cm uncertainty per axis.
+
+Recorded ZED depth and confidence are inventoried, but the primary experiment
+does not consume them. It derives SGBM depth into a separately named immutable
+segment so the pose/depth protocol remains stereo RGB + RTK and matches the
+headland method boundary. LiDAR, IMU, ZED pose, and wheel odometry are not
+method inputs for this candidate.
+
+The Buffalo SSD is usable through the stable USB 2.0 connection. A complete
+4.25 GB bag read finished at **44.4 MB/s** with no new kernel reset or I/O
+errors, and sampled reads across the required later ZED chunks also passed.
+The workflow treats the source bags as read-only and directs all generated
+artifacts to the internal disk. This validates storage transport, not the
+dataset contents.
+
+A real bounded smoke then exercised the data path rather than only its
+preflight. The 4 s interval at 543--547 s used 0.50 m spacing, read 39 stereo
+candidates, and atomically published 10 pairs over 4.630 m in **135.7 s** with
+about **184 MB** peak RSS. Left/right header residual was exactly zero, all
+camera and bag-log timestamps were retained, and the largest selected GNSS
+association residual was 43.0 ms. The first attempt failed closed on nested
+calibration-provenance serialization; the writer published no segment, the
+conversion was fixed recursively, and a regression test now covers it.
+
+The successful segment was derived through SGBM and a real COLMAP 4.1 GPU
+frontend. It retained 20/20 images in one calibrated stereo rig, extracted
+198,786 descriptors, inserted all 10 covariance-aware RTK priors, and verified
+all 52 requested pairs (36,133 verified correspondences). Depth plus the
+sealed frontend completed in **10.5 s** and peaked at about **512 MB**. SGBM
+valid coverage was 65.0--73.4% per frame (69.0% median), with a 2.30 m median
+valid depth across frames. This
+short, almost linear slice is intentionally not used to judge Global Mapper
+or fixed-scale georeferencing observability, so no mapper or GS smoke is
+claimed. The repository suite passes **207 tests** in the RTK-Splat
+environment after this integration.
+
+`scripts/runs/citrusfarm_05_13d_uturn.sh` provides plan, preflight, fresh run,
+and evidence-checked resume modes without `tmux`. It runs ingest, immutable
+SGBM depth, the all-frame GPU frontend, bounded Global Mapper, all-frame
+registration and held-out quality gates, pose export, cloud construction, and
+the matched 65,000-iteration/2.5-million-Gaussian training profile. The measured
+first attempt took about **42 min** to the export gate: 9m53s ingest, 3m29s
+SGBM, 2m49s frontend build/features/rig/priors, 13m39s matching, and 11m18s
+backend preparation/solve/registration/quality. GS remains an estimated
+**3--5 hours** because this pose did not pass and training was not started.
+
+A full-window Citrus ingest, COLMAP reconstruction, and rejected RTK-refinement
+control now exist, but no accepted
+pose artifact, cloud, GS model, or rendering metric has been produced. In
+particular, the headland 24.8 dB result cannot be promised or directly compared
+across a different scene, camera, motion profile, and held-out image
+distribution.
 
 ## Historical Global Mapper golden result
 
@@ -251,6 +467,20 @@ The separately named reduced profile retained all 53,058 verified pairs for
 rotation averaging, targeted 1,000 selected long tracks per image, capped the
 set at 60,000 tracks, and disabled final retriangulation so COLMAP could not
 recreate the unbounded point set.
+
+That successful resource profile is now represented directly by
+`MapperConfig` and the reproduction YAML rather than by mismatched legacy flag
+names. A read-only held-out replay of the accepted 2,688-image model using the
+current five temporal blocks and exact 1,344 frontend priors/covariances gave:
+
+| Held-out RTK quantity | Replay | Reproduction gate |
+|---|---:|---:|
+| Median residual | 0.09891653 m | <= 0.12 m |
+| Inlier p95 residual | 0.12088889 m | <= 0.15 m |
+| Inlier fraction | 1.0 | >= 0.95 |
+
+The replay shows that the current gates accept the golden model. It does not
+constitute a fresh frontend or mapper execution.
 
 That reduced pose run completed on 2026-07-30:
 
@@ -294,24 +524,28 @@ dataset adapter
     -> GS mapper/evaluator
 ```
 
-Verified through adapter conformance tests:
+Implemented behind the same adapter contract and covered by targeted
+unit/synthetic checks:
 
-- project ROS 2 ZED/u-blox input; and
-- AgriGS external-folder input.
+- project ROS 2 ZED/u-blox input;
+- AgriGS external-folder input; and
+- CitrusFarm-style ordered ROS 1 bags with stereo `sensor_msgs/Image` and
+  single-receiver Piksi `NavSatFix`.
+
+Real-data evidence differs by source. The headland contract migration is fully
+published and validated. CitrusFarm has passed bag-chain, timing, calibration,
+sampling, storage, environment, bounded contract publication, SGBM, sealed
+frontend, complete visual reconstruction, and registration checks. Its first
+full-window pose failed the factor-held-out RTK export gate, and GS remains
+unverified.
 
 Not implemented or verified:
 
-- CitrusFarm ROS 1 ordered split-bag ingestion;
-- arbitrary ROS topic/message layouts;
+- arbitrary ROS topic/message layouts without configuration;
 - stereo cameras distributed across independent recordings;
-- full-field submaps and RTK-constrained local BA; and
-- a fresh real v2 headland run through the new frontend/backend interface.
-
-Read-only inspection of the mounted CitrusFarm sequence found ROS 1 split bags,
-7,592 synchronized 10 Hz ZED2i stereo pairs, recorded depth/confidence, and
-single-receiver fixed RTK over 12 min 39 s. The canonical contract and mapper
-can represent single-RTK input, but the source still needs a tested ROS 1
-split-bag adapter before end-to-end compatibility can be claimed.
+- full-field submaps and a custom RTK-constrained local BA/submap graph;
+- a fresh real v2 headland run through the new frontend/backend interface; and
+- a complete real CitrusFarm pose and GS result.
 
 ## Known scientific limitations
 
@@ -321,31 +555,54 @@ split-bag adapter before end-to-end compatibility can be claimed.
 - The historical incremental reference used legacy bounded Sim(3) alignment;
   the current backend uses fixed-scale SE(3), so a provenance-matched control
   is still required.
-- Global Mapper does not optimize RTK factors in bundle adjustment.
+- Global Mapper does not optimize RTK factors in bundle adjustment. The
+  optional sidecar constrains camera positions only; it does not add an
+  explicit dual-antenna heading factor.
 - Current right imagery contributes to depth and visual pose reconstruction;
   right-camera GS photometric supervision is not validated.
 - Full-field chunking, submap consistency, and tile merging are not
   implemented.
 - Independent target-based stereo calibration has not resolved the remaining
   shared scale uncertainty.
+- CitrusFarm course heading is weak or unavailable during near-stationary
+  motion, and the single-receiver GPS-frame orientation used by the composed
+  camera extrinsic is an explicit assumption rather than a measured heading.
+- CitrusFarm's provided trajectory is GNSS-derived and is used only for window
+  selection/evaluation context; it is not an independent pose ground truth for
+  a method that already consumes Piksi GNSS.
 
 ## Next controlled experiment
 
-1. Use the validated normalized headland contract-v2 segment; derive another
-   immutable depth segment only if a different depth backend is tested.
-2. Compare `gpu` and `cpu_reference` features with the `all` preset.
-3. From independently sealed but controlled evidence, run pose-only `all`,
-   `dense`, `balanced`, and `sparse` Global arms; retain incremental as a
+1. Preserve both the successful visual reconstruction and the rejected
+   position-prior refinement. Do not reinterpret the 1.72 cm aggregate median
+   gain as acceptance.
+2. Run the prepared fresh pose-prior mapper arm on the cached evidence. It
+   reuses the completed quadratic continuation arm as control and changes only
+   initialization: no finished model is supplied to COLMAP. Accept it only if
+   every registration, visual, absolute track-graph, rig, scale, and held-out
+   RTK gate passes; do not train GS as part of this experiment.
+3. If from-start stock pose-prior mapping still rejects the coherent early
+   block, implement bounded
+   RTK-anchored local submaps with robust temporal/block consistency and an
+   RTK-constrained submap graph. That is the method-level path; repeatedly
+   rerunning a whole-model COLMAP refinement is not.
+4. Once a pose mechanism passes, make one new immutable Citrus ingest so the
+   verified receiver-state stream is retained, then reproduce the accepted pose
+   into a new work directory. If interrupted without code/config changes, use
+   the launcher's evidence-checked resume mode.
+5. If the pose passes, complete one matched 65,000-iteration Citrus GS run and
+   report its scene-specific train/validation metrics, runtime, peak resources,
+   and visual failure modes. Compare approaches on the same Citrus split; do
+   not compare raw PSNR directly with headland.
+6. Retain the validated normalized headland segment for the pending efficiency
+   A/B: compare `gpu` and `cpu_reference` features, then pose-only `all`,
+   `dense`, `balanced`, and `sparse` Global arms with incremental as the
    fallback/control.
-4. Require complete stereo registration, acceptable reprojection and temporal
-   continuity, fixed-scale RTK behavior no worse than the control, and stable
-   resource use.
-5. Use inexpensive pose/rendering proxies to select one adaptive arm.
-6. Train only the all-frame control and selected arm with matched seed,
-   split, depth, GS configuration, and provenance.
+7. Train only the headland all-frame control and selected adaptive arm with
+   matched seed, split, depth, GS configuration, and provenance.
 
-The Phase 4 acceptance target is a material pose-runtime reduction with no more
-than **0.2--0.3 dB** masked-PSNR loss and no georeferencing regression. A
+The Phase 4 acceptance target remains a material pose-runtime reduction with no
+more than **0.2--0.3 dB** masked-PSNR loss and no georeferencing regression. A
 further 3.8 dB pose-only gain is not assumed. No paper-level, SOTA, or
-cross-dataset claim should be made before this A/B and an independent dataset
-evaluation.
+cross-dataset claim should be made from adapter preflight or a single
+CitrusFarm run.

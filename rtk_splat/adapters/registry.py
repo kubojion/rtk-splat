@@ -13,7 +13,7 @@ from typing import Any
 from rtk_splat.core.segment import SegmentReader
 
 
-ADAPTER_NAMES = ("agrigs", "ros2_zed_ublox")
+ADAPTER_NAMES = ("agrigs", "ros1_citrusfarm", "ros2_zed_ublox")
 
 
 def publish_from_config(
@@ -26,6 +26,10 @@ def publish_from_config(
     name = str(getattr(cfg, "adapter", "")).strip()
     if name == "ros2_zed_ublox":
         from .ros2_zed_ublox import ingest_config_v2
+
+        return ingest_config_v2(cfg, destination, window=selection)
+    if name == "ros1_citrusfarm":
+        from .ros1_citrusfarm import ingest_config_v2
 
         return ingest_config_v2(cfg, destination, window=selection)
     if name == "agrigs":

@@ -92,6 +92,11 @@ def antenna_pose_at(track, yaw_smoothed: np.ndarray, t: float, pose_cfg):
 
     k = int(np.searchsorted(ft, t))
     k0, k1 = max(0, k - 1), min(len(ft) - 1, k)
+    position_valid = getattr(track, "fix_position_valid", None)
+    if position_valid is not None and not np.asarray(
+        position_valid, dtype=bool
+    )[[k0, k1]].all():
+        return None
     minimum_fix_status = int(getattr(pose_cfg, "minimum_navsat_status", -1))
     if np.min(np.asarray(track.fix_status)[[k0, k1]]) < minimum_fix_status:
         return None

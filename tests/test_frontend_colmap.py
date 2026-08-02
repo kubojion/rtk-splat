@@ -221,15 +221,25 @@ def _artifact(root: Path) -> Path:
         repo_root=_git_repo(root / "repo"),
     )
     return FrontendArtifactBuilder(segment, root / "work", "sealed").build(
-        rig_config={
-            "rigs": [
-                {
-                    "left_prefix": "left_",
-                    "right_prefix": "right_",
-                    "reference": "left",
-                }
-            ]
-        },
+        rig_config=[
+            {
+                "cameras": [
+                    {
+                        "image_prefix": "left_",
+                        "ref_sensor": True,
+                        "camera_model_name": "PINHOLE",
+                        "camera_params": [1118.7, 1118.7, 965.4, 559.8],
+                    },
+                    {
+                        "image_prefix": "right_",
+                        "cam_from_rig_rotation": [1.0, 0.0, 0.0, 0.0],
+                        "cam_from_rig_translation": [-0.1198, 0.0, 0.0],
+                        "camera_model_name": "PINHOLE",
+                        "camera_params": [1118.7, 1118.7, 965.4, 559.8],
+                    },
+                ]
+            }
+        ],
         keyframes={"frame_ids": [0, 1, 2, 3], "selector": "all"},
         pairs=[
             (f"left_{index:06d}.jpg", f"right_{index:06d}.jpg")
@@ -244,27 +254,27 @@ def _create_colmap_schema(database: Path, names: list[str]) -> None:
     with sqlite3.connect(database) as connection:
         connection.executescript(
             """
-            CREATE TABLE cameras(
+            CREATE TABLE IF NOT EXISTS cameras(
               camera_id INTEGER PRIMARY KEY, model INTEGER, width INTEGER,
               height INTEGER, params BLOB, prior_focal_length INTEGER);
-            CREATE TABLE images(
+            CREATE TABLE IF NOT EXISTS images(
               image_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
               camera_id INTEGER NOT NULL);
-            CREATE TABLE keypoints(
+            CREATE TABLE IF NOT EXISTS keypoints(
               image_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB);
-            CREATE TABLE descriptors(
+            CREATE TABLE IF NOT EXISTS descriptors(
               image_id INTEGER PRIMARY KEY, type INTEGER, rows INTEGER,
               cols INTEGER, data BLOB);
-            CREATE TABLE rigs(
+            CREATE TABLE IF NOT EXISTS rigs(
               rig_id INTEGER PRIMARY KEY, ref_sensor_id INTEGER,
               ref_sensor_type INTEGER);
-            CREATE TABLE frames(frame_id INTEGER PRIMARY KEY, rig_id INTEGER);
-            CREATE TABLE frame_data(
+            CREATE TABLE IF NOT EXISTS frames(frame_id INTEGER PRIMARY KEY, rig_id INTEGER);
+            CREATE TABLE IF NOT EXISTS frame_data(
               frame_id INTEGER, data_id INTEGER, sensor_id INTEGER,
               sensor_type INTEGER);
-            CREATE UNIQUE INDEX frame_sensor_assignment
+            CREATE UNIQUE INDEX IF NOT EXISTS frame_sensor_assignment
               ON frame_data(data_id, sensor_type);
-            CREATE TABLE pose_priors(
+            CREATE TABLE IF NOT EXISTS pose_priors(
               pose_prior_id INTEGER PRIMARY KEY NOT NULL,
               corr_data_id INTEGER NOT NULL,
               corr_sensor_id INTEGER NOT NULL,
@@ -273,23 +283,52 @@ def _create_colmap_schema(database: Path, names: list[str]) -> None:
               position_covariance BLOB,
               gravity BLOB,
               coordinate_system INTEGER NOT NULL);
-            CREATE UNIQUE INDEX pose_prior_data_assignment
+            CREATE UNIQUE INDEX IF NOT EXISTS pose_prior_data_assignment
               ON pose_priors(corr_data_id, corr_sensor_id, corr_sensor_type);
-            CREATE TABLE matches(
+            CREATE TABLE IF NOT EXISTS matches(
               pair_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB);
-            CREATE TABLE two_view_geometries(
+            CREATE TABLE IF NOT EXISTS two_view_geometries(
               pair_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB,
               config INTEGER, F BLOB, E BLOB, H BLOB, qvec BLOB, tvec BLOB);
             """
         )
-        for image_id, name in enumerate(names, start=1):
+        # Real COLMAP appends to an existing database and, with
+        # --ImageReader.single_camera, allocates exactly one camera per
+        # invocation. The A/B runs one invocation per rig sensor.
+        camera_id = int(
             connection.execute(
-                "INSERT INTO cameras VALUES (?, 1, 8, 6, NULL, 1)",
-                (image_id,),
-            )
+                "SELECT COALESCE(MAX(camera_id), 0) + 1 FROM cameras"
+            ).fetchone()[0]
+        )
+        next_image_id = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(image_id), 0) + 1 FROM images"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "INSERT INTO cameras VALUES (?, 1, 8, 6, NULL, 1)",
+            (camera_id,),
+        )
+        rig_id = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(rig_id), 0) + 1 FROM rigs"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "INSERT INTO rigs VALUES (?, ?, 0)",
+            (rig_id, camera_id),
+        )
+        next_frame_id = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(frame_id), 0) + 1 FROM frames"
+            ).fetchone()[0]
+        )
+        for offset, name in enumerate(names):
+            image_id = next_image_id + offset
+            frame_id = next_frame_id + offset
             connection.execute(
                 "INSERT INTO images VALUES (?, ?, ?)",
-                (image_id, name, image_id),
+                (image_id, name, camera_id),
             )
             connection.execute(
                 "INSERT INTO keypoints VALUES (?, 10, 4, ?)",
@@ -299,11 +338,27 @@ def _create_colmap_schema(database: Path, names: list[str]) -> None:
                 "INSERT INTO descriptors VALUES (?, 0, 10, 128, ?)",
                 (image_id, b"descriptors"),
             )
+            # COLMAP 4.1 creates this default singleton rig/frame assignment
+            # during feature extraction. ``rig_configurator`` replaces it
+            # with synchronized multi-sensor frames.
+            connection.execute(
+                "INSERT INTO frames VALUES (?, ?)", (frame_id, rig_id)
+            )
+            connection.execute(
+                "INSERT INTO frame_data VALUES (?, ?, ?, 0)",
+                (frame_id, image_id, camera_id),
+            )
 
 
 def _feature_runner(command: list[str], *, check: bool) -> None:
     assert check
-    images = sorted(path.name for path in Path(_option(command, "--image_path")).iterdir())
+    if "--image_list_path" in command:
+        listing = Path(_option(command, "--image_list_path"))
+        images = [line for line in listing.read_text().splitlines() if line]
+    else:
+        images = sorted(
+            path.name for path in Path(_option(command, "--image_path")).iterdir()
+        )
     _create_colmap_schema(Path(_option(command, "--database_path")), images)
 
 
@@ -317,6 +372,9 @@ def _rig_runner(command: list[str], *, check: bool) -> None:
                 "SELECT image_id, name FROM images"
             )
         }
+        connection.execute("DELETE FROM frame_data")
+        connection.execute("DELETE FROM frames")
+        connection.execute("DELETE FROM rigs")
         connection.execute("INSERT INTO rigs VALUES (1, 1, 0)")
         for frame_id in (1, 2, 3, 4):
             connection.execute("INSERT INTO frames VALUES (?, 1)", (frame_id,))
@@ -382,6 +440,33 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertEqual(_option(gpu, "--image_path"), "/tmp/artifact/images")
         self.assertNotIn("image_list_path", " ".join(gpu))
 
+    def test_extraction_is_one_single_camera_pass_per_rig_sensor(self):
+        """The rig stage needs exactly one camera per sensor.
+
+        Per-image cameras leave the rig configurator unable to group the two
+        sensors, and a single shared camera conflates them. Both previously
+        surfaced only as a late, opaque rig/frame count error.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = _artifact(Path(tmp))
+            run_feature_extraction(
+                artifact, "colmap", profile="gpu", runner=_feature_runner
+            )
+            with sqlite3.connect(artifact / "database.db") as connection:
+                cameras = connection.execute(
+                    "SELECT COUNT(*) FROM cameras"
+                ).fetchone()[0]
+                rows = list(
+                    connection.execute("SELECT name, camera_id FROM images")
+                )
+        self.assertEqual(cameras, 2)
+        for prefix in ("left_", "right_"):
+            assigned = {
+                camera_id for name, camera_id in rows if name.startswith(prefix)
+            }
+            self.assertEqual(len(assigned), 1, f"{prefix} must share one camera")
+        self.assertEqual(len(rows), 8)
+
     def test_rig_and_match_commands_use_sealed_inputs_and_verification(self):
         rig = build_rig_configurator_command("/tmp/artifact", "colmap")
         match = build_matches_importer_command("/tmp/artifact", "colmap")
@@ -396,6 +481,50 @@ class CommandBuilderTests(unittest.TestCase):
 
 
 class ColmapStageTests(unittest.TestCase):
+    def test_colmap_singleton_pre_rig_state_is_accepted_but_malformed_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = _artifact(Path(tmp))
+            run_feature_extraction(
+                artifact, "colmap", profile="gpu", runner=_feature_runner
+            )
+            with sqlite3.connect(artifact / "database.db") as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM rigs").fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM frames").fetchone()[0],
+                    8,
+                )
+                connection.execute(
+                    "UPDATE rigs SET ref_sensor_id=999 WHERE rig_id=1"
+                )
+            with self.assertRaisesRegex(ArtifactError, "singleton pre-rig"):
+                run_rig_configurator(
+                    artifact,
+                    "colmap",
+                    runner=lambda *args, **kwargs: self.fail("must not run"),
+                )
+            self.assertFalse((artifact / "stages" / "rig.json").exists())
+
+    def test_unmarked_preexisting_configured_rig_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = _artifact(Path(tmp))
+            run_feature_extraction(
+                artifact, "colmap", profile="gpu", runner=_feature_runner
+            )
+            _rig_runner(
+                list(build_rig_configurator_command(artifact, "colmap")),
+                check=True,
+            )
+            with self.assertRaisesRegex(ArtifactError, "unmarked/pre-existing"):
+                run_rig_configurator(
+                    artifact,
+                    "colmap",
+                    runner=lambda *args, **kwargs: self.fail("must not run"),
+                )
+            self.assertFalse((artifact / "stages" / "rig.json").exists())
+
     def test_mocked_full_frontend_inserts_exact_cartesian_blob_and_matches(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = _artifact(Path(tmp))

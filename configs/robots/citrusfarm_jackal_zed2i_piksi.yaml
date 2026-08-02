@@ -1,0 +1,78 @@
+# Stable sensor facts for the UCR CitrusFarm Jackal. Sequence files contain
+# bag paths and windows; this profile contains only topics, clock/pose policy,
+# and the published sensor geometry.
+adapter: ros1_citrusfarm
+
+topics:
+  left_image: /zed2i/zed_node/left/image_rect_color
+  right_image: /zed2i/zed_node/right/image_rect_color
+  left_info: /zed2i/zed_node/left/camera_info
+  right_info: /zed2i/zed_node/right/camera_info
+  depth: /zed2i/zed_node/depth/depth_registered
+  depth_info: /zed2i/zed_node/depth/camera_info
+  confidence: /zed2i/zed_node/confidence/confidence_map
+  fix: /piksi/navsatfix_best_fix
+  # NavSatStatus=2 proves ground-based augmentation, not RTK-fixed state.
+  # The receiver's own solution mode is the authority for fixed/float labels.
+  receiver_state: /piksi/debug/receiver_state
+
+gnss_quality:
+  receiver_state_required: true
+  receiver_state_association_tolerance_s: 0.15
+  # The recorded NavSatFix uses COVARIANCE_TYPE_APPROXIMATED and the same
+  # driver-configured matrix each epoch; it is not live receiver accuracy.
+  covariance_provenance: driver_static_nominal
+  covariance_is_live_per_epoch: false
+
+pose:
+  source: gnss_course
+  # Every sequence must supply and audit pose.time_offset_s: device-clock
+  # alignment is a recording fact, not a permanent robot calibration.
+  yaw_smooth_window: 5
+  min_course_speed_ms: 0.20
+  minimum_navsat_status: 2
+  minimum_position_carrier_status: 2
+  maximum_position_covariance_m2: 0.04
+  use_imu_tilt: false
+
+frontend:
+  pose_priors:
+    # The adapter associates the receiver's verified fix_mode to NavSatFix.
+    min_fix_status: 2
+    min_carrier_status: 2
+    covariance_floor_m: 0.05
+    max_covariance_m2: 0.04
+    max_source_residual_s: 0.15
+
+sensor_geometry:
+  # The official Kalibr chain terminates at the raw left optical frame. The
+  # adapter composes recorded CameraInfo.R to publish the rectified frame used
+  # by COLMAP (R is exactly identity in sequence 05, but this stays generic).
+  extrinsic_camera_geometry: raw_left
+  frames:
+    world: map
+    camera: zed2i_left_camera_optical_frame
+    # CitrusFarm has one receiver, so its orientation is not measured. For
+    # pose construction this named frame has body/lidar-aligned axes and its
+    # origin at the published GPS phase centre.
+    primary_antenna: gps_receiver_body_aligned_phase_center
+  # p_camera = T_camera_primary_antenna * p_antenna.
+  # Derived, without fitting this sequence, as:
+  #   T_cam1_cam0 * inverse(T_lidar_cam0) * T_lidar_gps
+  # using the official UCR calibration results listed below.
+  T_camera_primary_antenna:
+    - [0.026234841320, -0.999648165195, 0.003908826209, 0.060535141536]
+    - [-0.009163740751, -0.004150497990, -0.999949398331, -0.309152932606]
+    - [0.999613804905, 0.026197694323, -0.009269404284, -0.424344392950]
+    - [0.0, 0.0, 0.0, 1.0]
+  extrinsic_translation_sigma_m: [0.05, 0.05, 0.05]
+  extrinsic_provenance:
+    method: official UCR multi-camera and lidar-camera calibration composed with CAD lidar-GPS translation
+    status: published calibration; GPS axes explicitly assumed body/lidar-aligned because a single receiver has no measured orientation
+    sources:
+      - url: https://ucr-robotics.s3.us-west-2.amazonaws.com/citrus-farm-dataset/Calibration/results/01-multi-cam-result.yaml
+        sha256: e903a94947658fc701077a191cfd7df74e03b8e9411949cc653cdd9208cf5cfe
+      - url: https://ucr-robotics.s3.us-west-2.amazonaws.com/citrus-farm-dataset/Calibration/results/03-lidar-cam-result.txt
+        sha256: 9d2274b18f6f0739031f7f145b2b05784068150cc87283abbd85f89f0eb4c334
+      - url: https://ucr-robotics.s3.us-west-2.amazonaws.com/citrus-farm-dataset/Calibration/results/04-lidar-gps-result.txt
+        sha256: df2ccdcb23c966d345cae496390f8fdd40941051800322b9cc951623ec1a7e51

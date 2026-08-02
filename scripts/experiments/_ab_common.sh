@@ -299,7 +299,7 @@ segment = (
     )
 ).resolve()
 reader = SegmentReader(segment).validate()
-expected, expected_train, expected_val = map(int, sys.argv[2:])
+expected, expected_train, expected_val = map(int, sys.argv[2:5])
 if reader.meta["n_frames"] != expected:
     raise SystemExit(
         f"expected {expected} headland frames, found {reader.meta['n_frames']}"

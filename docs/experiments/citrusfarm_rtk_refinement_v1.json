@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "experiment_id": "citrusfarm_05_13d_rtk_refinement_v1_2026-08-01",
+  "recorded_at": "2026-08-01T13:19:50+02:00",
+  "status": "rejected_by_predeclared_quality_gates",
+  "publication_policy": {
+    "pose_artifact_published": false,
+    "cloud_artifact_published": false,
+    "gaussian_splat_run_started": false,
+    "reason": "The refined reconstruction failed the independent held-out RTK absolute gates and track-retention gate."
+  },
+  "provenance": {
+    "git_head_at_run": "d599f938d4f81dc95ab82b8ce3e14d632b4327ce",
+    "source_state_note": "The implementation was uncommitted during this rejected A/B. The hashes below are a post-run snapshot containing resume-efficiency and fail-closed sealing fixes; the sealed artifact records the exact solver command and inputs used by the run.",
+    "workdir": "/home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_v1",
+    "source_backend": "citrus-05-13d-543-735-global-bounded-v1",
+    "refinement_artifact": "citrus-05-13d-543-735-rtk-refined-v1",
+    "post_run_source_sha256": {
+      "configs/sequences/citrusfarm_05_13d_uturn.yaml": "d961766a83927a6950dbde0588e98e1e06068eb6c96ae1cd0d20c375f66d8f89",
+      "rtk_splat/backends/rtk_refinement.py": "f6b402c080f3308c6f4124396dc5757210ef999ae85d5d18c8e8f048d101bacb",
+      "rtk_splat/backends/mapper.py": "bc3457c9ca157c260497c34d985f57c00478f7bd9da3dddb922470630cde35fb",
+      "rtk_splat/workflows/cli.py": "8654fa0289eec89055259e8e6028d5d2326fbe1244d078db65e66c5abc4db36a",
+      "scripts/runs/refine_existing_backend.sh": "11766664e747ba38e43347c19190d10022f18c37856a0e3971c4e090796d10e5"
+    }
+  },
+  "method": {
+    "name": "rtk_position_constrained_stereo_pose_refinement",
+    "implementation": "COLMAP 4.1.1 pose_prior_mapper continuation",
+    "strict_se3_only": false,
+    "prior_factor": "camera_position_only",
+    "dual_antenna_heading_factor": false,
+    "intrinsics_frozen": true,
+    "rig_extrinsics_frozen": true,
+    "robust_loss": "Cauchy",
+    "prior_position_loss_scale": 2.795,
+    "global_ba_iterations": 50,
+    "global_ba_refinements": 3
+  },
+  "refinement_factor_holdout_evaluation": {
+    "scope": {
+      "independent_of": [
+        "rtk_position_refinement_factors",
+        "refinement_alignment_fit"
+      ],
+      "not_independent_of": [
+        "upstream_rtk_guided_keyframe_and_pair_planning"
+      ]
+    },
+    "split_method": "contiguous_rank_blocks_alternating_v1",
+    "calibration_block_ids": [0, 2, 4],
+    "holdout_block_ids": [1, 3],
+    "n_evaluation_priors": 1495,
+    "n_optimizer_priors": 897,
+    "n_physically_removed_holdout_priors": 598,
+    "source": {
+      "median_residual_m": 0.2662515907975873,
+      "robust_support_fraction": 0.5919732441471572,
+      "inlier_p95_residual_m": 0.3151034864227777,
+      "full_p95_residual_m": 0.6538075206054229
+    },
+    "refined": {
+      "median_residual_m": 0.2490394377935407,
+      "robust_support_fraction": 0.6722408026755853,
+      "inlier_p95_residual_m": 0.3033925874020382,
+      "full_p95_residual_m": 0.5012746272612492
+    },
+    "median_improvement_m": 0.017212153004046604,
+    "absolute_gates_passed": false
+  },
+  "visual_and_metric_integrity": {
+    "registered_frames": 1495,
+    "registered_stereo_images": 2990,
+    "registration_fraction": 1.0,
+    "source_mean_reprojection_error_px": 0.972732,
+    "refined_mean_reprojection_error_px": 0.67439,
+    "source_mean_track_length": 30.433427,
+    "refined_mean_track_length": 6.839838,
+    "track_length_retention": 0.2247475448624304,
+    "source_stereo_baseline_median_m": 0.11988516625889226,
+    "refined_stereo_baseline_median_m": 0.11988516625889213,
+    "stereo_baseline_max_change_m": 1.4030443473700416e-14,
+    "trajectory_similarity_scale": 1.0039864651454566,
+    "calibration_max_numeric_change": 1.3877787807814457e-17
+  },
+  "resources": {
+    "solver_wall_time_s": 1911.398743614991,
+    "solver_peak_process_rss_bytes": 6935175168,
+    "solver_minimum_system_available_bytes": 8930070528,
+    "solver_minimum_disk_free_bytes": 64028667904,
+    "private_database_size_bytes": 4852965376
+  },
+  "sealed_file_sha256": {
+    "refinement_plan.json": "55b350b24baf582d8881fc38f7206b5fc7f1094e4c02c21f05d0d6630d8e27a4",
+    "prior_split.json": "a5d15af07d21f8c939d5ffe96dc74ecda1b428d9c6c149a356f3c3e75db9efa5",
+    "optimizer_database.json": "aadb18c693b7000430b1744afde11041d8a2bcc18d197f60bb869dc7f78c31f1",
+    "refined_model_manifest.json": "233055a795ab05deee7dbd63d33c9b512ee07f660ae56666628782fd204bde3a",
+    "refined_text_manifest.json": "853501c5274d42651a9a02c7231dd03d9da04fb3c01974d18456d72eee48ecbe",
+    "stages/prepare.json": "0a0e74164300b38f706367fa56a0081f3edd2c72bb2ae0d079bb553136775716",
+    "stages/refine.json": "74d3a00e0fef909546db2dec6abccdf257a95be9cac9dadf5ac9fd60284c92ed",
+    "stages/quality.json": "552f8ba5141469bf993f8b32e84751b5a4c60a1a46f1868b35b29550df749d55",
+    "reports/refine.json": "1cf4963de1559669a3b06b03ccd520c9fa8fd610323b11df4b2eb9a28d763e19",
+    "reports/quality.json": "7a5aaec6d12bdeacb4df3656a70993fb2a48d0044bb6bccf34873f04a0716596"
+  }
+}

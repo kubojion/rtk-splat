@@ -1,8 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from rtk_splat.core.configio import _deep_merge, load_config
+from rtk_splat.workflows.cli import _mapper_config
 
 
 class ConfigProfileTests(unittest.TestCase):
@@ -147,6 +149,49 @@ class ConfigProfileTests(unittest.TestCase):
             # preserves their value without knowing their semantics.
             self.assertEqual(cfg.paths.ublox_msgs_dir, "~/msgs")
             self.assertEqual(cfg.pose.source, "rtk_dual_antenna")
+
+    def test_deprecated_global_mapper_section_is_rejected_loudly(self):
+        cfg = SimpleNamespace(
+            global_mapper=SimpleNamespace(max_num_tracks=60_000)
+        )
+        with self.assertRaisesRegex(ValueError, "deprecated 'global_mapper:'"):
+            _mapper_config(cfg, SimpleNamespace(backend=None))
+
+    def test_headland_reproduction_uses_canonical_bounded_mapper(self):
+        config = (
+            Path(__file__).resolve().parents[1]
+            / "configs/reproductions/headland_stereo_ba.yaml"
+        )
+        cfg = load_config(config)
+        self.assertFalse(hasattr(cfg, "global_mapper"))
+        mapper = _mapper_config(cfg, SimpleNamespace(backend=None))
+        self.assertEqual(mapper.keep_max_num_tracks, 60_000)
+        self.assertEqual(mapper.track_required_tracks_per_view, 1_000)
+        self.assertTrue(mapper.skip_retriangulation)
+        self.assertFalse(mapper.gp_use_gpu)
+        self.assertFalse(mapper.ba_ceres_use_gpu)
+        # Read-only replay of the accepted reduced-global model through the
+        # current covariance-aware, five-block temporal holdout evaluator.
+        golden_holdout = {
+            "median_m": 0.09891653002379946,
+            "p95_inliers_m": 0.12088889251051756,
+            "inlier_fraction": 1.0,
+        }
+        self.assertLessEqual(
+            golden_holdout["median_m"], mapper.max_rtk_median_error_m
+        )
+        self.assertLessEqual(
+            golden_holdout["p95_inliers_m"],
+            mapper.max_rtk_p95_inlier_error_m,
+        )
+        self.assertGreaterEqual(
+            golden_holdout["inlier_fraction"], mapper.min_rtk_inlier_fraction
+        )
+        # Keep the reproduction allowance bounded: these are not permissive
+        # fallback settings for a failed or grossly mis-georeferenced solve.
+        self.assertLessEqual(mapper.max_rtk_median_error_m, 0.12)
+        self.assertLessEqual(mapper.max_rtk_p95_inlier_error_m, 0.15)
+        self.assertGreaterEqual(mapper.min_rtk_inlier_fraction, 0.95)
 
 
 if __name__ == "__main__":

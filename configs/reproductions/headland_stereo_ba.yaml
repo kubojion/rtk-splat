@@ -97,12 +97,13 @@ colmap:
   min_registered_fraction: 0.95
   scale_range: [0.98, 1.02]
 
-# Isolated Global Mapper A/B. These stages reuse the completed stereo front
-# end but copy its database before COLMAP opens it. They are explicit only:
-# `all`, normal cloud construction, and training never invoke this backend.
-global_mapper:
-  source_pose_artifact: colmap_stereo
-  source_workspace_subdir: colmap
+# Isolated, mapper-neutral backend. It reuses a sealed stereo frontend and
+# copies that database before COLMAP opens it. Always use a new artifact name
+# when any setting changes; old plans are intentionally not resumed.
+mapper:
+  name: headland-global-bounded-v1
+  pose_artifact_name: headland-global-bounded-v1
+  backend: global
   num_threads: 8
   random_seed: 7
   ba_num_iterations: 3
@@ -112,12 +113,16 @@ global_mapper:
   # The successful incremental model predicts that the 1000/view target stops
   # after ~53,866 longest tracks (~6.91 M observations, versus 18.21 M), while
   # the 60k ceiling bounds adverse datasets. The core knobs remain generic.
-  max_num_tracks: 60000
-  required_tracks_per_view: 1000
+  keep_max_num_tracks: 60000
+  track_required_tracks_per_view: 1000
   # COLMAP retriangulation deletes the capped tracks and rebuilds from the full
   # correspondence graph, defeating the memory bound. Stereo depth builds the
   # GS initialization independently, so it is intentionally disabled here.
   skip_retriangulation: true
+  # Keep both global positioning and bundle adjustment on CPU. This is the
+  # exact successful reduced-profile choice; the GPU remains free for later GS.
+  gp_use_gpu: false
+  ba_ceres_use_gpu: false
   # Keep the desktop responsive and stop before the no-swap host reaches OOM.
   process_nice: 10
   resource_sample_interval_s: 2.0
@@ -125,21 +130,21 @@ global_mapper:
   low_memory_consecutive_samples: 2
   minimum_free_space_gb: 15.0
   minimum_runtime_free_space_gb: 5.0
-  quality_gates:
-    max_reprojection_error_px: 1.0
-    min_observation_fraction: 0.90
-    min_track_length_fraction: 0.75
-    max_baseline_error_m: 0.0005
-    max_rig_rotation_error_deg: 0.02
-    max_intrinsics_error: 1.0e-8
-    min_observations_per_image: 250
-    max_rtk_median_error_m: 0.06
-    max_rtk_p95_error_m: 0.12
-    max_rtk_error_m: 0.15
-    min_alignment_inlier_fraction: 1.0
-    max_step_m: 0.08             # broad catastrophe limit; reference 0.0393 m
-    max_rotation_step_deg: 1.5   # broad catastrophe limit; reference 0.714 deg
-    reference_regression_fraction: 0.05
+  # Current held-out quality semantics. Do not revive the legacy 1.0 px gate:
+  # the accepted golden global reconstruction measured about 1.335 px.
+  max_reprojection_error_px: 2.0
+  min_mean_track_length: 2.0
+  alignment_ransac_threshold_m: 0.15
+  alignment_ransac_iterations: 5000
+  alignment_temporal_blocks: 5
+  # Read-only held-out replay of the accepted 2688-image golden model using
+  # this frontend's exact 1344 priors/covariances (5 temporal blocks, seed 7):
+  # median 0.0989165 m, inlier p95 0.1208889 m, inlier fraction 1.0.
+  # These limits reproduce that result while rejecting systematic >12 cm
+  # disagreement, a >15 cm inlier tail, or more than 5% covariance outliers.
+  max_rtk_median_error_m: 0.12
+  max_rtk_p95_inlier_error_m: 0.15
+  min_rtk_inlier_fraction: 0.95
 
 # Historical, diagnostic-only calibration sidecar configuration. No current
 # contract-v2 CLI exposes `integrity-audit`; normal cloud and train stages

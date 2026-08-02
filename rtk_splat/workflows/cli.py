@@ -45,6 +45,15 @@ def _section(cfg, name: str) -> SimpleNamespace:
     return value if isinstance(value, SimpleNamespace) else SimpleNamespace()
 
 
+def _reject_deprecated_mapper_section(cfg) -> None:
+    if hasattr(cfg, "global_mapper"):
+        raise ValueError(
+            "deprecated 'global_mapper:' configuration is not supported; "
+            "move the current MapperConfig options under canonical 'mapper:' "
+            "and prepare a new backend artifact"
+        )
+
+
 def _dataclass_options(section: Any, cls, *, base: dict[str, Any] | None = None):
     values = {} if base is None else dict(base)
     allowed = {item.name for item in fields(cls)}
@@ -92,10 +101,12 @@ def _frontend_path(cfg, args) -> Path:
 
 
 def _backend_kind(cfg, args) -> str:
+    _reject_deprecated_mapper_section(cfg)
     return str(args.backend or getattr(_section(cfg, "mapper"), "backend", "global"))
 
 
 def _backend_name(cfg, args) -> str:
+    _reject_deprecated_mapper_section(cfg)
     return str(
         args.backend_name
         or getattr(_section(cfg, "mapper"), "name", None)
@@ -105,6 +116,23 @@ def _backend_name(cfg, args) -> str:
 
 def _backend_path(cfg, args) -> Path:
     return Path(cfg.paths.workdir) / "backend_artifacts" / _backend_name(cfg, args)
+
+
+def _refinement_name(cfg, args) -> str:
+    configured = getattr(_section(cfg, "rtk_refinement"), "name", None)
+    return str(
+        args.refinement_name
+        or configured
+        or f"{_backend_name(cfg, args)}-rtk-refined"
+    )
+
+
+def _refinement_path(cfg, args) -> Path:
+    return (
+        Path(cfg.paths.workdir)
+        / "refinement_artifacts"
+        / _refinement_name(cfg, args)
+    )
 
 
 def _pose_name(cfg, args) -> str:
@@ -313,12 +341,25 @@ def cmd_frontend_match(cfg, args) -> None:
 def _mapper_config(cfg, args):
     from rtk_splat.backends.mapper import MapperConfig
 
+    _reject_deprecated_mapper_section(cfg)
     mapper_values = dict(vars(_section(cfg, "mapper")))
     mapper_values.pop("name", None)
     mapper_values.pop("pose_artifact_name", None)
     if args.backend is not None:
         mapper_values["backend"] = args.backend
     return _dataclass_options(mapper_values, MapperConfig)
+
+
+def _rtk_refinement_config(cfg, args):
+    from rtk_splat.backends.rtk_refinement import RtkRefinementConfig
+
+    values = dict(vars(_section(cfg, "rtk_refinement")))
+    values.pop("name", None)
+    if args.initialization_mode is not None:
+        values["initialization_mode"] = args.initialization_mode
+    if args.prior_position_loss is not None:
+        values["prior_position_loss"] = args.prior_position_loss
+    return _dataclass_options(values, RtkRefinementConfig)
 
 
 def cmd_backend_prepare(cfg, args) -> None:
@@ -353,6 +394,18 @@ def cmd_backend_quality(cfg, args) -> None:
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
+def cmd_backend_refine_rtk(cfg, args) -> None:
+    from rtk_splat.backends.rtk_refinement import run_rtk_refinement
+
+    report = run_rtk_refinement(
+        _backend_path(cfg, args),
+        _refinement_path(cfg, args),
+        _colmap(cfg),
+        config=_rtk_refinement_config(cfg, args),
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
 def cmd_backend_export(cfg, args) -> None:
     from rtk_splat.backends.mapper import export_pose_artifact
 
@@ -360,6 +413,11 @@ def cmd_backend_export(cfg, args) -> None:
         _backend_path(cfg, args),
         _pose_name(cfg, args),
         output_root=Path(cfg.paths.workdir) / "pose_artifacts",
+        refinement_workspace=(
+            _refinement_path(cfg, args)
+            if args.refinement_name is not None
+            else None
+        ),
     )
     print(f"fixed-scale ENU pose artifact -> {output}")
 
@@ -460,6 +518,7 @@ COMMANDS = {
     "backend-solve": cmd_backend_solve,
     "backend-register": cmd_backend_register,
     "backend-quality": cmd_backend_quality,
+    "backend-refine-rtk": cmd_backend_refine_rtk,
     "backend-export": cmd_backend_export,
     "cloud": cmd_cloud,
     "train": cmd_train,
@@ -486,6 +545,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--backend", choices=("global", "incremental"))
     parser.add_argument("--backend-name")
+    parser.add_argument("--refinement-name")
+    parser.add_argument(
+        "--initialization-mode",
+        choices=("continuation", "fresh"),
+        help=(
+            "pose-prior mapper initialization for backend-refine-rtk only; "
+            "fresh omits the existing visual model"
+        ),
+    )
+    parser.add_argument(
+        "--prior-position-loss",
+        choices=("cauchy", "trivial"),
+        help="RTK position-prior loss for backend-refine-rtk only",
+    )
     parser.add_argument("--pose-name")
     parser.add_argument("--run-name")
     parser.add_argument("--train-iters", type=int)
@@ -504,6 +577,20 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--train-iters must be positive")
     if args.expected_frames is not None and args.expected_frames <= 0:
         raise ValueError("--expected-frames must be positive")
+    if (
+        args.prior_position_loss is not None
+        and args.stage != "backend-refine-rtk"
+    ):
+        raise ValueError(
+            "--prior-position-loss is valid only for backend-refine-rtk"
+        )
+    if (
+        args.initialization_mode is not None
+        and args.stage != "backend-refine-rtk"
+    ):
+        raise ValueError(
+            "--initialization-mode is valid only for backend-refine-rtk"
+        )
     cfg = load_config(args.config)
     if args.workdir is not None:
         cfg.paths.workdir = args.workdir.expanduser()

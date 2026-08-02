@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,8 @@ import numpy as np
 
 from rtk_splat.backends.mapper import (
     MapperConfig,
+    _MonitoredProcessInterrupted,
+    _run_monitored_mapper,
     build_mapper_command,
     build_registration_command,
     estimate_rigid_alignment,
@@ -19,6 +23,7 @@ from rtk_splat.backends.mapper import (
     prepare_mapper_backend,
     quality_summary,
     registered_names_from_images_txt,
+    rtk_residual_quality,
     run_image_registration,
     run_mapper_solve,
     run_quality_summary,
@@ -39,7 +44,11 @@ def _option(command, name: str) -> str:
     return command[command.index(name) + 1]
 
 
-def _frontend(root: Path) -> tuple[Path, list[str]]:
+def _frontend(
+    root: Path,
+    *,
+    prior_offsets_m: dict[int, np.ndarray] | None = None,
+) -> tuple[Path, list[str]]:
     artifact = root / "frontend"
     (root / "immutable-segment").mkdir()
     images = artifact / "images"
@@ -116,6 +125,8 @@ def _frontend(root: Path) -> tuple[Path, list[str]]:
                     dtype="<f8",
                 )
                 target_center = source_center + np.array([10.0, 20.0, 3.0])
+                if prior_offsets_m and frame_id in prior_offsets_m:
+                    target_center += prior_offsets_m[frame_id]
                 covariance = np.diag([1e-4, 1e-4, 4e-4]).astype("<f8")
                 connection.execute(
                     """
@@ -239,6 +250,16 @@ class MapperBackendTests(unittest.TestCase):
                 _option(global_command, "--GlobalMapper.image_list_path"),
                 str(global_work / "solve_images.txt"),
             )
+            expected_global = {
+                "--GlobalMapper.ba_num_iterations": "3",
+                "--GlobalMapper.gp_use_gpu": "0",
+                "--GlobalMapper.ba_ceres_use_gpu": "0",
+                "--GlobalMapper.keep_max_num_tracks": "60000",
+                "--GlobalMapper.track_required_tracks_per_view": "1000",
+                "--GlobalMapper.skip_retriangulation": "1",
+            }
+            for option, value in expected_global.items():
+                self.assertEqual(_option(global_command, option), value)
             self.assertEqual(
                 incremental_command[:2], ("/x/colmap", "mapper")
             )
@@ -246,6 +267,8 @@ class MapperBackendTests(unittest.TestCase):
                 _option(incremental_command, "--Mapper.image_list_path"),
                 str(incremental_work / "solve_images.txt"),
             )
+            self.assertNotIn("--GlobalMapper.keep_max_num_tracks", incremental_command)
+            self.assertNotIn("--log_target", incremental_command)
             self.assertEqual(
                 (global_work / "database.db").read_bytes(),
                 (incremental_work / "database.db").read_bytes(),
@@ -281,6 +304,63 @@ class MapperBackendTests(unittest.TestCase):
             (workspace / "database.db").write_bytes(b"tampered")
             with self.assertRaisesRegex(ArtifactError, "snapshot changed"):
                 build_mapper_command(workspace, "colmap")
+
+    def test_mapper_configuration_validation_is_strict(self):
+        invalid = (
+            {"ba_num_iterations": 0},
+            {"keep_max_num_tracks": 0},
+            {"track_required_tracks_per_view": -1},
+            {"skip_retriangulation": 1},
+            {"gp_use_gpu": "false"},
+            {"ba_ceres_use_gpu": 0},
+            {"process_nice": 20},
+            {"resource_sample_interval_s": 0.0},
+            {"minimum_available_memory_gb": float("nan")},
+            {"low_memory_consecutive_samples": 0},
+            {"rtk_chi2_inlier_probability": 1.0},
+            {"max_rtk_median_mahalanobis_sq": 0.0},
+            {"min_rtk_chi2_inlier_fraction": 0.0},
+            {"rtk_covariance_gate_mode": "guess"},
+            {
+                "minimum_free_space_gb": 1.0,
+                "minimum_runtime_free_space_gb": 2.0,
+            },
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                MapperConfig(**values)
+
+    def test_backend_plan_must_freeze_the_complete_mapper_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frontend, _ = _frontend(root)
+            workspace = prepare_mapper_backend(frontend, root / "backend")
+            plan_path = workspace / "backend_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["config"].pop("keep_max_num_tracks")
+            _write_json(plan_path, plan)
+            with self.assertRaisesRegex(ArtifactError, "predates.*new backend"):
+                build_mapper_command(workspace, "colmap")
+
+    def test_legacy_plan_backfills_only_new_evaluation_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frontend, _ = _frontend(root)
+            workspace = prepare_mapper_backend(frontend, root / "backend")
+            plan_path = workspace / "backend_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            for field in (
+                "rtk_chi2_inlier_probability",
+                "max_rtk_median_mahalanobis_sq",
+                "min_rtk_chi2_inlier_fraction",
+                "rtk_covariance_gate_mode",
+            ):
+                plan["config"].pop(field)
+            _write_json(plan_path, plan)
+            self.assertEqual(
+                build_mapper_command(workspace, "colmap")[:2],
+                ("colmap", "global_mapper"),
+            )
 
     def test_prepare_recovers_a_verified_snapshot_only_partial_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,6 +412,10 @@ class MapperBackendTests(unittest.TestCase):
             solve = run_mapper_solve(workspace, "colmap", runner=runner)
             self.assertTrue(solve["all_keyframes_registered"])
             self.assertEqual(solve["n_expected_solve_images"], 4)
+            self.assertEqual(solve["resources"]["monitor"], "injected-runner")
+            samples = workspace / solve["resources"]["samples_csv"]
+            self.assertTrue(samples.is_file())
+            self.assertTrue(samples.with_name("resource_usage.json").is_file())
             self.assertEqual(
                 build_registration_command(workspace, "colmap")[1],
                 "image_registrator",
@@ -414,6 +498,45 @@ class MapperBackendTests(unittest.TestCase):
             )
             self.assertEqual(len(runner.commands), commands_before)
 
+    def test_failed_pose_gate_writes_idempotent_diagnostics_without_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frontend, names = _frontend(
+                root,
+                prior_offsets_m={
+                    2: np.array([0.5, 0.0, 0.0]),
+                    4: np.array([0.5, 0.0, 0.0]),
+                },
+            )
+            workspace = prepare_mapper_backend(frontend, root / "backend")
+            runner = _ColmapRunner(names)
+            run_mapper_solve(workspace, "colmap", runner=runner)
+            run_image_registration(workspace, "colmap", runner=runner)
+            run_quality_summary(workspace, "colmap", runner=runner)
+            pose_root = root / "pose_artifacts"
+            for _ in range(2):
+                with self.assertRaisesRegex(ArtifactError, "diagnostics:"):
+                    export_pose_artifact(
+                        workspace,
+                        "rejected",
+                        output_root=pose_root,
+                    )
+            reports = list(
+                (workspace / "reports").glob(
+                    "pose_export_alignment_rejected_*.json"
+                )
+            )
+            self.assertEqual(len(reports), 1)
+            diagnostic = json.loads(reports[0].read_text(encoding="utf-8"))
+            self.assertFalse(diagnostic["passed"])
+            self.assertIsNone(
+                diagnostic["checks"][
+                    "p95_holdout_inlier_rtk_residual_m"
+                ]["value"]
+            )
+            self.assertFalse((pose_root / "rejected").exists())
+            self.assertFalse(list(pose_root.glob(".rejected.writing-*")))
+
     def test_failed_solve_cleans_partial_output_and_can_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -429,10 +552,78 @@ class MapperBackendTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
                 run_mapper_solve(workspace, "colmap", runner=fail_after_partial)
             self.assertFalse((workspace / "solve.incomplete").exists())
+            failed_usage = json.loads(
+                (
+                    workspace
+                    / "attempts/solve/attempt-0001/resource_usage.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(failed_usage["exception"], "RuntimeError")
             solve = run_mapper_solve(
                 workspace, "colmap", runner=_ColmapRunner(names)
             )
             self.assertTrue(solve["all_keyframes_registered"])
+            self.assertTrue(
+                (
+                    workspace
+                    / "attempts/solve/attempt-0002/resource_usage.json"
+                ).is_file()
+            )
+
+    def test_linux_resource_monitor_records_success_nonzero_and_safe_abort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            solve_root = root / "attempts" / "solve"
+            solve_root.mkdir(parents=True)
+            safe = MapperConfig(
+                process_nice=0,
+                resource_sample_interval_s=0.01,
+                minimum_available_memory_gb=0.001,
+                minimum_free_space_gb=0.01,
+                minimum_runtime_free_space_gb=0.005,
+            )
+            success_dir = solve_root / "attempt-0001"
+            success_dir.mkdir()
+            success = _run_monitored_mapper(
+                (sys.executable, "-c", "pass"), success_dir, safe
+            )
+            self.assertEqual(success["returncode"], 0)
+            self.assertFalse(success["safety_aborted"])
+
+            failure_dir = solve_root / "attempt-0002"
+            failure_dir.mkdir()
+            with self.assertRaises(subprocess.CalledProcessError):
+                _run_monitored_mapper(
+                    (sys.executable, "-c", "raise SystemExit(7)"),
+                    failure_dir,
+                    safe,
+                )
+            failure = json.loads(
+                (failure_dir / "resource_usage.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failure["returncode"], 7)
+
+            abort_dir = solve_root / "attempt-0003"
+            abort_dir.mkdir()
+            abort_config = MapperConfig(
+                process_nice=0,
+                resource_sample_interval_s=0.01,
+                minimum_available_memory_gb=1.0e9,
+                low_memory_consecutive_samples=1,
+                minimum_free_space_gb=0.01,
+                minimum_runtime_free_space_gb=0.005,
+            )
+            with self.assertRaises(_MonitoredProcessInterrupted):
+                _run_monitored_mapper(
+                    (sys.executable, "-c", "import time; time.sleep(60)"),
+                    abort_dir,
+                    abort_config,
+                )
+            aborted = json.loads(
+                (abort_dir / "resource_usage.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(aborted["safety_aborted"])
+            self.assertIn("MemAvailable", aborted["safety_abort_reason"])
 
     def test_exact_registration_and_quality_hooks_report_failures(self):
         stats = parse_model_analyzer(_analyzer_output(2))
@@ -578,6 +769,107 @@ class MapperBackendTests(unittest.TestCase):
                 )
             ),
             1e-9,
+        )
+
+    @staticmethod
+    def _consistent_covariance_residuals(scale: float = 1.0):
+        covariance = np.array(
+            [
+                [4.0e-4, 1.2e-4, 0.4e-4],
+                [1.2e-4, 9.0e-4, -0.6e-4],
+                [0.4e-4, -0.6e-4, 16.0e-4],
+            ],
+            dtype=np.float64,
+        )
+        standardized = np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.8, 0.8, 0.8],
+                [-0.7, 0.4, -0.5],
+            ]
+            * 8,
+            dtype=np.float64,
+        )
+        covariance_batch = np.repeat(
+            (covariance * scale**2)[None], len(standardized), axis=0
+        )
+        residuals = standardized @ np.linalg.cholesky(covariance).T * scale
+        return residuals, covariance_batch
+
+    def test_covariance_gate_accepts_high_quality_consistent_residuals(self):
+        residuals, covariance = self._consistent_covariance_residuals()
+        quality = rtk_residual_quality(
+            residuals,
+            covariance,
+            np.ones(len(residuals), dtype=bool),
+            config=MapperConfig(rtk_covariance_gate_mode="enforce"),
+        )
+        self.assertTrue(quality["passed"])
+        self.assertEqual(quality["degrees_of_freedom"], 3)
+        self.assertTrue(
+            quality["checks"]["median_holdout_rtk_mahalanobis_sq"][
+                "passed"
+            ]
+        )
+
+    def test_covariance_gate_accepts_degraded_but_consistent_accuracy(self):
+        baseline_residuals, baseline_covariance = (
+            self._consistent_covariance_residuals()
+        )
+        residuals, covariance = self._consistent_covariance_residuals(scale=10.0)
+        permissive_absolute_caps = MapperConfig(
+            max_rtk_median_error_m=0.5,
+            max_rtk_p95_inlier_error_m=0.7,
+            rtk_covariance_gate_mode="enforce",
+        )
+        baseline = rtk_residual_quality(
+            baseline_residuals,
+            baseline_covariance,
+            np.ones(len(residuals), dtype=bool),
+            config=permissive_absolute_caps,
+        )
+        degraded = rtk_residual_quality(
+            residuals,
+            covariance,
+            np.ones(len(residuals), dtype=bool),
+            config=permissive_absolute_caps,
+        )
+        self.assertTrue(degraded["passed"])
+        np.testing.assert_allclose(
+            degraded["mahalanobis_sq"]["values"],
+            baseline["mahalanobis_sq"]["values"],
+            atol=1e-12,
+        )
+        self.assertGreater(
+            degraded["residual_m"]["median"],
+            baseline["residual_m"]["median"] * 9.9,
+        )
+
+    def test_covariance_gate_rejects_systematic_mismatch(self):
+        _, covariance = self._consistent_covariance_residuals()
+        residuals = np.repeat([[0.20, 0.0, 0.0]], len(covariance), axis=0)
+        quality = rtk_residual_quality(
+            residuals,
+            covariance,
+            np.ones(len(residuals), dtype=bool),
+            config=MapperConfig(
+                max_rtk_median_error_m=1.0,
+                max_rtk_p95_inlier_error_m=1.0,
+                rtk_covariance_gate_mode="enforce",
+            ),
+        )
+        self.assertFalse(quality["passed"])
+        self.assertFalse(
+            quality["checks"]["median_holdout_rtk_mahalanobis_sq"][
+                "passed"
+            ]
+        )
+        self.assertFalse(
+            quality["checks"]["holdout_rtk_chi2_inlier_fraction"][
+                "passed"
+            ]
         )
 
     def test_temporal_holdout_requires_enough_independent_calibration_data(self):

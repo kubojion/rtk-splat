@@ -50,15 +50,21 @@ contract-v2 path:
   incremental backends are implemented.
 - Phase 4: adaptive solve keyframes and RTK-guided bounded matching are
   implemented.
+- A ROS 1 ordered-bag adapter, staged reproduction launcher, and optional
+  factor-held-out RTK position-refinement backend are implemented for the CitrusFarm
+  sequence-05 window at 543--735 s.
 
 The normalized 1,344-frame headland contract-v2 migration is complete and
 hash-recorded. Phases 3 and 4 are prepared and covered by synthetic/unit tests,
 but the GPU-versus-CPU feature A/B and the
 all/dense/balanced/sparse keyframe A/B have not yet been run through COLMAP and
 GS from that segment. Do not confuse the historical Global result above with
-validation of the new frontend.
-RTK-anchored submaps, CitrusFarm support, and rendering-quality experiments
-(Phases 5--7) remain out of scope for this implementation.
+validation of the new frontend. The full Citrus window has completed ingest,
+SGBM, a sealed frontend, and a 2,990-image visual reconstruction. Both its
+visual-only export and a separate 897-prior/598-holdout position-refinement A/B
+failed the refinement-factor holdout RTK gates, so no Citrus pose, GS model, or rendering
+score is accepted. Bounded custom RTK-factor submaps and rendering-quality
+experiments remain future work.
 
 ## Architecture
 
@@ -72,25 +78,34 @@ sealed frontend: symlinked images + rig + features + verified matches + priors
 Global Mapper (primary)      incremental mapper (fallback/reference)
         └──────────────┬──────────┘
                        ↓  image_registrator adds every non-keyframe
+        optional RTK position refinement (calibration blocks only)
+                       ↓  blocks excluded from refinement-factor gates
 fixed-scale ENU pose artifact
         ↓
 pose-matched cloud → GS train → evaluate
 ```
 
 The core package under `rtk_splat/core/` imports no ROS, bag, dataset, backend,
-or workflow module. ROS 2 ZED/u-blox and AgriGS are adapters under
-`rtk_splat/adapters/`.
-CitrusFarm is not supported until a ROS 1/split-bag adapter passes the same
-contract tests.
+or workflow module. ROS 2 ZED/u-blox, ROS 1 CitrusFarm, and AgriGS are adapters
+under `rtk_splat/adapters/`. The CitrusFarm implementation handles an ordered
+chain of ROS 1 bags, raw rectified stereo, Piksi `NavSatFix`, single-antenna
+course heading, clock auditing, and travelled-distance sampling without adding
+dataset conditionals to the mapping core.
 
 RTK use is intentionally explicit. Covariance, status, timestamps, and
 optional full dual-antenna baselines are preserved in contract v2. Trusted
 Cartesian camera-centre priors are inserted into the reusable frontend
-database and retained as evidence. The current `global_mapper` solve itself is
-visual: it does **not** optimize RTK residual factors in Global Mapper bundle
-adjustment. After visual solving and all-frame registration, the exporter fits
+database and retained as evidence. The primary Global Mapper solve itself is
+visual: it does **not** optimize RTK residual factors in its bundle
+adjustment. An explicit optional sidecar can refine positions using
+calibration-block priors; it removes holdouts from a private database, freezes
+metric stereo calibration, and rejects scale, baseline, or visual regressions.
+It is position-only and does not add a dual-antenna heading factor. After pose
+solving and all-frame registration, the exporter fits
 the fixed-scale SE(3) alignment on alternating contiguous calibration blocks
-and gates georeferencing on untouched temporal blocks. A Sim(3) scale is fit
+and gates georeferencing on blocks untouched by that fit/refinement. These
+blocks are not end-to-end GNSS-independent because upstream frame and pair
+planning may use the full RTK track. A Sim(3) scale is fit
 on calibration blocks only, reported as a diagnostic, and never applied.
 
 See [PIPELINE.md](docs/architecture/PIPELINE.md) and
@@ -108,6 +123,12 @@ ROS 2 bag ingestion is optional:
 
 ```bash
 python -m pip install -e '.[ros2]'
+```
+
+ROS 1 bag ingestion, including CitrusFarm, uses the separate optional extra:
+
+```bash
+python -m pip install -e '.[ros1]'
 ```
 
 Training additionally requires a compatible CUDA, PyTorch, and gsplat setup:
@@ -205,11 +226,28 @@ rtk-splat backend-quality \
   --config configs/sequences/headland.example.yaml \
   --backend-name balanced-gpu-global
 
+# Optional and experimental: publishes a separate refinement sidecar.
+rtk-splat backend-refine-rtk \
+  --config configs/sequences/headland.example.yaml \
+  --backend-name balanced-gpu-global \
+  --refinement-name balanced-gpu-global-rtk-v1
+
 rtk-splat backend-export \
   --config configs/sequences/headland.example.yaml \
   --backend-name balanced-gpu-global \
+  --refinement-name balanced-gpu-global-rtk-v1 \
   --pose-name balanced-gpu-global
 ```
+
+`backend-refine-rtk` uses covariance-weighted Cauchy position residuals by
+default. `--prior-position-loss trivial` is an explicit diagnostic that keeps
+the same covariance whitening but removes Cauchy downweighting. Use a new
+refinement name for every arm. A missing loss field in a sealed legacy plan is
+interpreted as the historical Cauchy default without modifying that plan.
+`--initialization-mode fresh` omits the finished input model and lets the same
+calibration-block priors constrain COLMAP while it builds the reconstruction.
+The historical/default `continuation` mode remains byte-compatible. Fresh mode
+uses absolute graph-quality gates because its tracks are newly constructed.
 
 Use `--backend incremental` and a different backend name for the fallback or
 reference arm. Backend export refuses an existing destination and publishes
@@ -240,6 +278,69 @@ Verify the historical golden artifacts without rerunning COLMAP or GS:
 ```bash
 rtk-splat-verify
 ```
+
+## Prepared CitrusFarm reproduction
+
+The checked-in CitrusFarm candidate uses the 192 s window at 543--735 s,
+0.15 m travelled-distance sampling, stereo RGB, computed SGBM depth, and
+single-antenna Piksi RTK. Its launcher calls the same explicit workflow stages,
+writes only to an internal-disk work directory, does not use `tmux`, and
+resumes only stages whose code/config/command evidence still matches:
+
+```bash
+bash scripts/runs/citrusfarm_05_13d_uturn.sh plan
+bash scripts/runs/citrusfarm_05_13d_uturn.sh preflight
+bash scripts/runs/citrusfarm_05_13d_uturn.sh run \
+  --workdir /home/jion_kubo/agromap4d_work/citrusfarm_05_13d_543_735_v2
+```
+
+The real read-only adapter preflight measured a 228.726 m GNSS path, estimated
+about 1,525 stereo pairs, recovered a 0.119885 m recorded rig baseline, and
+estimated a +72.548749 ms camera-to-GNSS clock correction. That audited value
+is now frozen in the sequence profile (zero configured residual); estimated
+window drift was -2.581 ms, within the 15 ms gate. Recorded ZED depth and
+confidence are inventoried but are not used by this primary arm; SGBM
+publishes depth in a new immutable derived segment.
+
+A 4 s real-data smoke published 10 stereo pairs, computed SGBM depth, and
+sealed a 20-image GPU frontend with all 52 requested pairs verified. The first
+full-window attempt later published 1,495 stereo pairs and registered all 2,990
+images at 0.973 px mean reprojection error, but it failed the untouched-block
+RTK export gate (0.266 m median and 59.2% support). A separate 31.7-minute
+position-prior refinement preserved the rig/intrinsics and improved those
+figures to 0.249 m and 67.2%, but still failed the 0.15 m/80% gates. It also
+reduced reprojection error to 0.674 px. Neither arm published an accepted pose,
+cloud, GS model, or PSNR. The adapter now also requires and
+preserves the receiver's own fixed/float state; the recorded NavSatFix
+covariance is explicitly static/approximated rather than live accuracy. See
+`PROGRESS.md` for the exact audit and measured stage timings. The 24.8 dB
+headland result remains a historical regression reference, not a promised or
+directly comparable CitrusFarm score.
+The rejected refinement A/B is frozen in
+`docs/experiments/citrusfarm_rtk_refinement_v1.json` so it cannot silently be
+relabelled as an accepted result later.
+
+The controlled cached loss experiment completed. Its quadratic arm improved
+held-out median RTK residual to 0.2284 m and support to 95.32%, but still failed
+the 0.15 m median and 0.30 m inlier-p95 gates, so it remains rejected.
+
+The next overnight test asks whether using those same quadratic RTK priors
+from the beginning of incremental reconstruction fixes the coherent early-row
+error. Its preflight has passed on the current cache:
+
+```bash
+bash scripts/experiments/citrusfarm_pose_prior_fresh_l2.sh preflight
+bash scripts/experiments/citrusfarm_pose_prior_fresh_l2.sh run
+```
+
+It reuses all 2,990 images, cached features/matches, the fixed stereo rig, and
+the exact 897/598 factor/holdout split. Compared with the completed L2 control,
+the fresh mapper command removes only `--input_path`. Budget approximately
+4--10 hours and 7--12 GiB. The launcher writes a paired diagnostic report and
+deliberately performs no pose export, cloud construction, GS training, or PLY
+generation. A separate export and training decision is allowed only after the
+fresh arm passes every existing metric/RTK gate and its absolute track-graph
+gates.
 
 ## Migration status
 
@@ -281,10 +382,13 @@ docs/experiments/golden/    accepted metrics and hashes
 - The headland sequence has no independent survey-grade camera trajectory.
 - The new sealed frontend and adaptive-keyframe path still need controlled
   real-data runtime, pose, and GS A/B results.
-- Global Mapper is visual; RTK factors inside local/global BA are not
-  implemented.
+- Global Mapper is visual. The optional whole-model sidecar consumes RTK
+  position priors but failed its first real held-out A/B; custom bounded local
+  RTK factors and a submap graph are not implemented.
 - Full-field bounded submaps and cross-session merging are not implemented.
-- CitrusFarm/ROS 1 split-bag ingestion is not implemented.
+- CitrusFarm has completed one full-window visual reconstruction and one
+  rejected RTK-refinement control; the first accepted georeferenced pose and
+  GS result remain future work.
 - Right-camera GS photometric supervision and learned stereo depth are not
   validated.
 

@@ -533,7 +533,8 @@ class AdapterConformanceTests(unittest.TestCase):
 class AdapterRegistryTests(unittest.TestCase):
     def test_registry_declares_exact_supported_adapters(self):
         self.assertEqual(
-            set(ADAPTER_NAMES), {"agrigs", "ros2_zed_ublox"}
+            set(ADAPTER_NAMES),
+            {"agrigs", "ros1_citrusfarm", "ros2_zed_ublox"},
         )
 
     def test_registry_dispatches_ros2_with_selection(self):
@@ -552,6 +553,18 @@ class AdapterRegistryTests(unittest.TestCase):
         ingest.assert_called_once_with(
             cfg, destination, window=selection
         )
+
+    def test_registry_dispatches_ros1(self):
+        cfg = SimpleNamespace(adapter="ros1_citrusfarm")
+        destination = Path("/new/segment")
+        expected = object()
+        with patch(
+            "rtk_splat.adapters.ros1_citrusfarm.ingest_config_v2",
+            return_value=expected,
+        ) as ingest:
+            result = publish_from_config(cfg, destination)
+        self.assertIs(result, expected)
+        ingest.assert_called_once_with(cfg, destination, window=None)
 
     def test_registry_dispatches_agrigs_without_ros_selection(self):
         cfg = SimpleNamespace(adapter="agrigs")

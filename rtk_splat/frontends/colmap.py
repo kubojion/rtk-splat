@@ -59,8 +59,18 @@ def build_feature_extractor_command(
     max_num_features: int = 8192,
     gpu_index: int = -1,
     seed: int = 0,
+    image_list: str | Path | None = None,
+    camera_model: str | None = None,
+    camera_params: Sequence[float] | None = None,
 ) -> tuple[str, ...]:
-    """Build all-image SIFT extraction for the controlled GPU/CPU A/B."""
+    """Build SIFT extraction for one rig sensor of the controlled A/B.
+
+    The rig stage requires exactly one camera per sensor, so extraction runs
+    once per sensor over an explicit image list with ``single_camera``.  Per-
+    image cameras leave the rig configurator unable to group the two sensors;
+    a single shared camera conflates them.  Calibrated intrinsics are passed
+    explicitly so the database never carries a guessed focal length.
+    """
     root = Path(artifact).resolve()
     if profile not in ("gpu", "cpu_reference"):
         raise ValueError("profile must be 'gpu' or 'cpu_reference'")
@@ -75,21 +85,34 @@ def build_feature_extractor_command(
         str(root / "images"),
         "--default_random_seed",
         str(seed),
-        # Flat, deterministic left_/right_ names are grouped by the following
-        # rig stage. Per-image cameras prevent the two sensors being conflated.
-        "--ImageReader.single_camera_per_image",
-        "1",
-        "--FeatureExtraction.max_image_size",
-        str(max_image_size),
-        "--FeatureExtraction.num_threads",
-        str(num_threads),
-        "--FeatureExtraction.use_gpu",
-        "1" if profile == "gpu" else "0",
-        "--FeatureExtraction.gpu_index",
-        str(gpu_index),
-        "--SiftExtraction.max_num_features",
-        str(max_num_features),
     ]
+    if image_list is not None:
+        command.extend(["--image_list_path", str(image_list)])
+    command.extend(
+        [
+            "--ImageReader.single_camera",
+            "1",
+            "--FeatureExtraction.max_image_size",
+            str(max_image_size),
+            "--FeatureExtraction.num_threads",
+            str(num_threads),
+            "--FeatureExtraction.use_gpu",
+            "1" if profile == "gpu" else "0",
+            "--FeatureExtraction.gpu_index",
+            str(gpu_index),
+            "--SiftExtraction.max_num_features",
+            str(max_num_features),
+        ]
+    )
+    if camera_model is not None:
+        command.extend(["--ImageReader.camera_model", str(camera_model)])
+    if camera_params is not None:
+        command.extend(
+            [
+                "--ImageReader.camera_params",
+                ",".join(repr(float(value)) for value in camera_params),
+            ]
+        )
     if profile == "cpu_reference":
         command.extend(
             [
@@ -370,18 +393,25 @@ def run_feature_extraction(
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
     root, manifest, _ = _sealed_context(artifact)
-    command = build_feature_extractor_command(
-        root,
-        executable,
-        profile=profile,
-        max_image_size=max_image_size,
-        num_threads=num_threads,
-        max_num_features=max_num_features,
-        gpu_index=gpu_index,
-        seed=seed,
+    sensors = _sensor_image_lists(root, manifest)
+    commands = tuple(
+        build_feature_extractor_command(
+            root,
+            executable,
+            profile=profile,
+            max_image_size=max_image_size,
+            num_threads=num_threads,
+            max_num_features=max_num_features,
+            gpu_index=gpu_index,
+            seed=seed,
+            image_list=sensor["image_list"],
+            camera_model=sensor["camera_model"],
+            camera_params=sensor["camera_params"],
+        )
+        for sensor in sensors
     )
     inputs = {
-        "command": command,
+        "command": [list(item) for item in commands],
         "frame_manifest_sha256": sha256_file(root / "frame_manifest.json"),
         "image_inventory_sha256": manifest["image_inventory_sha256"],
     }
@@ -398,18 +428,100 @@ def run_feature_extraction(
     if status == "resume" and database.exists() and quality is None:
         raise ArtifactError("partial feature extraction cannot be resumed")
     if quality is None:
-        _execute(command, runner)
+        for item in commands:
+            _execute(item, runner)
         quality = _feature_quality(database, manifest)
         if quality is None:
             raise ArtifactError("feature extractor produced no database")
+        _require_sensor_cameras(database, sensors)
     report = {
         "schema_version": 1,
         "stage": "features",
         "profile": profile,
-        "command": list(command),
+        "command": [list(item) for item in commands],
         **quality,
     }
     return _finish_stage(ledger, root, "features", inputs, report)
+
+
+def _sensor_image_lists(
+    root: Path, manifest: Mapping[str, Any]
+) -> tuple[dict[str, Any], ...]:
+    """One explicit image list per rig sensor, in rig-config order.
+
+    Extraction must produce exactly one camera per sensor.  Prefixes and
+    calibrated intrinsics are read from the sealed ``rig_config.json`` so the
+    database the rig stage inherits cannot disagree with it.
+    """
+    config = json.loads((root / "rig_config.json").read_text(encoding="utf-8"))
+    if not isinstance(config, list) or len(config) != 1:
+        raise ArtifactError("rig_config.json must hold exactly one rig")
+    cameras = config[0].get("cameras")
+    if not isinstance(cameras, list) or not cameras:
+        raise ArtifactError("rig_config.json declares no cameras")
+    names = _manifest_image_names(manifest)
+    sensors: list[dict[str, Any]] = []
+    claimed: set[str] = set()
+    for index, camera in enumerate(cameras):
+        prefix = str(camera.get("image_prefix", ""))
+        if not prefix:
+            raise ArtifactError("every rig camera needs an image_prefix")
+        selected = tuple(name for name in names if name.startswith(prefix))
+        if not selected:
+            raise ArtifactError(f"no sealed images match rig prefix {prefix!r}")
+        overlap = claimed.intersection(selected)
+        if overlap:
+            raise ArtifactError(
+                f"image claimed by two rig prefixes: {sorted(overlap)[0]}"
+            )
+        claimed.update(selected)
+        listing = root / f"image_list_{index}.txt"
+        listing.write_text(
+            "".join(f"{name}\n" for name in selected), encoding="utf-8"
+        )
+        sensors.append(
+            {
+                "prefix": prefix,
+                "image_list": listing,
+                "camera_model": camera.get("camera_model_name"),
+                "camera_params": camera.get("camera_params"),
+                "n_images": len(selected),
+            }
+        )
+    if claimed != set(names):
+        raise ArtifactError("rig prefixes do not cover every sealed image")
+    return tuple(sensors)
+
+
+def _require_sensor_cameras(
+    database: Path, sensors: Sequence[Mapping[str, Any]]
+) -> None:
+    """Fail closed unless extraction produced exactly one camera per sensor.
+
+    Per-image or shared cameras leave the rig configurator unable to build a
+    single rig, which previously surfaced only as a late, opaque count error.
+    """
+    with _connect_readonly(database) as connection:
+        cameras = int(
+            connection.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]
+        )
+        rows = list(connection.execute("SELECT name, camera_id FROM images"))
+    if cameras != len(sensors):
+        raise ArtifactError(
+            f"expected {len(sensors)} sensor cameras, found {cameras}; "
+            "extraction must use one --ImageReader.single_camera pass per sensor"
+        )
+    for sensor in sensors:
+        prefix = str(sensor["prefix"])
+        assigned = {
+            int(camera_id)
+            for name, camera_id in rows
+            if str(name).startswith(prefix)
+        }
+        if len(assigned) != 1:
+            raise ArtifactError(
+                f"rig prefix {prefix!r} spans {len(assigned)} cameras; expected 1"
+            )
 
 
 def _rig_assignments(
@@ -417,6 +529,11 @@ def _rig_assignments(
 ) -> tuple[dict[int, tuple[int, int]], dict[str, Any]] | None:
     with _connect_readonly(database) as connection:
         _require_tables(connection, {"images", "rigs", "frames", "frame_data"})
+        camera_ids = {
+            int(row[0])
+            for row in connection.execute("SELECT camera_id FROM cameras")
+        }
+        n_cameras = len(camera_ids)
         counts = [
             int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             for table in ("rigs", "frames", "frame_data")
@@ -427,17 +544,17 @@ def _rig_assignments(
             connection.execute(
                 """
                 SELECT i.name, i.image_id, i.camera_id, fd.frame_id,
-                       fd.sensor_id, fd.sensor_type,
+                       fd.sensor_id, fd.sensor_type, f.rig_id,
                        r.ref_sensor_id, r.ref_sensor_type
                 FROM images AS i
                 JOIN frame_data AS fd
-                  ON fd.data_id=i.image_id AND fd.sensor_type=0
+                  ON fd.data_id=i.image_id
                 JOIN frames AS f ON f.frame_id=fd.frame_id
                 JOIN rigs AS r ON r.rig_id=f.rig_id
                 """
             )
         )
-    by_name: dict[str, tuple[int, int, int, int, int, int, int]] = {}
+    by_name: dict[str, tuple[int, int, int, int, int, int, int, int]] = {}
     for row in rows:
         name = str(row[0])
         if name in by_name:
@@ -446,15 +563,86 @@ def _rig_assignments(
     expected_names = set(_manifest_image_names(manifest))
     if set(by_name) != expected_names:
         raise ArtifactError("partial/stale rig image assignments")
+    side_cameras: dict[str, int] = {}
+    for side in ("left_image", "right_image"):
+        names = [
+            str(frame[side]["name"])
+            for frame in manifest["frames"]
+            if side in frame
+        ]
+        if not names:
+            continue
+        assigned = {by_name[name][1] for name in names}
+        if len(assigned) != 1:
+            raise ArtifactError(f"{side} spans multiple camera sensors")
+        side_cameras[side] = next(iter(assigned))
+    if len(set(side_cameras.values())) != len(side_cameras):
+        raise ArtifactError("manifest sensor streams share one camera")
+    if set(side_cameras.values()) != camera_ids:
+        raise ArtifactError("camera table does not match manifest sensor streams")
+
+    # COLMAP 4.1's feature extractor creates a default singleton rig and frame
+    # for every camera/image before ``rig_configurator`` groups synchronized
+    # sensors.  This is the one legitimate non-empty pre-rig state.  Accept it
+    # only when the whole database has the exact one-rig-per-camera and
+    # one-frame-per-image topology; any partial or mixed transition still
+    # fails closed.
+    singleton_counts = [n_cameras, len(expected_names), len(expected_names)]
+    if counts == singleton_counts:
+        frame_ids: set[int] = set()
+        camera_to_rig: dict[int, int] = {}
+        rig_to_camera: dict[int, int] = {}
+        for (
+            image_id,
+            camera_id,
+            db_frame,
+            sensor_id,
+            sensor_type,
+            rig_id,
+            ref_id,
+            ref_type,
+        ) in by_name.values():
+            if (
+                sensor_type != 0
+                or ref_type != 0
+                or sensor_id != camera_id
+                or ref_id != camera_id
+            ):
+                raise ArtifactError("invalid COLMAP singleton pre-rig assignment")
+            if db_frame in frame_ids:
+                raise ArtifactError("invalid COLMAP singleton pre-rig frame sharing")
+            frame_ids.add(db_frame)
+            previous_rig = camera_to_rig.setdefault(camera_id, rig_id)
+            previous_camera = rig_to_camera.setdefault(rig_id, camera_id)
+            if previous_rig != rig_id or previous_camera != camera_id:
+                raise ArtifactError("invalid COLMAP singleton pre-rig topology")
+        if len(camera_to_rig) != n_cameras or len(rig_to_camera) != n_cameras:
+            raise ArtifactError("incomplete COLMAP singleton pre-rig topology")
+        return None
+
     if counts != [1, len(manifest["frames"]), len(expected_names)]:
-        raise ArtifactError("partial/stale rig/frame counts")
+        raise ArtifactError(
+            "partial/stale rig/frame counts: "
+            f"found {counts}, expected configured "
+            f"{[1, len(manifest['frames']), len(expected_names)]} "
+            f"or COLMAP singleton {singleton_counts}"
+        )
     left: dict[int, tuple[int, int]] = {}
     db_frames: set[int] = set()
     for frame in manifest["frames"]:
         frame_id = int(frame["frame_id"])
         left_name = str(frame["left_image"]["name"])
         left_row = by_name[left_name]
-        image_id, camera_id, db_frame, sensor_id, sensor_type, ref_id, ref_type = left_row
+        (
+            image_id,
+            camera_id,
+            db_frame,
+            sensor_id,
+            sensor_type,
+            _,
+            ref_id,
+            ref_type,
+        ) = left_row
         if sensor_type != 0 or ref_type != 0 or sensor_id != camera_id:
             raise ArtifactError("invalid reference-camera sensor assignment")
         if ref_id != camera_id:
@@ -469,6 +657,10 @@ def _rig_assignments(
                 raise ArtifactError("stereo images are assigned to different frames")
             if right_row[4] != 0 or right_row[3] != right_row[1]:
                 raise ArtifactError("invalid right-camera sensor assignment")
+            if right_row[6] != camera_id or right_row[7] != 0:
+                raise ArtifactError("right camera has the wrong rig reference sensor")
+            if right_row[1] == camera_id:
+                raise ArtifactError("stereo images share one camera sensor")
     quality = {
         "n_rigs": counts[0],
         "n_frames": counts[1],

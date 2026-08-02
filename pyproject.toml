@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ros1 = ["rosbags>=0.10"]
 ros2 = ["rosbags>=0.10"]
 gpu = [
   "gsplat>=1.5",

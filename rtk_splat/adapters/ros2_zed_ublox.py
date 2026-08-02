@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import Any, Iterable
 
 import numpy as np
@@ -136,8 +137,8 @@ class FrameRecord:
 
     t: float
     t_right: float
-    left_jpeg: bytes
-    right_jpeg: bytes
+    left_jpeg: bytes | Path
+    right_jpeg: bytes | Path
     left_header_ns: int | None = None
     right_header_ns: int | None = None
     header_timestamps_exact: bool = field(init=False)
@@ -482,6 +483,16 @@ def _message_bytes(data) -> bytes:
     if hasattr(data, "tobytes"):
         return data.tobytes()
     return bytes(data)
+
+
+def _payload_format(payload: bytes | Path) -> str:
+    """Detect an in-memory payload or a staged image without loading it."""
+    if isinstance(payload, Path):
+        if not payload.is_file():
+            raise ValueError(f"staged image does not exist: {payload}")
+        with payload.open("rb") as stream:
+            return detect_compressed_format(stream.read(8))
+    return detect_compressed_format(payload)
 
 
 def read_stereo_frames(
@@ -966,6 +977,7 @@ def publish_segment_v2(
     capabilities: Mapping[str, bool] | None = None,
     splits: Mapping[str, Sequence[int]] | None = None,
     provenance: Mapping[str, Any] | None = None,
+    adapter_name: str = "ros2_zed_ublox",
 ) -> SegmentReader:
     """Atomically publish selected ROS2 evidence as segment contract v2.
 
@@ -997,6 +1009,14 @@ def publish_segment_v2(
         right_payloads = []
         left_formats = []
         right_formats = []
+        has_frame_logs = [
+            hasattr(frame, "left_log_ns") and hasattr(frame, "right_log_ns")
+            for frame in frame_records
+        ]
+        if any(has_frame_logs) and not all(has_frame_logs):
+            raise ValueError("frame bag-log timestamps must be present for every frame")
+        left_log_values = []
+        right_log_values = []
         for index, frame in enumerate(frame_records):
             if not frame.header_timestamps_exact:
                 raise ValueError(
@@ -1012,14 +1032,25 @@ def publish_segment_v2(
                     f"stereo association exceeds {stereo_tolerance} ns "
                     f"at frame {index}"
                 )
-            left_payload = bytes(frame.left_jpeg)
-            right_payload = bytes(frame.right_jpeg)
+            left_payload = frame.left_jpeg
+            right_payload = frame.right_jpeg
+            if not isinstance(left_payload, Path):
+                left_payload = bytes(left_payload)
+            if not isinstance(right_payload, Path):
+                right_payload = bytes(right_payload)
             left_ns_values.append(left_ns)
             right_ns_values.append(right_ns)
             left_payloads.append(left_payload)
             right_payloads.append(right_payload)
-            left_formats.append(detect_compressed_format(left_payload))
-            right_formats.append(detect_compressed_format(right_payload))
+            left_formats.append(_payload_format(left_payload))
+            right_formats.append(_payload_format(right_payload))
+            if has_frame_logs[index]:
+                left_log_values.append(
+                    _exact_ns(frame.left_log_ns, f"frame {index} left_log_ns")
+                )
+                right_log_values.append(
+                    _exact_ns(frame.right_log_ns, f"frame {index} right_log_ns")
+                )
         left_ns_array = np.asarray(left_ns_values, dtype=np.int64)
         right_ns_array = np.asarray(right_ns_values, dtype=np.int64)
         if np.any(np.diff(left_ns_array) <= 0) or np.any(
@@ -1053,8 +1084,14 @@ def publish_segment_v2(
         ):
             left_name = f"left_{index:06d}{extension[left_format]}"
             right_name = f"right_{index:06d}{extension[right_format]}"
-            (image_dir / left_name).write_bytes(left_payload)
-            (image_dir / right_name).write_bytes(right_payload)
+            if isinstance(left_payload, Path):
+                shutil.copyfile(left_payload, image_dir / left_name)
+            else:
+                (image_dir / left_name).write_bytes(left_payload)
+            if isinstance(right_payload, Path):
+                shutil.copyfile(right_payload, image_dir / right_name)
+            else:
+                (image_dir / right_name).write_bytes(right_payload)
             left_paths.append(f"images/{left_name}")
             right_paths.append(f"images/{right_name}")
 
@@ -1079,6 +1116,13 @@ def publish_segment_v2(
             "initial_camera_center_m": centers,
             "pose_valid": pose_valid,
         }
+        if all(has_frame_logs):
+            frame_values["left_log_timestamp_ns"] = np.asarray(
+                left_log_values, dtype=np.int64
+            )
+            frame_values["right_log_timestamp_ns"] = np.asarray(
+                right_log_values, dtype=np.int64
+            )
 
         fix_count = len(fix_header_ns)
         fix_enu = np.asarray(getattr(track, "enu_xyz", None), dtype=np.float64)
@@ -1125,6 +1169,23 @@ def publish_segment_v2(
             np.isfinite(fix_enu).all(axis=1)
             & np.isfinite(fix_covariance).all(axis=(1, 2)),
         )
+        supplied_valid = getattr(track, "fix_position_valid", None)
+        supplied_quality = getattr(track, "fix_position_quality", None)
+        if (supplied_valid is None) != (supplied_quality is None):
+            raise ValueError(
+                "RtkTrack must supply fix_position_valid and "
+                "fix_position_quality together"
+            )
+        if supplied_valid is not None:
+            position_valid = np.asarray(supplied_valid, dtype=bool)
+            position_quality = np.asarray(supplied_quality, dtype=np.str_)
+            if position_valid.shape != (fix_count,) or position_quality.shape != (
+                fix_count,
+            ):
+                raise ValueError(
+                    "RtkTrack receiver-derived position quality must have one "
+                    "entry per fix"
+                )
         gnss = {
             "frame_id": frame_ids,
             "frame_timestamp_ns": left_ns_array,
@@ -1156,6 +1217,103 @@ def publish_segment_v2(
                 track.pvt_carrier_status, dtype=np.int16
             ),
         }
+        if hasattr(track, "fix_service"):
+            service = np.asarray(track.fix_service, dtype=np.int16)
+            if service.shape != (fix_count,):
+                raise ValueError(
+                    f"RtkTrack fix_service must have shape ({fix_count},)"
+                )
+            gnss["service"] = service[fix_indices]
+            gnss["raw_service"] = service
+
+        receiver_state = getattr(track, "receiver_state_evidence", None)
+        if receiver_state is not None:
+            fix_receiver_fields = {
+                "state_index": np.asarray(
+                    track.fix_receiver_state_index, dtype=np.int64
+                ),
+                "state_matched": np.asarray(
+                    track.fix_receiver_state_matched, dtype=bool
+                ),
+                "state_header_timestamp_ns": np.asarray(
+                    track.fix_receiver_state_header_ns, dtype=np.int64
+                ),
+                "state_log_timestamp_ns": np.asarray(
+                    track.fix_receiver_state_log_ns, dtype=np.int64
+                ),
+                "state_residual_ns": np.asarray(
+                    track.fix_receiver_state_residual_ns, dtype=np.int64
+                ),
+                "fix_mode": np.asarray(track.fix_receiver_mode, dtype=np.str_),
+                "rtk_mode_fix": np.asarray(
+                    track.fix_receiver_rtk_mode_fix, dtype=bool
+                ),
+                "num_sat": np.asarray(track.fix_receiver_num_sat, dtype=np.int16),
+                "system_error": np.asarray(
+                    track.fix_receiver_system_error, dtype=np.int16
+                ),
+                "io_error": np.asarray(
+                    track.fix_receiver_io_error, dtype=np.int16
+                ),
+                "swift_nap_error": np.asarray(
+                    track.fix_receiver_swift_nap_error, dtype=np.int16
+                ),
+                "external_antenna_present": np.asarray(
+                    track.fix_receiver_external_antenna_present, dtype=np.int16
+                ),
+            }
+            bad_shape = [
+                name
+                for name, value in fix_receiver_fields.items()
+                if value.shape != (fix_count,)
+            ]
+            if bad_shape:
+                raise ValueError(
+                    "RtkTrack receiver-state fix associations have wrong shape: "
+                    + ", ".join(sorted(bad_shape))
+                )
+            for name, value in fix_receiver_fields.items():
+                gnss[f"receiver_{name}"] = value[fix_indices]
+                gnss[f"raw_receiver_{name}"] = value
+
+            state_fields = {
+                "header_timestamp_ns": np.asarray(
+                    receiver_state.header_ns, dtype=np.int64
+                ),
+                "log_timestamp_ns": np.asarray(
+                    receiver_state.log_ns, dtype=np.int64
+                ),
+                "fix_mode": np.asarray(receiver_state.fix_mode, dtype=np.str_),
+                "rtk_mode_fix": np.asarray(
+                    receiver_state.rtk_mode_fix, dtype=bool
+                ),
+                "num_sat": np.asarray(receiver_state.num_sat, dtype=np.int16),
+                "system_error": np.asarray(
+                    receiver_state.system_error, dtype=np.int16
+                ),
+                "io_error": np.asarray(receiver_state.io_error, dtype=np.int16),
+                "swift_nap_error": np.asarray(
+                    receiver_state.swift_nap_error, dtype=np.int16
+                ),
+                "external_antenna_present": np.asarray(
+                    receiver_state.external_antenna_present, dtype=np.int16
+                ),
+            }
+            state_count = len(state_fields["header_timestamp_ns"])
+            bad_state_shape = [
+                name
+                for name, value in state_fields.items()
+                if value.shape != (state_count,)
+            ]
+            if bad_state_shape:
+                raise ValueError(
+                    "receiver-state raw evidence has inconsistent shape: "
+                    + ", ".join(sorted(bad_state_shape))
+                )
+            for name, value in state_fields.items():
+                # The prefix deliberately differs from ``raw_*``: this is a
+                # second raw stream with its own timestamps and sample count.
+                gnss[f"receiver_state_raw_{name}"] = value
 
         dual_available = _dual_evidence_available(track)
         capability_record = _capability_record(capabilities, dual_available)
@@ -1245,10 +1403,23 @@ def publish_segment_v2(
             "provenance": semantics["provenance"],
         }
         crs = semantics["crs"]
+        normalized_provenance = _json_value({} if provenance is None else provenance)
+        receiver_state_metadata = None
+        if receiver_state is not None:
+            receiver_state_metadata = {
+                "topic": str(receiver_state.topic),
+                "message_type": str(receiver_state.message_type),
+                "message_definition_sha256": str(
+                    receiver_state.message_definition_sha256
+                ),
+                "classification_field": "fix_mode",
+                "fixed_cross_check_field": "rtk_mode_fix",
+                "raw_stream_prefix": "receiver_state_raw_",
+            }
         meta = {
             "contract_version": CONTRACT_VERSION,
             "n_frames": n_frames,
-            "adapter": "ros2_zed_ublox",
+            "adapter": str(adapter_name),
             "capabilities": capability_record,
             "clock_alignment": {
                 "camera_to_rtk_offset_ns": clock_offset,
@@ -1259,6 +1430,7 @@ def publish_segment_v2(
                     "frames.timestamp_ns + camera_to_rtk_offset_ns",
                 "source_timestamp_semantics": "sensor header clock",
                 "source_log_timestamp_semantics": "rosbag log timestamp",
+                "frame_log_timestamps_preserved": bool(all(has_frame_logs)),
             },
             "world_origin": {
                 "lat0": crs["origin_lat"],
@@ -1295,6 +1467,15 @@ def publish_segment_v2(
                 "validity_field": "position_valid",
                 "quality_field": "position_quality",
                 "quality_vocabulary": list(POSITION_QUALITY_VOCABULARY),
+                "quality_source": (
+                    "receiver_state.fix_mode"
+                    if receiver_state is not None
+                    else "NavSatStatus plus optional carrier status"
+                ),
+                "receiver_state_evidence": receiver_state_metadata,
+                "covariance_provenance": normalized_provenance.get(
+                    "gnss_quality", {}
+                ).get("covariance"),
             },
             "heading_observation": (
                 {
@@ -1346,7 +1527,7 @@ def publish_segment_v2(
                 "left": sorted(set(left_formats)),
                 "right": sorted(set(right_formats)),
             },
-            "provenance": _json_value({} if provenance is None else provenance),
+            "provenance": normalized_provenance,
         }
         manifest = _split_manifest(splits, n_frames)
         writer.write_frames(frame_values)

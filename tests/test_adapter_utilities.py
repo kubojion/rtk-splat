@@ -169,6 +169,7 @@ def guarded(name, *args, **kwargs):
     return real_import(name, *args, **kwargs)
 builtins.__import__ = guarded
 import rtk_splat.adapters.ros2_zed_ublox
+import rtk_splat.adapters.ros1_citrusfarm
 """
         completed = subprocess.run(
             [sys.executable, "-c", source],

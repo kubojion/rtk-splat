@@ -170,6 +170,15 @@ invalidate a finite position. Invalid rows may use all-NaN ENU/covariance.
 Every valid RTK row requires finite ENU and complete, symmetric,
 positive-semidefinite covariance.
 
+When a receiver publishes a separate solution-state stream, an adapter may
+retain both its complete raw arrays and its per-fix association under explicit
+`receiver_state_raw_*` and `receiver_*` names. The receiver's own fixed/float
+mode is authoritative over ambiguous `NavSatStatus` service codes. Required
+state evidence is fail-closed: missing, stale, unrecognized, internally
+inconsistent, or error-flagged records cannot be relabelled as RTK fixed.
+Metadata must also distinguish live per-epoch accuracy from a static or merely
+approximated driver covariance.
+
 When a GNSS antenna observation becomes a camera-centre prior, the current
 frontend adds the ENU GNSS covariance to the configured camera-frame
 translation covariance after rotating it into ENU. The translation sigma's
@@ -213,6 +222,26 @@ An adapter must:
 The supported dispatch boundary is `rtk_splat.adapters.registry.publish_from_config`.
 Adding a new dataset means writing an adapter that publishes the same v2
 contract, not adding conditionals to the mapper.
+
+### CitrusFarm ROS 1 application
+
+`ros1_citrusfarm` applies this contract to an explicitly ordered ROS 1 bag
+chain. It reads with `rosbags` rather than importing ROS into the core,
+validates each chunk and boundary, decodes the configured rectified stereo
+topics to lossless PNG, preserves camera and Piksi sensor stamps plus bag-log
+stamps, and converts the complete `NavSatFix` covariance/status evidence to
+local ENU. Single-antenna course heading is derived only where motion makes it
+observable; the adapter does not fabricate dual-antenna or IMU capabilities.
+
+Its constant camera-to-GNSS clock correction affects association queries only;
+original timestamps remain unchanged. The sequence-05 read-only preflight
+estimated +72.548749 ms; that value is frozen in the sequence profile, and
+the measured -2.581 ms drift across the 543--735 s window is inside its 15 ms
+gate. It also inventoried recorded
+depth and confidence without declaring them as active primary inputs. The
+prepared reproduction instead uses `depth --derived-segment` to publish SGBM
+depth separately. A bounded 4 s real-data contract/SGBM/frontend smoke passes;
+the full 192 s Citrus contract and mapping run remain unexecuted.
 
 ## One-time migration from the validated v1 headland layout
 
