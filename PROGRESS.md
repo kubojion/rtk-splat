@@ -893,6 +893,10 @@ prefix. A guarded bootstrap now places both environments and their package
 caches under `/data/jkobo/rtk-splat`, leaving base Conda, system CUDA/drivers,
 Docker, and other users unchanged. The server preflight now accepts either a
 24 GB RTX 3090 or 4090 and still performs real gsplat and COLMAP CUDA smokes.
+The first server installation revealed that gsplat's former
+`docs.gsplat.studio/whl/pt24cu121` listing is now empty. The environment now
+uses the official v1.5.3 CPython-3.10/PyTorch-2.4/CUDA-12.1 GitHub release
+wheel directly and pins its published SHA-256, avoiding index drift.
 
 The finalized real-bag ingest probe covered the first 120 s and published 316
 frames over 108.92 s in **29 min 18 s**. It peaked at **452,984 KiB RSS** with

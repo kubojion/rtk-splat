@@ -5,11 +5,12 @@
 # Install this file inside a fresh Conda environment, then install the
 # repository itself with `python -m pip install -e . --no-deps`.
 --extra-index-url https://download.pytorch.org/whl/cu121
---find-links https://docs.gsplat.studio/whl/pt24cu121
 
 torch==2.4.1+cu121
 torchvision==0.19.1+cu121
-gsplat==1.5.3+pt24cu121
+# Pin the official v1.5.3 release asset directly. The former
+# docs.gsplat.studio/whl/pt24cu121 listing is now an empty compatibility page.
+gsplat @ https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt24cu121-cp310-cp310-linux_x86_64.whl#sha256=0493bab68ed5fc71f4ce8bfc2be03b584d8a41a06a6d9362e09a795340f8c488
 torchmetrics==1.9.0
 numpy==2.2.6
 opencv-python-headless==5.0.0.93

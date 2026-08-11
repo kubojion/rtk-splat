@@ -6,6 +6,7 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "scripts/tools/bootstrap_server_env.sh"
+REQUIREMENTS = REPOSITORY / "configs/environments/rtk-splat-cu121.txt"
 
 
 class ServerEnvironmentBootstrapTests(unittest.TestCase):
@@ -48,6 +49,20 @@ class ServerEnvironmentBootstrapTests(unittest.TestCase):
         self.assertNotIn("apt ", contents)
         self.assertNotIn("conda init", contents)
         self.assertNotIn("rm -rf", contents)
+
+        requirements = REQUIREMENTS.read_text(encoding="utf-8")
+        self.assertIn(
+            "gsplat-1.5.3%2Bpt24cu121-cp310-cp310-linux_x86_64.whl",
+            requirements,
+        )
+        self.assertIn(
+            "sha256=0493bab68ed5fc71f4ce8bfc2be03b584d8a41a06a6d9362e09a795340f8c488",
+            requirements,
+        )
+        self.assertNotIn(
+            "--find-links https://docs.gsplat.studio/whl/pt24cu121",
+            requirements,
+        )
 
 
 if __name__ == "__main__":

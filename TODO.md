@@ -58,6 +58,9 @@ item only after its artifact or test result exists.
 - [ ] Pull the environment-bootstrap/4090-preflight commit on the server,
   install the two isolated prefix Conda environments, and pass bootstrap plus
   full server preflight. Do not modify system CUDA, base Conda, or other users.
+  The first install exposed an upstream wheel-index change; the requirements
+  now pin the official gsplat v1.5.3 release asset by SHA-256. Resume the
+  existing prefix rather than deleting it.
 - [ ] On the server, solve and seal the complete global pose artifact, then
   generate the final automatic TilePlan.
   The full pose solve, not per-tile GS, is now the main unmeasured scaling risk.
@@ -180,6 +183,8 @@ item only after its artifact or test result exists.
 - [x] Revalidated the complete source tree after the server adaptation: 364
   tests plus 35 subtests passed on 2026-08-11; shell syntax and diff checks
   passed.
+- [x] Replaced the obsolete gsplat wheel-index route with the exact official
+  CPython-3.10/PyTorch-2.4/CUDA-12.1 v1.5.3 release asset and published SHA-256.
 
 ## Update rule
 
