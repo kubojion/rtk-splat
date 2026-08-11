@@ -12,6 +12,7 @@ from rtk_splat.backends.mapper_config import MapperConfig, _LEGACY_EVALUATION_DE
 from rtk_splat.frontends.artifact import (
     ArtifactError,
     FRONTEND_SEAL_FILE,
+    canonical_hash,
     sha256_file,
     sqlite_logical_record,
     verify_frontend_seal,
@@ -187,6 +188,17 @@ def _workspace_context(
         != plan.get("matching_stage_sha256")
     ):
         raise ArtifactError("sealed frontend terminal evidence changed")
+    frontend_provenance = _json(frontend / "provenance.json")
+    contract_inputs = frontend_provenance.get("contract_inputs")
+    if not isinstance(contract_inputs, dict):
+        raise ArtifactError("frontend source-segment binding is invalid")
+    expected_binding = {
+        "contract_inputs": contract_inputs,
+        "contract_inputs_sha256": canonical_hash(contract_inputs),
+        "acquisition_id": contract_inputs.get("acquisition_id"),
+    }
+    if plan.get("source_segment_binding") != expected_binding:
+        raise ArtifactError("backend source-segment binding is invalid")
     _verify_snapshot(root, plan)
     for filename, expected_key in (
         ("solve_images.txt", "solve_image_names"),

@@ -1,6 +1,6 @@
 # RTK-Splat Progress
 
-Last updated: 2026-08-02
+Last updated: 2026-08-10
 
 This is the current source of truth for this repository. Superseded plans are
 kept under `docs/archive/`.
@@ -21,11 +21,21 @@ artifact or accepted metric:
 - `63b8a36` documented the final cleanup/runtime ownership; and
 - `abfa4c1` made the active Citrus controls data-derived and auditable.
 
-The current source-tree gate passes **255 tests plus 35 subtests**, shell and
-compile checks. The historical incremental and Global verifiers still pass
-**38/38** and **42/42** exact checks. A clean wheel installs only the
-`rtk_splat` namespace and works outside a Git checkout. The editable
-`rtk-splat` environment was refreshed after the layout/entry-point move.
+The current source-tree gate passed **362 tests plus 35 subtests** on
+2026-08-10, including memory-bounded ingest, portable transfer, sealed
+TilePlan, tile execution, production scene publication, server-launcher,
+scientific-control, and source-mutation gates. At the earlier cleanup freeze,
+the historical incremental and
+Global external verifiers passed **38/38** and **42/42** exact checks. After the
+2026-08-09 workspace cleanup, the incremental artifact still passes 38/38, but
+the historical reduced-Global compact pose artifact is no longer present, so
+that external verifier currently passes only 6/20. Its recorded metrics remain,
+and the complete modern AB03 GPU pose/model control is intact. A clean wheel
+installs only the `rtk_splat` namespace and works outside a Git checkout.
+
+The only active tracker is [TODO.md](TODO.md). The present objective is a
+seam-validated, georeferenced tiled reconstruction of the full 77-minute field
+recording. Rosario colour research is frozen while that objective is pursued.
 
 ## Current reference result
 
@@ -50,6 +60,85 @@ of row 5, a U-turn, and the entry to row 1.
 Test-time pose alignment provides no gain after stereo BA, supporting the
 conclusion that the refined trajectory is already locally consistent for this
 reconstruction.
+
+## Rosario v2 cross-dataset pilot: production pose and IR GS complete
+
+The quality-first Sequence 5 pilot covers 140--250 s relative to the exact
+first main-bag log timestamp. It contains two opposing traversals on adjacent
+rows and one complete U-turn over 103.37 m. The separately distributed Reach
+1/Reach 2 PPK bag is an explicit offline method input; PGT, conventional GNSS,
+IMU, and wheel odometry are excluded.
+
+The new ROS 1 Rosario adapter passed a real fail-closed preflight and published
+one immutable segment on 2026-08-03:
+
+- **1,014** rectified IR stereo frames with recorded metric depth over
+  **109.812 s**, sampled at **0.10144 m** effective spacing;
+- **1,645** full-resolution RGB observations in a separate, acquisition-bound
+  sealed artifact; and
+- complete raw/effective covariance, status, timestamps, and both antenna
+  position streams. All **569/569** interpolated dual-position headings pass
+  the physical-baseline gate.
+
+The recorded IR baseline is **50.211037 mm**, versus **50.240891 mm** in the
+official Kalibr files. Real-image epipolar checks pass the predeclared gates:
+median sample-p95 vertical residual **0.8618 px**, aggregate fraction below
+1 px **0.9692**, and at least **1,473** geometric matches per probe. Recorded
+depth also passes: disparity disagreement p95 is at most **0.5624 px**,
+depth/left timestamps are exactly equal, CameraInfo dimensions/K/P/R/D match
+exactly, and the recorded static depth-from-left transform is **0 m / 0 deg**.
+
+The offline PPK file does not expose carrier solution state and its recorded
+covariance is a static placeholder. Raw `[1, 1, 4] m^2` diagonal covariance is
+retained; a separately labelled, conservative `[0.10, 0.10, 0.20] m` effective
+sigma is used for weighting only and is not an accuracy claim. The physical
+dual-antenna baseline is internally consistent, but the camera-to-primary-
+antenna URDF transform remains a rough prior pending the post-SfM metric-
+integrity audit. The online Reach streams fail their physical-baseline gate and
+cannot silently replace the PPK input.
+
+Ingest took **13 min 48.81 s** over USB 2.0, peaked at **2.63 GB RSS**, and
+published 1.77 GB canonical plus 2.67 GB RGB artifacts on NVMe. The sealed
+downstream run then completed on 2026-08-04 without replaying the bags:
+
+- Global Mapper registered **1,014/1,014 frames and 2,028/2,028 images** with
+  **0.80256 px** mean reprojection error and **38.679** mean track length. Its
+  solve took **400.5 s** and peaked at **5.87 GB RSS**.
+- Fixed-scale ENU export passed as a production artifact. Held-out RTK-camera
+  residuals were **0.16186 m median / 0.31344 m p95**, with 100% absolute-cap
+  inlier support. The diagnostic Sim(3) scale was **1.008414** and was recorded
+  but not applied. These are consistency residuals against the declared PPK
+  prior, not survey-ground-truth camera accuracy.
+- The IR/depth GS completed **44,400** presentations in **3 h 15 min**. The
+  selected checkpoint is step 44,000 with corrected masked PSNR **21.15047**,
+  and contains **2,462,523 Gaussians**.
+
+The original viewer PLY retained 758,882 Gaussians after the configured 0.05
+opacity threshold and spatial crop. A new non-destructive completed-checkpoint
+export retained all **2,462,523** Gaussians with threshold 0 and no crop at
+`runs/rosario-seq5-ppk-140-250-gs-v1/exports/full-model-no-crop-v1/splat.ply`.
+It is 226,552,695 bytes; the source `params.pt`, original PLY, georeferencing,
+and **21.15 dB** metric remain unchanged.
+
+The RGB-D transfer subsequently published **1,012** diagnostic RGB/depth views
+(886 train / 126 validation). Its inherited RGB pose/timing state is not
+independently validated, so all colour outputs remain
+`DIAGNOSTIC_ONLY` and metric-claim ineligible. The matched v5 control selected
+step 20k at 20.066 masked / 20.340 corrected masked PSNR, SSIM 0.4108, and
+LPIPS-CC 0.4721. Free per-training-view pose optimization in v6 made the image
+visibly sharper and improved LPIPS-CC to 0.4336, but reduced the raw held-out
+scores to 19.847 / 20.259 dB and SSIM 0.4093. Its small unregularized deltas
+(median about 5.6 mm and 0.15 degrees) are diagnostic photometric adjustments,
+not calibrated or georeferenced poses.
+
+A 250-frame unconstrained monocular colour COLMAP probe registered every frame
+at 1.079 px sparse reprojection, but its trajectory folded: global Sim(3)
+camera-centre RMS was 5.807 m, one adjacent step rotated 178.8 degrees, and
+independent temporal blocks implied incompatible scales. It rejects that
+unconstrained monocular solve, not colour-aware bounded refinement in general.
+No more Rosario work is scheduled for the current full-field milestone.
+Complete evidence is in
+`docs/experiments/ROSARIO_V2_SEQUENCE5_PILOT.md`.
 
 ## Pose reconstruction evidence
 
@@ -210,11 +299,54 @@ sidecars, empty or hash-mismatched PLYs, and failed markers. This path permits
 local visual inspection only; it does not make a failed map eligible for a
 metric georeferencing claim.
 
-The real Citrus preflight passed on 2026-08-02 with the stable USB2 mount,
-**86 GiB** free on internal storage, a derived **0.10 m** sampling target,
-approximately **2,288** expected stereo pairs, a **0.119885 m** baseline, and
-all **7,593/7,593** selected NavSatFix samples associated with receiver-fixed
-RTK evidence. No end-to-end diagnostic run or GS artifact has been started yet.
+The real full-window diagnostic continuation subsequently reached GS. Its
+failure and the bounded follow-up are recorded below; it produced no completed
+parameter artifact or PLY.
+
+### Generic-auto full-window GS failure and bounded follow-up
+
+The fresh 543--735 s generic-auto run published **1,847 stereo pairs** and
+registered **3,694/3,694 images**. Its visual reconstruction was locally
+strong: **1.001269 px** mean reprojection error, **37.895351** mean track
+length, and diagnostic Sim(3) scale **1.000721**. Fixed-scale georeferencing
+still failed honestly at **0.293749 m** held-out median, **0.315424 m** inlier
+p95 and **57.45%** support. Diagnostic-render authorization retained that
+failure label and allowed GS to start without turning it into a metric claim.
+
+The monolithic 227 m GS then degraded monotonically and was stopped after the
+14,000-step evaluation:
+
+| Step | Masked PSNR | Corrected masked PSNR | Near PSNR | SSIM | LPIPS-CC |
+|---:|---:|---:|---:|---:|---:|
+| 2,000 | **18.45** | **19.01** | **19.44** | **0.556** | **0.561** |
+| 14,000 | 15.43 | 16.99 | 15.98 | 0.508 | 0.608 |
+
+The source frames and COLMAP poses remained usable. The immediate failure was
+the GS resource/optimizer interaction: a four-million-point cloud was clipped
+at initialization to the measured **2,462,524-Gaussian** VRAM cap, leaving no
+growth headroom; dense regularization and relocation operated across a long,
+sparsely visible scene; and upstream MCMC continued injecting position noise
+after its nominal refinement cutoff. The interrupted implementation saved only
+diagnostic render JPEGs, not `params.pt`, metrics, or a PLY.
+
+The generic correction now derives the initial-cloud ceiling from the same
+measured VRAM policy. On this 7.656 GiB GPU it resolves to **820,841 points**,
+allowing growth toward the safe **2,462,524** final cap rather than beginning
+at it. Training atomically retains the earliest best held-out
+`psnr_masked_cc` checkpoint, restores it for final evaluation/PLY export, and
+stops the third-party MCMC callback at `refine_stop_iter`. Interrupted runs
+retain an explicitly incomplete checkpoint but cannot pass completion gates.
+
+The bounded same-corridor retrace at **330--410 s** then completed: **788**
+stereo frames / **1,576** images, all registered, at **0.8793 px** mean
+reprojection. Fixed-scale georeferencing passed at **0.1172 m** held-out median
+and **0.1373 m** p95. Because the launcher explicitly requested diagnostic
+rendering, the artifact correctly remained metric-claim ineligible rather than
+silently promoting itself. Its GS selected step 34,500 at **21.1975** masked /
+**22.6319** corrected masked PSNR, SSIM **0.6349**, and LPIPS-CC **0.4598**.
+This supports bounded visibility/capacity as the practical full-field route;
+it is not directly comparable to headland PSNR because the scene and split
+differ.
 
 ## Contract-v2 work: Phase 0 accepted baseline
 
@@ -304,7 +436,7 @@ Implemented and covered by unit/synthetic tests:
   frontends, backends, workflows, and diagnostics are explicit subpackages;
   the former collision-prone global package names no longer exist.
 - Dataset-specific ingestion lives under `src/rtk_splat/adapters/`; the registry
-  supports ROS 2 ZED/u-blox, ROS 1 CitrusFarm, and AgriGS.
+  supports ROS 2 ZED/u-blox, ROS 1 CitrusFarm, ROS 1 Rosario v2, and AgriGS.
 - Calibration ROS topics, u-blox message registration, message decoding, and
   bounded MCAP reading moved into `src/rtk_splat/adapters/calibration_bag.py`.
   Diagnostics retain only plain records, numerical analysis, COLMAP parsing,
@@ -397,10 +529,17 @@ Implemented and unit-tested:
 - a required physically admissible bounded-degree connected solve graph with
   fail-closed component diagnostics.
 
-The real headland GPU/CPU feature A/B and
-all/dense/balanced/sparse keyframe A/B have **not** been run. Phase 4 is
-prepared for measurement, not yet demonstrated as a speed or quality
-improvement.
+The real headland GPU/CPU feature and all-frame pose A/B is complete. Both arms
+registered **2,688/2,688** images and passed fixed-scale gates. GPU feature
+extraction took 77 s versus 4,053 s for CPU (about **52.6x faster**) and had
+slightly lower mean reprojection error (1.2129 versus 1.2753 px). The GPU
+all-frame Global pose then completed a matched 65k GS control at **24.3639 dB**
+masked and **25.7326 dB** corrected masked PSNR: only -0.0810/-0.1153 dB from
+the accepted reference and inside the predeclared 0.3 dB gate.
+
+Only the dense/balanced/sparse adaptive-keyframe GS A/B remains unrun.
+Phase 4 keyframe reduction is therefore implemented and planned, but not yet
+demonstrated as a quality-preserving speed improvement.
 
 One bounded planning-only smoke used the normalized real headland segment with
 the `balanced` preset and image-quality decoding disabled. It completed in
@@ -498,19 +637,19 @@ short, almost linear slice is intentionally not used to judge Global Mapper
 or fixed-scale georeferencing observability, so no mapper or GS smoke is
 claimed. The current repository-wide cleanup receipt is recorded above.
 
-`scripts/runs/citrusfarm_05_13d_uturn.sh` provides plan, preflight, fresh run,
-and evidence-checked resume modes without `tmux`. It runs ingest, immutable
-SGBM depth, the all-frame GPU frontend, bounded Global Mapper, all-frame
-registration and held-out quality gates, pose export, cloud construction, and
-the matched 65,000-iteration/2.5-million-Gaussian training profile. The measured
+The public Citrus launchers are thin run specifications over one private shared
+driver. Both provide plan, preflight, fresh run, and evidence-checked resume
+modes without `tmux`. They run ingest, immutable SGBM depth, the all-frame GPU
+frontend, bounded Global Mapper, all-frame registration and held-out quality
+gates, pose export, cloud construction, and runtime-derived GS training. The measured
 first attempt took about **42 min** to the export gate: 9m53s ingest, 3m29s
 SGBM, 2m49s frontend build/features/rig/priors, 13m39s matching, and 11m18s
-backend preparation/solve/registration/quality. GS remains an estimated
-**3--5 hours** because this pose did not pass and training was not started.
+backend preparation/solve/registration/quality. The later generic-auto
+full-window diagnostic GS exposed the optimizer failure documented above.
 
-A full-window Citrus ingest, COLMAP reconstruction, and rejected RTK-refinement
-control now exist, but no accepted
-pose artifact, cloud, GS model, or rendering metric has been produced. In
+A full-window Citrus ingest, COLMAP reconstruction, rejected RTK-refinement
+controls, and an incomplete diagnostic GS trajectory now exist, but no accepted
+pose artifact or completed Citrus GS/PLY has been produced. In
 particular, the headland 24.8 dB result cannot be promised or directly compared
 across a different scene, camera, motion profile, and held-out image
 distribution.
@@ -571,8 +710,9 @@ These differences are a practical quality tie, not a quality gain. The mapper
 stage fell from about 581 minutes to 18.1 minutes—about **32x faster**—while
 retaining every frame. On the already canonical historical segment, the other
 measured stages were approximately 63 minutes for feature extraction, 19
-minutes for matching, and 4.2 hours for GS. These timings do not yet measure
-the new standalone frontend or adaptive-keyframe arms.
+minutes for matching, and 4.2 hours for GS. The modern GPU frontend control
+separately measured 77 s for features, 858 s for matching, and 776 s for its
+Global solve. The adaptive-keyframe arms remain unmeasured.
 
 ## Genericity status
 
@@ -583,6 +723,7 @@ dataset adapter
     -> immutable contract-v2 segment
     -> sealed mapper-neutral frontend
     -> isolated named pose backend
+    -> sealed visibility TilePlan or single-scene path
     -> pose-matched cloud
     -> GS mapper/evaluator
 ```
@@ -593,38 +734,170 @@ unit/synthetic checks:
 - project ROS 2 ZED/u-blox input;
 - AgriGS external-folder input; and
 - CitrusFarm-style ordered ROS 1 bags with stereo `sensor_msgs/Image` and
-  single-receiver Piksi `NavSatFix`.
+  single-receiver Piksi `NavSatFix`; and
+- Rosario v2 ROS 1 input with rectified IR stereo, aligned recorded depth,
+  separately sealed RGB, and offline dual-position PPK evidence.
 
 Real-data evidence differs by source. The headland contract migration is fully
 published and validated. CitrusFarm has passed bag-chain, timing, calibration,
 sampling, storage, environment, bounded contract publication, SGBM, sealed
 frontend, complete visual reconstruction, and registration checks. Its first
-full-window pose failed the factor-held-out RTK export gate, and GS remains
-unverified.
+  full-window pose failed the factor-held-out RTK export gate, and no Citrus
+metric GS is accepted. Rosario has completed immutable publication, all-frame
+stereo Global reconstruction, production fixed-scale pose export, one IR/depth
+GS, and several metric-ineligible colour diagnostics.
 
 Not implemented or verified:
 
 - arbitrary ROS topic/message layouts without configuration;
 - stereo cameras distributed across independent recordings;
-- full-field submaps and a custom RTK-constrained local BA/submap graph;
-- a fresh real v2 headland run through the new frontend/backend interface; and
-- a complete real CitrusFarm pose and GS result.
+- a full 77-minute global visual pose solve or automatic TilePlan;
+- a complete real CitrusFarm pose and GS result; and
+- an independently validated Rosario RGB extrinsic/clock state and a
+  production-eligible colour GS result.
+
+## Sealed visibility TilePlan
+
+TilePlan schema v3 and the `tiles-plan` stage are implemented. They consume one
+metric-depth segment and one complete global pose artifact, derive an oriented
+spatial support graph from projected depth, recursively split under a derived
+training-presentation budget, and publish disjoint ENU cores with overlapping
+visibility context. Row count, waypoint labels, and fixed time intervals are
+not inputs.
+
+The artifact is atomic and non-overwriting. It content-seals both image streams,
+all depth, the segment contract, the complete pose artifact, exact frame lists,
+support geometry, configuration, and package state. Its verifier recomputes
+selection, split preservation, ownership, capacity, and core-support coverage.
+A bounded number of depthless frames may inherit adjacent temporal membership;
+exceeding the declared fraction fails closed. Legacy pose status propagates and
+cannot become a production metric claim.
+
+The cached headland behaved as intended:
+
+- automatic capacity returned one tile because 1,176 training frames fit under
+  the resolved 1,300-frame budget;
+- the controlled two-tile artifact `headland-two-tile-seam-v1` retained
+  919/879 training frames and 132/126 validation frames;
+- its core training-support coverage is 99.339%/99.356%; and
+- its 2.482 m context shares 622 training frames.
+
+The forced split lies near the middle of the measured dominant row direction;
+it is not a row/U-turn hard-code. The plan is marked provisional because the
+historical AB03 pose has `legacy_unassessed` evidence under the modern schema.
+It is valid for a rendering/seam A/B but not a new georeferencing claim.
+
+Tile execution and scene publication are now implemented. A tile cloud uses
+only its sealed training IDs and crops metric points to the visibility context;
+packed context masks constrain depth and photometric supervision without
+copying the source segment. Training preserves the full context checkpoint but
+exports only exact half-open core-owned Gaussian centres. `scene-publish`
+rejects mismatched source/pose/plan/trainer/config identities, concatenates the
+core tensors, renders every one of the 168 source validation views once with no
+far-plane truncation, and separately gates a 1 m internal-boundary band. The
+real cached plan supplies 20,206,365 seam depth pixels across 77 held-out views.
+Quality failures publish an explicitly labelled diagnostic scene rather than a
+false pass.
+
+The controlled GPU run completed on 2026-08-10. It first trained a new
+same-code 65k monolithic control, then the two 65k tiles, because the frozen
+AB03 result used an earlier trainer implementation. All stages exited zero and
+the terminal scene seal verifies against the complete source evidence.
+
+| Held-out metric | Same-code monolith | Core-owned tiled scene | Change |
+|---|---:|---:|---:|
+| Masked PSNR | 24.3481 dB | **24.6528 dB** | **+0.3048 dB** |
+| Corrected masked PSNR | 25.7284 dB | **26.1087 dB** | **+0.3803 dB** |
+| SSIM | 0.5851 | **0.6126** | **+0.0274** |
+| LPIPS-CC | 0.3221 | **0.2959** | **-0.0261** |
+
+The same 168 source validation views were rendered exactly once. In the exact
+1 m internal-boundary band, containing 20,206,365 metric-depth pixels across
+77 held-out views, masked/corrected masked PSNR improved by 0.1580/0.0921 dB,
+SSIM improved by 0.0278, and LPIPS-CC decreased by 0.0110. All 13 source,
+identity, ownership, whole-view, and seam checks pass.
+
+Each tile trained to 2.5 million Gaussians. Exact half-open ownership retained
+3,751,281 tensors in the combined scene, and the opacity-filtered provisional
+PLY retains 2,258,580. The run took **11 h 29 min 46 s** on the RTX 3080
+Laptop, occupied **2.1 GiB**, and published
+`scene.PROVISIONAL.ply` with SHA-256
+`ea7e3eb71c1d0ef50226f870da3ed620649de12a1f3d3e9d6eafb3955b92e398`.
+There were no OOMs, swaps, failed stages, or scientific warnings; only benign
+dependency deprecation/future warnings appeared.
+
+This proves that visibility context plus exact ENU core ownership can scale GS
+capacity without creating a seam on this sequence. It is not an equal-compute
+claim: the two-tile arm uses two independent 65k/2.5-million optimizations.
+The average improved, but 28/168 frames lost more than 0.3 dB raw masked PSNR
+and five lost more than 1 dB, so production reporting must add lower-tail and
+temporal-block checks. Stage-level recovery verifies completed artifacts;
+exact within-optimizer resume remains future work for the multi-day server
+build.
+
+The whole recording audit found about 4,640 s and 69,088 stereo frames. At
+stride five it would contain roughly 13,800 pairs and 12,100 training frames,
+so the current presentation budget implies at least about ten tiles before
+halo duplication. Metric 0.10 m sampling may reduce that count, but the final
+topology cannot be known until the complete depth segment and global pose
+artifact exist. See [TILED_SCENE.md](docs/methods/TILED_SCENE.md).
+
+## Full-field deployment preparation
+
+The first guarded laptop/server path is implemented and documented in
+[SERVER_RUN.md](SERVER_RUN.md):
+
+- ROS2 ingest now spools each selected compressed stereo pair to disk and
+  atomically consumes it during publication instead of retaining the complete
+  recording in RAM;
+- heading association keeps the original 150 ms freshness definition while
+  bounding the accepted full-field dropout shape to at most 0.5% of selected
+  frames, two consecutive frames, and 0.5 s nearest-source residual. Invalid
+  rows remain explicitly invalid;
+- the derived depth segment can be materialized as a self-contained,
+  terminally SHA-256-sealed directory with no symlinks, so the raw bag does not
+  need to move to the server;
+- the server preflight binds the portable data, clean Git snapshot, exact
+  Python/COLMAP stack, RTX 3090/driver, RAM, storage mount, and LPIPS weights;
+  the first unmeasured full solve defaults to 120 GiB RAM and 500 GiB free
+  space; and
+- the full launcher prepares one global pose/automatic TilePlan, selects the
+  highest-workload tile for a smoke test, then trains arbitrary planned tiles
+  sequentially and publishes a production scene without a monolithic GS
+  reference. Completed stages are verified and reused; an interrupted tile is
+  preserved and retried under a new immutable attempt name.
+
+No full bag ingest, server pose solve, or server GS has been started. The
+current Buffalo connection is USB 2 at a measured 35.7 MB/s and is expected to
+dominate local ingest until reconnected at USB 3. Exact optimizer-level resume
+is not claimed; the recovery boundary is the completed tile.
+
+The finalized real-bag ingest probe covered the first 120 s and published 316
+frames over 108.92 s in **29 min 18 s**. It peaked at **452,984 KiB RSS** with
+no swap. Exactly one heading association (frame 315) was 190.482 ms from its
+nearest source, so it remained explicitly invalid; the observed invalid
+fraction was 0.316%, longest run one frame, and all bounded full-field policy
+checks passed. All 316 initial visual poses remained available as rough
+initialization. This verifies memory and dropout behavior, not full-recording
+runtime or final georeferencing.
 
 ## Known scientific limitations
 
 - Validation views participated in the historical SfM pose estimation.
 - The headland sequence lacks independent camera-pose ground truth.
 - One successful scene is insufficient to claim generalization or SOTA.
-- The historical incremental reference used legacy bounded Sim(3) alignment;
-  the current backend uses fixed-scale SE(3), so a provenance-matched control
-  is still required.
+- The controlled two-tile scene passes rendering and seam gates, but its
+  `legacy_unassessed` source pose makes it ineligible for a new metric-
+  georeferencing claim.
 - Global Mapper does not optimize RTK factors in bundle adjustment. The
   optional sidecar constrains camera positions only; it does not add an
   explicit dual-antenna heading factor.
 - Current right imagery contributes to depth and visual pose reconstruction;
   right-camera GS photometric supervision is not validated.
-- Full-field chunking, submap consistency, and tile merging are not
-  implemented.
+- Tile planning, tile-aware cloud/training, core-cropped export, scene
+  publication, and whole-scene/boundary-band validation completed one real GPU
+  A/B. Arbitrary-N orchestration and no-monolith production publication are now
+  implemented; exact within-training resume remains deliberately unclaimed.
 - Independent target-based stereo calibration has not resolved the remaining
   shared scale uncertainty.
 - CitrusFarm course heading is weak or unavailable during near-stationary
@@ -633,35 +906,34 @@ Not implemented or verified:
 - CitrusFarm's provided trajectory is GNSS-derived and is used only for window
   selection/evaluation context; it is not an independent pose ground truth for
   a method that already consumes Piksi GNSS.
+- Rosario's PPK sigma is an external prior rather than surveyed ground truth;
+  its camera/antenna transform is not independently surveyed, and its current
+  RGB extrinsic/clock pair is not jointly observable enough for a metric claim.
 
-## Next controlled experiment
+## Next full-field preparation
 
-1. Preserve both the successful visual reconstruction and the rejected
-   position-prior refinement. Do not reinterpret the 1.72 cm aggregate median
-   gain as acceptance.
-2. Preserve the completed fresh pose-prior mapper arm as a rejected baseline;
-   it improved held-out geometry but failed the existing RTK and scale gates.
-3. Implement bounded
-   RTK-anchored local submaps with robust temporal/block consistency and an
-   RTK-constrained submap graph. That is the method-level path; repeatedly
-   rerunning a whole-model COLMAP refinement is not.
-4. Once a pose mechanism passes, make one new immutable Citrus ingest so the
-   verified receiver-state stream is retained, then reproduce the accepted pose
-   into a new work directory. If interrupted without code/config changes, use
-   the launcher's evidence-checked resume mode.
-5. If the pose passes, complete one matched 65,000-iteration Citrus GS run and
-   report its scene-specific train/validation metrics, runtime, peak resources,
-   and visual failure modes. Compare approaches on the same Citrus split; do
-   not compare raw PSNR directly with headland.
-6. Retain the validated normalized headland segment for the pending efficiency
-   A/B: compare `gpu` and `cpu_reference` features, then pose-only `all`,
-   `dense`, `balanced`, and `sparse` Global arms with incremental as the
-   fallback/control.
-7. Train only the headland all-frame control and selected adaptive arm with
-   matched seed, split, depth, GS configuration, and provenance.
+1. Run the memory-bounded local ingest and SGBM stage once, materialize the
+   derived segment without symlinks, and transfer its terminal SHA-256 inventory
+   to server-local storage. The raw 151.9 GB MCAP does not need to move.
+2. Freeze and push one clean tested source snapshot, install the pinned Python
+   and COLMAP environments, and pass the server preflight. The first full solve
+   defaults to a 120 GiB RAM and 500 GiB free-space gate.
+3. Run and gate the complete global visual pose
+   reconstruction, and generate an automatic TilePlan without a forced count.
+   The roughly 27,600-image pose solve is now the main unvalidated bottleneck.
+4. Train one 2.5-million-Gaussian tile on the RTX 3090 as a resource/quality
+   smoke, then launch the remaining roughly 10--15 planned tiles.
 
-The Phase 4 acceptance target remains a material pose-runtime reduction with no
-more than **0.2--0.3 dB** masked-PSNR loss and no georeferencing regression. A
-further 3.8 dB pose-only gain is not assumed. No paper-level, SOTA, or
-cross-dataset claim should be made from adapter preflight or a single
-CitrusFarm run.
+The RTX 3090 and 40 TB storage are sufficient for the validated sequential
+per-tile GS workload. A separate guarded arbitrary-tile server launcher is now
+implemented; the cached two-tile script must still not be repurposed. Recovery
+is exact between sealed stages and tile attempts, but an interrupted optimizer
+restarts only that active tile under a new name. A provisional end-to-end budget
+is 2--4 days and 0.5--1 TB of fast working storage, subject to the full pose
+solve and first server-tile measurements.
+
+The adaptive frame-density A/B is optional: run it before the server only if
+reduced sampling will be used in production. Otherwise the first full-field
+experiment should retain all selected frames and spend the extra runtime to
+avoid introducing an unvalidated variable. No paper-level or SOTA claim should
+be made from one field or from cross-dataset PSNR comparisons.

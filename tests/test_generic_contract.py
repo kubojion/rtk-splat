@@ -534,7 +534,12 @@ class AdapterRegistryTests(unittest.TestCase):
     def test_registry_declares_exact_supported_adapters(self):
         self.assertEqual(
             set(ADAPTER_NAMES),
-            {"agrigs", "ros1_citrusfarm", "ros2_zed_ublox"},
+            {
+                "agrigs",
+                "ros1_citrusfarm",
+                "ros1_rosario_v2",
+                "ros2_zed_ublox",
+            },
         )
 
     def test_registry_dispatches_ros2_with_selection(self):

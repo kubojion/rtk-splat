@@ -1,0 +1,26 @@
+# Frozen first full-field transfer profile. It inherits the generic candidate
+# policy but keeps the cloud, optimization, Gaussian, and scale limits that
+# reproduced the accepted 1,344-frame headland result. Test a higher-capacity
+# arm on one server tile before creating a new profile.
+profile: quality_v1
+
+segment:
+  # Preserve the 150 ms definition of a fresh observation, but tolerate a
+  # sparse receiver dropout only when it affects at most 0.5% of selected
+  # frames. Those rows remain explicitly invalid and cannot become heading
+  # evidence; a larger dropout still aborts ingest.
+  maximum_heading_association_invalid_fraction: 0.005
+  # Prevent the aggregate budget from admitting one long outage: no more than
+  # two adjacent selected frames and no nearest source older than 0.5 s. At
+  # the accepted 3 Hz sampling this bounds a dropout to under one second while
+  # admitting the observed isolated receiver epoch loss.
+  maximum_heading_association_invalid_run_frames: 2
+  maximum_heading_association_invalid_residual_s: 0.5
+
+cloud:
+  max_points: 4000000
+
+train:
+  iterations: 65000
+  max_gaussians: 2500000
+  max_scale_m: 0.20

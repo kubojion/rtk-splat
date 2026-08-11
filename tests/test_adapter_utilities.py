@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from rtk_splat.adapters.synchronization import (
     monotonic_matches,
     nearest_matches,
 )
+from rtk_splat.adapters.records import StagedPayload
 from rtk_splat.adapters.ros2_zed_ublox import FrameRecord, pair_stereo_timestamps
 
 
@@ -207,6 +209,91 @@ class AdapterRuntimeDefaultTests(unittest.TestCase):
 
 
 class Ros2EvidenceTests(unittest.TestCase):
+    def test_stereo_reader_spools_selected_payloads_instead_of_retaining_bytes(self):
+        left = SimpleNamespace(topic="/left", msgtype="CompressedImage")
+        right = SimpleNamespace(topic="/right", msgtype="CompressedImage")
+
+        class FakeReader:
+            def __init__(self, _path):
+                self.connections = [left, right]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def messages(self, *, connections):
+                selected = {connection.topic for connection in connections}
+                for index in range(32):
+                    stamp = SimpleNamespace(
+                        sec=10,
+                        nanosec=index * 10_000_000,
+                    )
+                    payload = bytes([index]) * 65_536
+                    if left.topic in selected:
+                        yield left, 0, SimpleNamespace(
+                            header=SimpleNamespace(stamp=stamp),
+                            data=b"left" + payload,
+                        )
+                    if right.topic in selected:
+                        yield right, 0, SimpleNamespace(
+                            header=SimpleNamespace(stamp=stamp),
+                            data=b"right" + payload,
+                        )
+
+        topics = SimpleNamespace(left_image=left.topic, right_image=right.topic)
+        typestore = SimpleNamespace(deserialize_cdr=lambda raw, _kind: raw)
+        with tempfile.TemporaryDirectory() as temporary:
+            spool = Path(temporary)
+            with patch.object(ros2_adapter, "_reader_type", return_value=FakeReader):
+                frames = list(
+                    ros2_adapter.read_stereo_frames(
+                        [Path("/fake/bag")],
+                        topics,
+                        typestore,
+                        10.0,
+                        10.31,
+                        1,
+                        spool_directory=spool,
+                    )
+                )
+
+            self.assertEqual(len(frames), 32)
+            self.assertTrue(
+                all(isinstance(frame.left_jpeg, StagedPayload) for frame in frames)
+            )
+            self.assertTrue(
+                all(isinstance(frame.right_jpeg, StagedPayload) for frame in frames)
+            )
+            self.assertEqual(len(list(spool.iterdir())), 64)
+            self.assertEqual(frames[7].left_jpeg.path.read_bytes()[:4], b"left")
+            self.assertEqual(frames[7].right_jpeg.path.read_bytes()[:5], b"right")
+
+    def test_ingest_failure_removes_its_private_payload_spool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "segment"
+            captured = []
+
+            def fail(_cfg, _destination, *, window, payload_spool):
+                captured.append(payload_spool)
+                (payload_spool / "partial.payload").write_bytes(b"partial")
+                raise RuntimeError("synthetic ingest failure")
+
+            with patch.object(
+                ros2_adapter, "_ingest_config_v2_spooled", side_effect=fail
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic ingest failure"):
+                    ros2_adapter.ingest_config_v2(
+                        SimpleNamespace(), destination, window=None
+                    )
+
+            self.assertEqual(len(captured), 1)
+            self.assertFalse(captured[0].exists())
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.glob(".segment.payloads-*")), [])
+
     def test_camera_rate_measurement_uses_bounded_header_sample(self):
         connection = SimpleNamespace(topic="/left", msgtype="Image")
         messages = [

@@ -14,11 +14,12 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 
 import numpy as np
 
-from rtk_splat.adapters.records import FrameRecord, RtkTrack
+from rtk_splat.adapters.records import FrameRecord, RtkTrack, StagedPayload
 from rtk_splat.adapters.ros2_rtk_io import (
     build_typestore,
     read_rtk_track as _read_rtk_track,
@@ -173,6 +174,7 @@ def read_stereo_frames(
     *,
     timestamp_tolerance_s: float = 0.02,
     read_ahead_s: float = 2.0,
+    spool_directory: str | Path | None = None,
 ):
     """Yield every `stride`-th stereo pair with header stamp in [t0, t1].
 
@@ -181,6 +183,9 @@ def read_stereo_frames(
     association using the configured timestamp tolerance; it makes no
     frame-rate assumption. Pending payloads older than the tolerance are
     discarded so memory stays bounded regardless of selected window length.
+    When ``spool_directory`` is supplied, every yielded image payload is a
+    disposable :class:`StagedPayload` on disk instead of an in-memory byte
+    string.  The directory must already exist and be empty.
     """
     if isinstance(stride, bool) or not isinstance(stride, (int, np.integer)):
         raise ValueError("stride must be a positive integer")
@@ -190,6 +195,13 @@ def read_stereo_frames(
         raise ValueError("timestamp_tolerance_s must be finite and non-negative")
     if not np.isfinite(read_ahead_s) or read_ahead_s < 0:
         raise ValueError("read_ahead_s must be finite and non-negative")
+
+    spool_root = None if spool_directory is None else Path(spool_directory)
+    if spool_root is not None:
+        if not spool_root.is_dir():
+            raise ValueError("spool_directory must be an existing directory")
+        if any(spool_root.iterdir()):
+            raise ValueError("spool_directory must be empty")
 
     tolerance_ns = int(round(timestamp_tolerance_s * 1_000_000_000))
     t0_ns = int(round(t0 * 1_000_000_000))
@@ -236,12 +248,21 @@ def read_stereo_frames(
                 for left, right in _drain_stereo_pairs(
                     pending_left, pending_right, tolerance_ns
                 ):
+                    left_payload: bytes | StagedPayload = left.payload
+                    right_payload: bytes | StagedPayload = right.payload
+                    if spool_root is not None:
+                        left_path = spool_root / f"left_{kept:06d}.payload"
+                        right_path = spool_root / f"right_{kept:06d}.payload"
+                        left_path.write_bytes(left.payload)
+                        right_path.write_bytes(right.payload)
+                        left_payload = StagedPayload(left_path)
+                        right_payload = StagedPayload(right_path)
                     kept += 1
                     yield FrameRecord(
                         t=left.stamp_ns * 1e-9,
                         t_right=right.stamp_ns * 1e-9,
-                        left_jpeg=left.payload,
-                        right_jpeg=right.payload,
+                        left_jpeg=left_payload,
+                        right_jpeg=right_payload,
                         left_header_ns=left.stamp_ns,
                         right_header_ns=right.stamp_ns,
                     )
@@ -320,7 +341,29 @@ def ingest_config_v2(
     *,
     window: Mapping[str, Any] | None = None,
 ) -> SegmentReader:
-    """Run the ROS2 adapter from a resolved robot/sequence configuration."""
+    """Run one memory-bounded ROS2 ingest and atomically publish its segment."""
+    output = Path(destination)
+    if output.exists():
+        raise FileExistsError(f"refusing to modify existing segment: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    prefix = f".{output.name}.payloads-"
+    with TemporaryDirectory(prefix=prefix, dir=output.parent) as temporary:
+        return _ingest_config_v2_spooled(
+            cfg,
+            output,
+            window=window,
+            payload_spool=Path(temporary),
+        )
+
+
+def _ingest_config_v2_spooled(
+    cfg,
+    destination: str | Path,
+    *,
+    window: Mapping[str, Any] | None,
+    payload_spool: Path,
+) -> SegmentReader:
+    """Implementation executed while its disposable payload spool is alive."""
     from rtk_splat.adapters.pose_sources import make_pose_source
     from rtk_splat.core.poses import (
         pose_frames_from_extrinsic,
@@ -395,6 +438,7 @@ def ingest_config_v2(
             t1 - offset_s,
             stride,
             timestamp_tolerance_s=stereo_tolerance_s,
+            spool_directory=payload_spool,
         )
     )
     pose_stamps = [
@@ -462,6 +506,27 @@ def ingest_config_v2(
     tolerance_ns = int(
         round(float(getattr(cfg.segment, "association_tolerance_s", 0.15)) * 1.0e9)
     )
+    maximum_heading_invalid_residual_s = getattr(
+        cfg.segment,
+        "maximum_heading_association_invalid_residual_s",
+        0.0,
+    )
+    if isinstance(maximum_heading_invalid_residual_s, (bool, np.bool_)):
+        raise ValueError(
+            "segment.maximum_heading_association_invalid_residual_s must be "
+            "finite and non-negative"
+        )
+    maximum_heading_invalid_residual_s = float(
+        maximum_heading_invalid_residual_s
+    )
+    if (
+        not np.isfinite(maximum_heading_invalid_residual_s)
+        or maximum_heading_invalid_residual_s < 0
+    ):
+        raise ValueError(
+            "segment.maximum_heading_association_invalid_residual_s must be "
+            "finite and non-negative"
+        )
     return publish_segment_v2(
         destination,
         selected_frames,
@@ -485,6 +550,21 @@ def ingest_config_v2(
         clock_offset_ns=clock_offset_ns,
         association_tolerance_ns=tolerance_ns,
         stereo_tolerance_ns=int(round(stereo_tolerance_s * 1.0e9)),
+        maximum_heading_association_invalid_fraction=float(
+            getattr(
+                cfg.segment,
+                "maximum_heading_association_invalid_fraction",
+                0.0,
+            )
+        ),
+        maximum_heading_association_invalid_run_frames=getattr(
+            cfg.segment,
+            "maximum_heading_association_invalid_run_frames",
+            0,
+        ),
+        maximum_heading_association_invalid_residual_ns=int(
+            round(maximum_heading_invalid_residual_s * 1.0e9)
+        ),
         splits=splits,
         provenance={
             "adapter": "ros2_zed_ublox",

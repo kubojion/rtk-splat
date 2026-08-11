@@ -188,7 +188,13 @@ frontend; that omission is recorded in the prior-stage report rather than
 silently claiming a complete stochastic model.
 
 Dual-RTK heading rows carry the complete `baseline_ned_m`,
-`acc_heading_rad`, and `valid` flag. `observations/imu.npz`, when declared,
+`acc_heading_rad`, and `valid` flag. When an adapter explicitly permits a
+bounded source dropout, it also stores `association_valid`: the nearest raw
+row/index/timestamp/residual is retained, while usable `valid` must be
+`raw_valid AND association_valid`. Metadata records the unchanged freshness
+tolerance plus aggregate, consecutive-run, and maximum-residual gates; the
+contract validator recomputes them. GNSS position association remains strict.
+`observations/imu.npz`, when declared,
 contains strictly increasing `timestamp_ns`, `accel_mps2`, and `gyro_radps`;
 `orientation_xyzw` is optional.
 

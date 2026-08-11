@@ -206,6 +206,45 @@ class ConfigLedgerTests(unittest.TestCase):
                 (workdir / "config_artifacts/resolved_config.json").exists()
             )
 
+    def test_tile_plan_flags_are_stage_scoped_and_recorded(self):
+        args = cli.build_parser().parse_args([
+            "tiles-plan", "--config", "/unused.yaml",
+            "--pose-artifact-root", "/poses", "--tile-plan-name", "two-v1",
+            "--tile-count", "2",
+        ])
+        self.assertEqual(args.tile_count, 2)
+        self.assertEqual(
+            cli._stage_overrides(args)["pose_artifact_root"], "/poses"
+        )
+        with self.assertRaisesRegex(ValueError, "valid only for tiles-plan"):
+            cli.main([
+                "validate", "--config", "/does/not/exist.yaml",
+                "--tile-count", "2",
+            ])
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            cli.main([
+                "tiles-plan", "--config", "/does/not/exist.yaml",
+                "--tile-count", "0",
+            ])
+        tiled = cli.build_parser().parse_args([
+            "train", "--config", "/unused.yaml",
+            "--tile-plan", "/plans/two-v1", "--tile-id", "tile-0000",
+            "--pose-artifact-root", "/poses",
+        ])
+        overrides = cli._stage_overrides(tiled)
+        self.assertEqual(overrides["tile_plan"], "/plans/two-v1")
+        self.assertEqual(overrides["tile_id"], "tile-0000")
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            cli.main([
+                "train", "--config", "/does/not/exist.yaml",
+                "--tile-id", "tile-0000",
+            ])
+        with self.assertRaisesRegex(ValueError, "cloud and train"):
+            cli.main([
+                "validate", "--config", "/does/not/exist.yaml",
+                "--tile-plan", "/plans/two-v1", "--tile-id", "tile-0000",
+            ])
+
     def test_cli_commits_only_after_successful_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

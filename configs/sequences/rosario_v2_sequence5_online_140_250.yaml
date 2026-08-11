@@ -1,0 +1,37 @@
+# Degraded-GNSS ablation over the identical images/window. This uses only the
+# online Reach M2 streams in the main bag and their recorded metre-level
+# covariance; it is not the default quality pilot. The same strict 2 cm
+# dual-baseline gate is intentional: unstable online dual heading must fail
+# preflight rather than being blessed by a looser dataset-specific threshold.
+profile: quality_v1
+robot: rosario_v2_dual_m2_d435
+
+adapter_options:
+  gnss_source: online_differential
+
+paths:
+  workdir: ~/agromap4d_work/rosario_v2_sequence5_online_140_250_v1
+  bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15.compressed.bag
+
+pose:
+  time_offset_s: 0.0
+
+segment:
+  window_s: [140.0, 250.0]
+  window_epoch_source: first_bag_log
+  frame_spacing_m: auto
+
+frontend:
+  keyframes:
+    preset: all
+
+mapper:
+  name: rosario-seq5-online-140-250-global-v1
+  pose_artifact_name: rosario-seq5-online-140-250-global-v1
+  alignment_ransac_threshold_m: 1.5
+  max_rtk_median_error_m: 1.0
+  max_rtk_p95_inlier_error_m: 2.0
+
+train:
+  run_name: rosario-seq5-online-140-250-gs-v1

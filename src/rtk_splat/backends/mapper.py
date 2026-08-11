@@ -110,6 +110,15 @@ def prepare_mapper_backend(
     matching_stage_sha256 = _marker_hash(frontend, "matching")
     if matching_stage_sha256 is None:
         raise ArtifactError("sealed frontend matching stage is incomplete or absent")
+    frontend_provenance = _json(frontend / "provenance.json")
+    contract_inputs = frontend_provenance.get("contract_inputs")
+    if not isinstance(contract_inputs, dict):
+        raise ArtifactError("frontend provenance has no source-segment contract")
+    source_segment_binding = {
+        "contract_inputs": contract_inputs,
+        "contract_inputs_sha256": canonical_hash(contract_inputs),
+        "acquisition_id": contract_inputs.get("acquisition_id"),
+    }
     inputs = {
         "frontend_artifact": str(frontend),
         "frontend_inputs": frontend_inputs,
@@ -119,6 +128,7 @@ def prepare_mapper_backend(
             "sha256"
         ],
         "matching_stage_sha256": matching_stage_sha256,
+        "source_segment_binding": source_segment_binding,
         "config": asdict(config),
         "all_image_names": all_names,
         "solve_image_names": solve_names,
@@ -983,6 +993,7 @@ def export_pose_artifact(
             "frontend_artifact": str(frontend),
             "source_backend_workspace": str(root),
             "frontend_inputs": plan["frontend_inputs"],
+            "source_segment_binding": plan["source_segment_binding"],
             "backend": config.backend,
             "backend_config": plan["config"],
             "backend_config_effective": asdict(config),

@@ -9,8 +9,10 @@ and prevents ingestion code from importing the diagnostics package.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -25,6 +27,157 @@ RELPOS_FLAG_NAMES = (
     "rel_pos_heading_valid",
     "rel_pos_normalized",
 )
+
+
+def _typed_vector(value: Any, *, name: str, dtype: np.dtype) -> np.ndarray:
+    """Return a canonical numeric vector without accepting lossy casts."""
+    array = np.asarray(value)
+    expected = np.dtype(dtype)
+    if expected.kind in "iu" and array.dtype.kind not in "iu":
+        raise ValueError(f"{name} must contain integers")
+    if expected.kind == "b" and array.dtype.kind != "b":
+        raise ValueError(f"{name} must contain booleans")
+    if expected.kind == "f" and array.dtype.kind not in "iuf":
+        raise ValueError(f"{name} must contain numeric values")
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be a vector")
+    return np.asarray(array, dtype=expected)
+
+
+def _typed_matrix_series(
+    value: Any,
+    *,
+    name: str,
+    trailing_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Return canonical floating-point matrix evidence with a sample axis."""
+    array = np.asarray(value)
+    if array.dtype.kind not in "iuf":
+        raise ValueError(f"{name} must contain numeric values")
+    if array.ndim != len(trailing_shape) + 1 or array.shape[1:] != trailing_shape:
+        suffix = ", ".join(str(item) for item in trailing_shape)
+        raise ValueError(f"{name} must have shape (N, {suffix})")
+    return np.asarray(array, dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class SecondaryGnssEvidence:
+    """Complete raw/effective fix stream for a secondary GNSS antenna.
+
+    This is deliberately one record rather than a collection of optional
+    ``RtkTrack`` attributes: a partial secondary stream must never be
+    publishable as if it were complete evidence.
+    """
+
+    header_ns: np.ndarray
+    log_ns: np.ndarray
+    enu_m: np.ndarray
+    geodetic_deg_m: np.ndarray
+    raw_covariance_enu_m2: np.ndarray
+    effective_covariance_enu_m2: np.ndarray
+    fix_status: np.ndarray
+    carrier_status: np.ndarray
+    covariance_type: np.ndarray
+    service: np.ndarray
+
+    def __post_init__(self) -> None:
+        header = _typed_vector(
+            self.header_ns, name="secondary GNSS header_ns", dtype=np.int64
+        )
+        log = _typed_vector(
+            self.log_ns, name="secondary GNSS log_ns", dtype=np.int64
+        )
+        enu = _typed_matrix_series(
+            self.enu_m, name="secondary GNSS enu_m", trailing_shape=(3,)
+        )
+        geodetic = _typed_matrix_series(
+            self.geodetic_deg_m,
+            name="secondary GNSS geodetic_deg_m",
+            trailing_shape=(3,),
+        )
+        raw_covariance = _typed_matrix_series(
+            self.raw_covariance_enu_m2,
+            name="secondary GNSS raw_covariance_enu_m2",
+            trailing_shape=(3, 3),
+        )
+        effective_covariance = _typed_matrix_series(
+            self.effective_covariance_enu_m2,
+            name="secondary GNSS effective_covariance_enu_m2",
+            trailing_shape=(3, 3),
+        )
+        fix_status = _typed_vector(
+            self.fix_status, name="secondary GNSS fix_status", dtype=np.int16
+        )
+        carrier_status = _typed_vector(
+            self.carrier_status,
+            name="secondary GNSS carrier_status",
+            dtype=np.int8,
+        )
+        covariance_type = _typed_vector(
+            self.covariance_type,
+            name="secondary GNSS covariance_type",
+            dtype=np.int16,
+        )
+        service = _typed_vector(
+            self.service, name="secondary GNSS service", dtype=np.int16
+        )
+        count = len(header)
+        if count == 0:
+            raise ValueError("secondary GNSS evidence must not be empty")
+        fields = {
+            "log_ns": log,
+            "enu_m": enu,
+            "geodetic_deg_m": geodetic,
+            "raw_covariance_enu_m2": raw_covariance,
+            "effective_covariance_enu_m2": effective_covariance,
+            "fix_status": fix_status,
+            "carrier_status": carrier_status,
+            "covariance_type": covariance_type,
+            "service": service,
+        }
+        bad = [name for name, value in fields.items() if len(value) != count]
+        if bad:
+            raise ValueError(
+                "secondary GNSS evidence arrays must have equal sample count: "
+                + ", ".join(sorted(bad))
+            )
+        if np.any(np.diff(header) <= 0):
+            raise ValueError("secondary GNSS header_ns must be strictly increasing")
+        if np.any(np.diff(log) <= 0):
+            raise ValueError("secondary GNSS log_ns must be strictly increasing")
+        for name, value in (
+            ("enu_m", enu),
+            ("geodetic_deg_m", geodetic),
+            ("effective_covariance_enu_m2", effective_covariance),
+        ):
+            if not np.isfinite(value).all():
+                raise ValueError(f"secondary GNSS {name} must be finite")
+        for name, covariance in (
+            ("raw_covariance_enu_m2", raw_covariance),
+            ("effective_covariance_enu_m2", effective_covariance),
+        ):
+            if not np.isfinite(covariance).all():
+                raise ValueError(f"secondary GNSS {name} must be finite")
+            if not np.allclose(covariance, np.swapaxes(covariance, 1, 2), atol=1e-9):
+                raise ValueError(f"secondary GNSS {name} must be symmetric")
+            if np.any(np.diagonal(covariance, axis1=1, axis2=2) < 0):
+                raise ValueError(
+                    f"secondary GNSS {name} must have non-negative diagonal"
+                )
+        canonical = {
+            "header_ns": header,
+            "log_ns": log,
+            "enu_m": enu,
+            "geodetic_deg_m": geodetic,
+            "raw_covariance_enu_m2": raw_covariance,
+            "effective_covariance_enu_m2": effective_covariance,
+            "fix_status": fix_status,
+            "carrier_status": carrier_status,
+            "covariance_type": covariance_type,
+            "service": service,
+        }
+        for name, value in canonical.items():
+            object.__setattr__(self, name, value)
 
 
 @dataclass
@@ -55,6 +208,12 @@ class RtkTrack:
     pvt_header_ns: np.ndarray | None = None
     pvt_log_ns: np.ndarray | None = None
     pvt_carrier_status: np.ndarray | None = None
+    raw_message_covariance_enu_m2: np.ndarray | None = None
+    effective_covariance_policy: Mapping[str, Any] | None = None
+    fix_service: np.ndarray | None = None
+    fix_position_valid: np.ndarray | None = None
+    fix_position_quality: np.ndarray | None = None
+    secondary_gnss: SecondaryGnssEvidence | None = None
     fix_timestamps_exact: bool = field(init=False)
     relpos_timestamps_exact: bool = field(init=False)
 
@@ -80,6 +239,49 @@ class RtkTrack:
             self.fix_covariance_type = np.full(n_fix, -1, dtype=np.int16)
         if self.fix_carrier_status is None:
             self.fix_carrier_status = np.full(n_fix, -1, dtype=np.int8)
+        if self.raw_message_covariance_enu_m2 is not None:
+            raw_covariance = _typed_matrix_series(
+                self.raw_message_covariance_enu_m2,
+                name="raw_message_covariance_enu_m2",
+                trailing_shape=(3, 3),
+            )
+            if raw_covariance.shape[0] != n_fix:
+                raise ValueError(
+                    "raw_message_covariance_enu_m2 must have one matrix per fix"
+                )
+            self.raw_message_covariance_enu_m2 = raw_covariance
+        if self.effective_covariance_policy is not None and not isinstance(
+            self.effective_covariance_policy, Mapping
+        ):
+            raise ValueError("effective_covariance_policy must be a mapping")
+        if self.fix_service is not None:
+            self.fix_service = _typed_vector(
+                self.fix_service, name="fix_service", dtype=np.int16
+            )
+            if self.fix_service.shape != (n_fix,):
+                raise ValueError("fix_service must have one entry per fix")
+        if (self.fix_position_valid is None) != (self.fix_position_quality is None):
+            raise ValueError(
+                "fix_position_valid and fix_position_quality must be supplied together"
+            )
+        if self.fix_position_valid is not None:
+            self.fix_position_valid = _typed_vector(
+                self.fix_position_valid, name="fix_position_valid", dtype=np.bool_
+            )
+            quality = np.asarray(self.fix_position_quality)
+            if quality.dtype.kind not in "US":
+                raise ValueError("fix_position_quality must contain strings")
+            self.fix_position_quality = np.asarray(quality, dtype=np.str_)
+            valid_shape = self.fix_position_valid.shape == (n_fix,)
+            quality_shape = self.fix_position_quality.shape == (n_fix,)
+            if not valid_shape or not quality_shape:
+                raise ValueError(
+                    "fix position quality fields must have one entry per fix"
+                )
+        if self.secondary_gnss is not None and not isinstance(
+            self.secondary_gnss, SecondaryGnssEvidence
+        ):
+            raise ValueError("secondary_gnss must be SecondaryGnssEvidence")
         if self.relpos_header_ns is None:
             self.relpos_header_ns = np.rint(
                 np.asarray(self.relpos_t, dtype=np.float64) * 1e9
@@ -100,7 +302,12 @@ class RtkTrack:
             self.heading_valid = np.asarray(self.heading_valid, dtype=bool)
         if self.heading_valid.shape != (n_relpos,):
             raise ValueError("heading_valid must have one entry per heading sample")
-        if self.heading_quality_kind not in {"carrier", "course", "trajectory"}:
+        if self.heading_quality_kind not in {
+            "carrier",
+            "course",
+            "trajectory",
+            "dual_position",
+        }:
             raise ValueError("unknown heading_quality_kind")
         if self.pvt_header_ns is None:
             self.pvt_header_ns = np.empty(0, dtype=np.int64)
@@ -116,6 +323,64 @@ class RtkTrack:
         ):
             raise ValueError("NavPVT evidence arrays must have equal vector shape")
 
+    def apply_effective_covariance(
+        self,
+        covariance_enu_m2: np.ndarray,
+        *,
+        policy: Mapping[str, Any],
+    ) -> None:
+        """Atomically retain receiver covariance and install an external prior."""
+        if self.raw_message_covariance_enu_m2 is not None:
+            raise ValueError("effective covariance has already been applied")
+        if not isinstance(policy, Mapping) or not policy:
+            raise ValueError("effective covariance policy must be a non-empty mapping")
+        raw = _typed_matrix_series(
+            self.fix_covariance_enu_m2,
+            name="fix_covariance_enu_m2",
+            trailing_shape=(3, 3),
+        )
+        effective = _typed_matrix_series(
+            covariance_enu_m2,
+            name="effective fix covariance",
+            trailing_shape=(3, 3),
+        )
+        expected = (len(self.fix_t), 3, 3)
+        if raw.shape != expected or effective.shape != expected:
+            raise ValueError(
+                f"raw and effective fix covariance must have shape {expected}"
+            )
+        for name, value in (("raw", raw), ("effective", effective)):
+            if not np.isfinite(value).all():
+                raise ValueError(f"{name} fix covariance must be finite")
+            if not np.allclose(value, np.swapaxes(value, 1, 2), atol=1e-9):
+                raise ValueError(f"{name} fix covariance must be symmetric")
+            if np.any(np.diagonal(value, axis1=1, axis2=2) < 0):
+                raise ValueError(
+                    f"{name} fix covariance must have non-negative diagonal"
+                )
+        self.raw_message_covariance_enu_m2 = raw.copy()
+        self.fix_covariance_enu_m2 = effective.copy()
+        self.fix_cov_max = np.max(
+            np.diagonal(effective, axis1=1, axis2=2), axis=1
+        )
+        self.effective_covariance_policy = dict(policy)
+
+
+@dataclass(frozen=True)
+class StagedPayload:
+    """One disposable file owned by an adapter publication operation.
+
+    Unlike a plain :class:`~pathlib.Path`, this path may be moved into the
+    immutable segment rather than copied.  Adapters must only use it for files
+    in their own temporary staging directory; callers retaining source files
+    should continue to pass ``Path``.
+    """
+
+    path: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path))
+
 
 @dataclass
 class FrameRecord:
@@ -123,8 +388,8 @@ class FrameRecord:
 
     t: float
     t_right: float
-    left_jpeg: bytes | Path
-    right_jpeg: bytes | Path
+    left_jpeg: bytes | Path | StagedPayload
+    right_jpeg: bytes | Path | StagedPayload
     left_header_ns: int | None = None
     right_header_ns: int | None = None
     header_timestamps_exact: bool = field(init=False)

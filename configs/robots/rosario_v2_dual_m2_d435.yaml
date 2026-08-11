@@ -1,0 +1,149 @@
+# Stable Rosario v2 platform facts. Dataset-only decoding/calibration choices
+# remain inside the adapter; mapping policy remains in profiles/quality_v1.
+adapter: ros1_rosario_v2
+
+adapter_options:
+  # A sequence must explicitly choose offline_ppk or online_differential.
+  ir_geometry_mode: recorded_rectified_p
+  rgb_geometry_mode: recorded_camera_info
+  body_yaw_from_baseline_deg: 90.0
+  expected_baseline_m: 0.8
+  maximum_baseline_error_m: 0.02
+  minimum_valid_baseline_fraction: 0.95
+  heading_velocity_min_speed_m_s: 0.5
+  heading_velocity_max_turn_rate_deg_s: 8.0
+  maximum_heading_course_disagreement_deg: 30.0
+  gnss_window_padding_s: 2.0
+  # The PPK NavSatFix covariance is a dummy diag[1,1,4] m^2. Keep it raw,
+  # but use this conservative external prior for pose weighting only.
+  offline_ppk_effective_sigma_m: [0.10, 0.10, 0.20]
+  offline_ppk_effective_covariance_provenance: conservative Rosario PPK prior selected before mapping; not receiver-reported and not independently surveyed
+  offline_ppk_covariance_override:
+    placeholder_diagonal_m2: [1.0, 1.0, 4.0]
+    absolute_tolerance_m2: 1.0e-12
+    # A non-placeholder covariance may be live information; never replace it.
+    on_mismatch: retain_recorded
+  # Predeclared real-image and recorded-geometry gates. These are deliberately
+  # round thresholds, not fitted to Sequence 5's three probe measurements.
+  calibration_acceptance:
+    recorded_stereo:
+      maximum_median_sample_p95_vertical_residual_px: 1.25
+      minimum_fraction_under_1px_per_sample: 0.90
+      minimum_fraction_under_1px_aggregate: 0.90
+      minimum_geometric_matches_per_sample: 100
+    recorded_depth:
+      maximum_disparity_error_p95_px_per_sample: 2.0
+      minimum_valid_pixels_per_sample: 10000
+    depth_left_camera_info:
+      maximum_absolute_parameter_difference: 1.0e-9
+    depth_left_static_tf:
+      maximum_translation_m: 1.0e-6
+      maximum_rotation_deg: 0.001
+      on_missing: fail
+  recorded_depth_scale_m_per_unit: 0.001
+  recorded_depth_min_z_m: 0.2
+  recorded_depth_max_z_m: 8.0
+  depth_sync_tolerance_s: 0.005
+  kalibr_ir:
+    left_intrinsics: [645.4064992830425, 648.5756187194387, 648.7339043686679, 349.03769150591853]
+    left_distortion: [0.0008368252004208706, -0.0010662834505401491, -0.0005232293953624633, 0.00042863685319859406]
+    right_intrinsics: [645.9158469761354, 649.1492152113191, 647.7810357771295, 348.7846008503252]
+    right_distortion: [0.0005313293181523295, -0.0005556448379554267, -0.0005263985557901516, 0.0000498720460662138]
+    T_right_left:
+      - [0.9999991826391416, -0.00002905814154961309, 0.0012782318538085242, -0.05024074261711253]
+      - [0.000028934721515339954, 0.9999999949181538, 0.00009657366646367322, -0.00003438411480094234]
+      - [-0.0012782346535640172, -0.00009653660224541635, 0.9999991783980893, -0.00011708930749301937]
+      - [0.0, 0.0, 0.0, 1.0]
+    source_url: http://fs01.cifasis-conicet.gov.ar:90/~robot_desmalezador/rosariov2/calibration/kalibr_ir_stereo.tar.gz
+    sha256: 304587fa68e3ac96234dd880921f493116e1e1f05cb0b95867e4560adf1b06d9
+  kalibr_rgb:
+    intrinsics: [890.4202450761666, 895.5269973888081, 633.5761943138773, 375.39479166983205]
+    distortion: [0.05112465195903441, -0.08817933012895941, -0.0011842812428454741, -0.00040533553962803756]
+    # Official Kalibr color-from-infra1 transform. Recorded CameraInfo R=I for
+    # both chosen direct representations, so the rectification composition is
+    # identity for the initial pilot and is logged as such.
+    T_rgb_left:
+      - [0.999905459522, 0.010383392508, 0.009014276389, 0.013403177795]
+      - [-0.010353458909, 0.999940752935, -0.003361027804, 0.000489094118]
+      - [-0.009048641191, 0.003267381111, 0.999953722086, -0.000115835788]
+      - [0.0, 0.0, 0.0, 1.0]
+    source_url: http://fs01.cifasis-conicet.gov.ar:90/~robot_desmalezador/rosariov2/calibration/kalibr_ir_color.tar.gz
+    sha256: 11d2e63a0438986a15416d4aa74fb652fcbe634194a5a3eaa0f108186b6d51af
+    extrinsic_translation_sigma_m: [0.01, 0.01, 0.01]
+  recorded_tf:
+    topic: /tf
+    static_topic: /tf_static
+    comparison_child_frame: camera_left
+    primary_antenna_in_base_m: [1.805, 0.4, 1.368]
+
+segment:
+  maximum_bag_gap_s: 0.1
+  maximum_bag_overlap_s: 0.01
+  image_encoding: png_lossless
+
+timing:
+  clock_model: common_ros_header_clock
+  # Bag-log latency is only a coarse audit of the shared header clock.
+  maximum_offset_error_s: 0.05
+  maximum_window_drift_s: 0.02
+
+topics:
+  left_image: /realsense/infra1/image_rect_raw
+  right_image: /realsense/infra2/image_rect_raw
+  left_info: /realsense/infra1/camera_info
+  right_info: /realsense/infra2/camera_info
+  color_image: /realsense/color/image_raw
+  color_info: /realsense/color/camera_info
+  depth: /realsense/depth/image_rect_raw
+  depth_info: /realsense/depth/camera_info
+  fix: /reach_1/fix
+  secondary_fix: /reach_2/fix
+  ppk_fix: /reach_1/ppk/fix
+  ppk_secondary_fix: /reach_2/ppk/fix
+  tf: /tf
+  tf_static: /tf_static
+
+gnss_quality:
+  receiver_state_required: false
+  receiver_state_association_tolerance_s: 0.15
+  covariance_provenance: driver_static_nominal
+  covariance_is_live_per_epoch: false
+
+pose:
+  source: dual_position
+  yaw_smooth_window: 5
+  min_carr_soln: -1
+  minimum_navsat_status: 2
+  minimum_position_carrier_status: -1
+  maximum_position_covariance_m2: 5.0
+  use_imu_tilt: false
+
+frontend:
+  pose_priors:
+    min_fix_status: 2
+    min_carrier_status: -1
+    covariance_floor_m: 0.10
+    max_covariance_m2: 5.0
+    max_source_residual_s: 0.15
+
+sensor_geometry:
+  # Official URDF prior, not fitted on Sequence 5. CameraInfo R=I, so raw and
+  # recorded-left optical orientations coincide for this initial path.
+  extrinsic_camera_geometry: rectified_left
+  frames:
+    world: map
+    camera: realsense_infra1_optical_frame
+    primary_antenna: reach_gps1
+    secondary_antenna: reach_gps2
+  T_camera_primary_antenna:
+    - [0.0, -1.0, 0.0, -0.382]
+    - [-0.309017072133, 0.0, -0.951056491030, -0.103566633146]
+    - [0.951056491030, 0.0, -0.309017072133, -0.313155381506]
+    - [0.0, 0.0, 0.0, 1.0]
+  extrinsic_translation_sigma_m: [0.05, 0.05, 0.05]
+  extrinsic_provenance:
+    method: official Rosario v2 URDF chain sensor_box->Reach1 and sensor_box->RealSense infra1
+    status: rough prior; not independently surveyed or optimized on Sequence 5
+    sources:
+      - url: https://raw.githubusercontent.com/CIFASIS/rosariov2/main/data/config/rosario_v2.urdf.xacro
+        sha256: 846e17cb90874f08fc8c71f2f519201c318afd281b5b9239c2920e56f5a6a2ab

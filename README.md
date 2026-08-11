@@ -53,18 +53,51 @@ contract-v2 path:
 - A ROS 1 ordered-bag adapter, staged reproduction launcher, and optional
   factor-held-out RTK position-refinement backend are implemented for the CitrusFarm
   sequence-05 window at 543--735 s.
+- A separate ROS 1 Rosario v2 adapter publishes rectified IR stereo, recorded
+  aligned depth, complete dual-position PPK evidence, and an acquisition-bound
+  RGB sidecar without exposing Rosario topics or calibration quirks to the
+  mapping core.
 
 The normalized 1,344-frame headland contract-v2 migration is complete and
-hash-recorded. Phases 3 and 4 are prepared and covered by synthetic/unit tests,
-but the GPU-versus-CPU feature A/B and the
-all/dense/balanced/sparse keyframe A/B have not yet been run through COLMAP and
-GS from that segment. Do not confuse the historical Global result above with
-validation of the new frontend. The full Citrus window has completed ingest,
-SGBM, a sealed frontend, and a 2,990-image visual reconstruction. Both its
-visual-only export and a separate 897-prior/598-holdout position-refinement A/B
-failed the refinement-factor holdout RTK gates, so no Citrus pose, GS model, or rendering
-score is accepted. Bounded custom RTK-factor submaps and rendering-quality
-experiments remain future work.
+hash-recorded. The modern all-frame GPU frontend registered all 2,688 stereo
+images, and its Global pose plus 65k GS control reproduced the accepted result
+within 0.081 dB masked and 0.115 dB corrected masked PSNR. The matched CPU arm
+also registered every image but took about 52.6 times longer for feature
+extraction. The dense/balanced/sparse adaptive-keyframe GS A/B is the remaining
+unrun efficiency experiment; it is not a prerequisite if a full-field build
+keeps all selected frames.
+
+The Citrus and Rosario work is retained as transfer evidence, not as a new
+production default. Citrus exposed a fixed-scale georeferencing failure and a
+monolithic GS capacity failure. Rosario produced an accepted IR/depth pose and
+GS, while its colour arms remain diagnostic because rolling-shutter RGB timing
+and RGB-to-stereo registration are not independently validated. Current work is
+therefore focused on bounded, georeferenced full-field tiles and their seam
+validation.
+
+The first bounded-map component is now implemented: a sealed, data-driven
+TilePlan derives spatial cores and visibility context from metric depth and one
+global pose artifact. It does not hard-code row count or time intervals. The
+cached headland produced one automatic tile, while a forced two-tile seam plan
+retained 919/879 training frames with 99.34%/99.36% measured core-support
+coverage. Tile-aware cloud/training, exact core ownership, controlled scene
+publication, and a metric-depth seam gate are implemented and have completed a
+real GPU validation. The core-owned merged scene passed all 13 declared checks
+and improved over a same-code monolithic control by 0.305 dB masked and
+0.380 dB corrected masked PSNR over the same 168 held-out views. Its exact 1 m
+seam band also improved by 0.158/0.092 dB. This validates bounded GS training
+and deterministic stitching, not equal-compute superiority: the two tiles use
+two independent 65k/2.5M-cap optimizations. The cached pose is
+`legacy_unassessed`, so the scene is correctly provisional and creates no new
+metric-georeferencing claim. See [TILED_SCENE.md](docs/methods/TILED_SCENE.md).
+
+The 77-minute deployment path is prepared separately: ROS2 ingest spools
+selected payloads to bounded disk rather than retaining the recording in RAM;
+`segment-materialize` creates a self-contained checksum-sealed transfer
+segment; and production scene publication consumes any number of verified
+tiles without requiring a full-scene monolithic control. The local/server
+order, environment pins, transfer verification, and remaining Global-Mapper
+scaling gate are in [SERVER_RUN.md](SERVER_RUN.md).
 
 ## Architecture
 
@@ -81,13 +114,15 @@ Global Mapper (primary)      incremental mapper (fallback/reference)
         optional RTK position refinement (calibration blocks only)
                        ↓  blocks excluded from refinement-factor gates
 fixed-scale ENU pose artifact
+        ↓                         ↓
+sealed visibility TilePlan   single-scene path
         ↓
-pose-matched cloud → GS train → evaluate
+tile-aware cloud → GS train → core ownership → scene/seam validation
 ```
 
 The core package under `src/rtk_splat/core/` imports no ROS, bag, dataset, backend,
-or workflow module. ROS 2 ZED/u-blox, ROS 1 CitrusFarm, and AgriGS are adapters
-under `src/rtk_splat/adapters/`. The CitrusFarm implementation handles an ordered
+or workflow module. ROS 2 ZED/u-blox, ROS 1 CitrusFarm, ROS 1 Rosario v2, and
+AgriGS are adapters under `src/rtk_splat/adapters/`. The CitrusFarm implementation handles an ordered
 chain of ROS 1 bags, raw rectified stereo, Piksi `NavSatFix`, single-antenna
 course heading, clock auditing, and travelled-distance sampling without adding
 dataset conditionals to the mapping core.
@@ -125,8 +160,9 @@ Configuration has three authored layers and one measured layer:
 
 The runtime-derived controls are frame stride or metric spacing from measured
 motion, stereo range from focal-length-times-baseline and reliable disparity,
-training iterations from the actual number of training views, and Gaussian
-capacity from initial-cloud size and available VRAM. `auto` opts into a named
+initial-cloud capacity from the VRAM-bound growth budget, training iterations
+from the actual number of training views, and Gaussian capacity from
+initial-cloud size and available VRAM. `auto` opts into a named
 formula; a numeric value is an explicit override. Formula inputs, bounds,
 source-file hashes, CLI overrides, and chosen values are written to
 `<workdir>/config_artifacts/resolved_config.json` and copied into immutable
@@ -153,7 +189,8 @@ ROS 2 bag ingestion is optional:
 python -m pip install -e '.[ros2]'
 ```
 
-ROS 1 bag ingestion, including CitrusFarm, uses the separate optional extra:
+ROS 1 bag ingestion, including CitrusFarm and Rosario v2, uses the separate
+optional extra:
 
 ```bash
 python -m pip install -e '.[ros1]'
@@ -283,6 +320,26 @@ all-frame OpenCV view matrices, ENU camera centres, exact frame IDs and
 timestamps, alignment diagnostics, quality gates, and provenance under
 `<workdir>/pose_artifacts/<pose-name>/`.
 
+After a complete metric-depth segment and global pose exist, production tile
+count and context can be derived rather than authored:
+
+```bash
+rtk-splat tiles-plan \
+  --config configs/sequences/headland.example.yaml \
+  --segment /path/to/depth-segment \
+  --workdir /new/tile-plan-workdir \
+  --pose-name balanced-gpu-global \
+  --tile-plan-name full-field-visibility-v1
+```
+
+This stage writes only a small sealed plan and plot. `--tile-count` is reserved
+for controlled seam A/B tests. Downstream `cloud` and `train` accept the paired
+`--tile-plan`/`--tile-id` arguments without copying a segment, and
+`scene-publish` verifies every tile before exact core-owned concatenation and
+held-out evaluation. The cached headland overnight launcher is documented in
+[TILED_SCENE.md](docs/methods/TILED_SCENE.md); it is experiment-specific rather
+than the generic package interface.
+
 Normal export remains fail-closed on held-out RTK gates. A rejected candidate
 can be rendered only through an explicit, separately named diagnostic path:
 
@@ -316,6 +373,21 @@ rtk-splat train \
   --train-iters 15000
 ```
 
+A completed checkpoint can be re-exported without training or replacing its
+canonical PLY. The command verifies the sealed selected-model hash and writes
+an atomic bundle under `<run>/exports/<name>/`:
+
+```bash
+python -m rtk_splat.workflows.export_splat \
+  --source-run /path/to/completed/run \
+  --export-name full-model-no-crop-v1 \
+  --opacity-threshold 0 \
+  --no-crop
+```
+
+This changes only the viewer PLY. Metrics already evaluated from `params.pt`
+do not change.
+
 Do pose-only comparisons first. A short 15,000-iteration GS proxy should be run
 only after an arm passes registration, reprojection, RTK, and scale gates; one
 full 65,000-iteration run is reserved for the selected arm.
@@ -333,7 +405,35 @@ wheel is dataset-neutral and therefore requires an explicit experiment record:
 rtk-splat-verify --manifest /path/to/experiment-manifest.json
 ```
 
-## Prepared CitrusFarm generic-policy transfer
+## Rosario v2 cross-dataset pilot
+
+The completed Sequence 5 experiment uses 140--250 s from the exact first-bag
+epoch: 103.37 m, two opposing adjacent-row passes, and one complete U-turn.
+The separate dual-M2 PPK bag is an explicit offline method input. PGT,
+conventional GNSS, IMU, and wheel odometry are excluded.
+
+The one-time immutable ingest is complete and validated on NVMe. It contains
+**1,014** rectified IR stereo frames with recorded metric depth and **1,645**
+separately sealed RGB observations. Real-image stereo, depth scale, CameraInfo,
+static-TF, timestamp, physical antenna-baseline, and heading-sign gates pass.
+The raw PPK covariance and the separately declared effective weighting prior
+are both retained.
+
+The all-frame Global run is also complete: all 2,028 stereo images registered
+at 0.80256 px mean reprojection error, fixed-scale ENU export passed, and the
+44,400-presentation IR/depth GS selected corrected masked PSNR 21.15047. Its
+checkpoint contains 2,462,523 Gaussians. A separate no-crop/zero-threshold PLY
+export keeps all of them without changing the checkpoint or metric.
+
+The camera-to-primary-antenna URDF transform remains a rough prior. The RGB-D
+transfer and matched v5/v6 training arms completed on 1,012 associations, but
+remain `diagnostic_render_only`: free train-view corrections sharpened the
+images without improving raw held-out PSNR. A later unconstrained colour-only
+COLMAP probe folded geometrically, so it cannot establish a pose ceiling.
+Exact evidence is in
+[the Rosario pilot record](docs/experiments/ROSARIO_V2_SEQUENCE5_PILOT.md).
+
+## CitrusFarm generic-policy transfer evidence
 
 The supported CitrusFarm candidate uses the 192 s window at 543--735 s,
 stereo RGB, computed SGBM depth, and single-antenna Piksi RTK. It deliberately
@@ -389,6 +489,14 @@ therefore remains a rejected experimental baseline and produced no pose,
 cloud, GS model or PLY. Its sealed paired receipt is
 `docs/experiments/citrusfarm_pose_prior_initialization_ab_v1.json`.
 
+The later 0.10 m generic-auto full-window reconstruction registered all 3,694
+images but failed fixed-scale georeferencing and its monolithic GS degraded as
+it exhausted the laptop's capacity. A bounded 330--410 s same-corridor retrace
+then registered all 1,576 images, passed its fixed-scale gate (0.117 m median /
+0.137 m p95), and completed a deliberately diagnostic GS at 21.198 dB masked /
+22.632 dB corrected masked PSNR. This is evidence for bounded spatial training,
+not an accepted Citrus metric model or a cross-scene comparison with headland.
+
 ## Migration status
 
 `rtk_splat.adapters.migrate_v1_to_v2` is a non-destructive, fail-closed
@@ -404,7 +512,9 @@ unchanged. Images and computed depth are directory symlinks to the untouched
 source segment. Exact output hashes, association residuals, capabilities,
 runtime, and memory are recorded in
 [the migration receipt](docs/experiments/migrations/headland_contract_v2.json).
-This proves the conversion/contract boundary, not the unrun COLMAP or GS A/B.
+The migration itself proves only the conversion boundary. A separately named
+modern all-frame COLMAP/GS arm later reproduced the golden quality without
+modifying this segment.
 
 ## Repository layout
 
@@ -433,16 +543,23 @@ records remain repository data; they are not hidden inside the wheel.
 
 - Validation views participated in the historical SfM pose estimation.
 - The headland sequence has no independent survey-grade camera trajectory.
-- The new sealed frontend and adaptive-keyframe path still need controlled
-  real-data runtime, pose, and GS A/B results.
+- The modern all-frame frontend has reproduced the headland reference; adaptive
+  keyframe density is implemented but has not completed a matched GS A/B.
 - Global Mapper is visual. The optional whole-model sidecar consumes RTK
   position priors but failed its first real held-out A/B; custom bounded local
   RTK factors and a submap graph are not implemented.
-- Full-field bounded submaps and cross-session merging are not implemented.
-- CitrusFarm has completed one full-window visual reconstruction and one
-  rejected RTK-refinement control; the first accepted georeferenced pose and
-  GS result remain future work.
+- Visibility-bounded full-field GS tiles, exact ENU ownership, arbitrary-tile
+  orchestration, and no-monolith production publication are implemented. The
+  77-minute global visual pose solve and final automatic plan remain unrun;
+  cross-session merging is not implemented.
+- CitrusFarm has strong visual reconstructions, rejected full-window
+  georeferencing controls, and a completed bounded diagnostic retrace; it has
+  no accepted metric GS.
+- Rosario v2 has a complete production fixed-scale visual pose and IR/depth GS,
+  plus completed colour diagnostics, but no independently validated RGB
+  timing/extrinsic solution or production-eligible colour GS.
 - Right-camera GS photometric supervision and learned stereo depth are not
   validated.
 
-See [PROGRESS.md](PROGRESS.md) for the detailed evidence and next experiment.
+See [TODO.md](TODO.md) for the short active plan and [PROGRESS.md](PROGRESS.md)
+for detailed evidence.

@@ -45,6 +45,9 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "left_info",
         "right_info",
         "fix",
+        "secondary_fix",
+        "ppk_fix",
+        "ppk_secondary_fix",
         "pvt",
         "relpos",
         "imu",
@@ -52,6 +55,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "depth_info",
         "confidence",
         "receiver_state",
+        "color_image",
+        "color_info",
+        "tf",
+        "tf_static",
     ),
     "pose": _leaves(
         "source",
@@ -91,6 +98,9 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "frame_spacing_m",
         "stereo_tolerance_s",
         "association_tolerance_s",
+        "maximum_heading_association_invalid_fraction",
+        "maximum_heading_association_invalid_run_frames",
+        "maximum_heading_association_invalid_residual_s",
         "validation_every",
         "expected_camera_bag_count",
         "expected_gnss_bag_count",
@@ -244,6 +254,20 @@ CONFIG_SCHEMA: dict[str, Any] = {
     "cloud": _leaves(
         "artifact_root", "pixel_stride", "voxel_m", "max_points"
     ),
+    "tiles": _leaves(
+        "name",
+        "strategy",
+        "max_training_frames",
+        "max_tiles",
+        "max_support_samples",
+        "support_cell_m",
+        "min_visibility_fraction",
+        "min_visibility_cells",
+        "context_halo_m",
+        "minimum_core_train_frames",
+        "max_depthless_frame_fraction",
+        "min_core_train_support_coverage",
+    ),
     "colmap": _leaves(
         "executable",
         # Legacy diagnostic-sidecar controls remain schema-valid.
@@ -294,6 +318,11 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "max_rot_deg",
             "trans_penalty",
             "rot_penalty",
+            # Gauge projection removes the mean per-view delta, protecting a
+            # georeferenced map from migrating wholesale. It also annihilates
+            # any correction that is common to every view (a sensor timing
+            # bias, for one). Diagnostic render-only runs may disable it.
+            "gauge_projection",
         ),
         "exposure_opt": _leaves("enabled", "lr", "weight_decay"),
         "lr": _leaves("means", "scales", "quats", "opacities", "sh0", "shN"),
@@ -390,6 +419,9 @@ LAYER_SCHEMAS: dict[str, dict[str, Any]] = {
             "segment",
             "stereo_tolerance_s",
             "association_tolerance_s",
+            "maximum_heading_association_invalid_fraction",
+            "maximum_heading_association_invalid_run_frames",
+            "maximum_heading_association_invalid_residual_s",
             "validation_every",
         ),
         "depth": CONFIG_SCHEMA["depth"],
@@ -409,6 +441,11 @@ LAYER_SCHEMAS: dict[str, dict[str, Any]] = {
             if key != "name"
         },
         "cloud": _subset("cloud", "pixel_stride", "voxel_m", "max_points"),
+        "tiles": {
+            key: value
+            for key, value in CONFIG_SCHEMA["tiles"].items()
+            if key != "name"
+        },
         "colmap": CONFIG_SCHEMA["colmap"],
         "train": {
             key: value
@@ -501,6 +538,7 @@ LAYER_SCHEMAS: dict[str, dict[str, Any]] = {
         # becomes part of normal mapping merely by appearing here.
         "rtk_refinement": CONFIG_SCHEMA["rtk_refinement"],
         "train": _subset("train", "run_name", "iterations", "max_gaussians"),
+        "tiles": _subset("tiles", "name"),
     },
     "reproduction": CONFIG_SCHEMA,
 }

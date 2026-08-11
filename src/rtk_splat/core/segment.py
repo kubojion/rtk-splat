@@ -492,7 +492,7 @@ class SegmentReader:
         _validate_gnss(gnss, frames, capabilities)
         heading = self.observations("heading", required=capabilities["dual_rtk"])
         if heading is not None:
-            _validate_heading(heading, frames)
+            _validate_heading(heading, frames, meta)
         imu = self.observations("imu", required=capabilities["imu_present"])
         if imu is not None:
             _validate_imu(imu)
@@ -846,7 +846,7 @@ def _validate_gnss(
             )
 
 
-def _validate_heading(values: Arrays, frames: Arrays) -> None:
+def _validate_heading(values: Arrays, frames: Arrays, meta: JsonObject) -> None:
     label = "observations/heading.npz"
     _validate_associations(
         values,
@@ -869,6 +869,196 @@ def _validate_heading(values: Arrays, frames: Arrays) -> None:
     accuracy = values["acc_heading_rad"][valid]
     if np.any(~np.isfinite(accuracy)) or np.any(accuracy < 0):
         raise SegmentContractError("valid heading accuracy must be finite and nonnegative")
+
+    heading_meta = meta.get("heading_observation")
+    association_meta = (
+        heading_meta.get("association")
+        if isinstance(heading_meta, dict)
+        else None
+    )
+    has_association_valid = "association_valid" in values
+    if (association_meta is None) != (not has_association_valid):
+        raise SegmentContractError(
+            "heading association metadata and association_valid must be present together"
+        )
+    if association_meta is None:
+        # Backward compatibility for sealed contract-v2 segments created
+        # before heading association validity was recorded explicitly.
+        return
+    if not isinstance(association_meta, dict):
+        raise SegmentContractError("heading_observation.association must be an object")
+    _require_keys(
+        values,
+        {
+            "association_valid",
+            "association_query_timestamp_ns",
+            "source_residual_ns",
+        },
+        label,
+    )
+    _require_keys(
+        association_meta,
+        {
+            "method",
+            "validity_field",
+            "tolerance_ns",
+            "maximum_invalid_fraction",
+            "maximum_consecutive_invalid_frames",
+            "maximum_invalid_abs_residual_ns",
+            "frame_count",
+            "valid_count",
+            "invalid_count",
+            "invalid_fraction",
+            "longest_consecutive_invalid_frames",
+            "max_abs_residual_ns",
+            "invalid_max_abs_residual_ns",
+            "first_invalid_frame_id",
+        },
+        "heading_observation.association",
+    )
+    if association_meta["method"] != "nearest":
+        raise SegmentContractError("heading association method must be nearest")
+    if association_meta["validity_field"] != "association_valid":
+        raise SegmentContractError(
+            "heading association validity_field must be association_valid"
+        )
+    tolerance = association_meta["tolerance_ns"]
+    if type(tolerance) is not int or tolerance < 0:
+        raise SegmentContractError(
+            "heading association tolerance_ns must be a non-negative integer"
+        )
+    maximum_fraction = association_meta["maximum_invalid_fraction"]
+    if (
+        isinstance(maximum_fraction, bool)
+        or not isinstance(maximum_fraction, (int, float))
+        or not np.isfinite(float(maximum_fraction))
+        or not 0.0 <= float(maximum_fraction) <= 1.0
+    ):
+        raise SegmentContractError(
+            "heading association maximum_invalid_fraction must be in [0, 1]"
+        )
+    maximum_run = association_meta["maximum_consecutive_invalid_frames"]
+    if type(maximum_run) is not int or maximum_run < 0:
+        raise SegmentContractError(
+            "heading association maximum_consecutive_invalid_frames must be "
+            "a non-negative integer"
+        )
+    maximum_invalid_residual = association_meta[
+        "maximum_invalid_abs_residual_ns"
+    ]
+    if (
+        type(maximum_invalid_residual) is not int
+        or maximum_invalid_residual < 0
+    ):
+        raise SegmentContractError(
+            "heading association maximum_invalid_abs_residual_ns must be a "
+            "non-negative integer"
+        )
+
+    association_valid = _vector(values, "association_valid", n, label)
+    residual = _vector(values, "source_residual_ns", n, label)
+    query_timestamp = _vector(
+        values, "association_query_timestamp_ns", n, label
+    )
+    if not np.issubdtype(association_valid.dtype, np.bool_):
+        raise SegmentContractError(f"{label}.association_valid must be boolean")
+    _timestamp(residual, f"{label}.source_residual_ns")
+    _timestamp(query_timestamp, f"{label}.association_query_timestamp_ns")
+    if not np.array_equal(
+        residual,
+        values["source_timestamp_ns"].astype(np.int64)
+        - query_timestamp.astype(np.int64),
+    ):
+        raise SegmentContractError(
+            "heading source_residual_ns must equal source minus query timestamp"
+        )
+    expected_association_valid = np.abs(residual) <= tolerance
+    if not np.array_equal(association_valid, expected_association_valid):
+        raise SegmentContractError(
+            "heading association_valid disagrees with residual/tolerance"
+        )
+    if np.any(valid & ~association_valid):
+        raise SegmentContractError(
+            "heading valid cannot be true when association_valid is false"
+        )
+    if "raw_valid" in values:
+        raw_valid = values["raw_valid"]
+        if not np.issubdtype(raw_valid.dtype, np.bool_):
+            raise SegmentContractError(f"{label}.raw_valid must be boolean")
+        expected_valid = (
+            raw_valid[values["source_index"].astype(np.int64)]
+            & association_valid
+        )
+        if not np.array_equal(valid, expected_valid):
+            raise SegmentContractError(
+                "heading valid must combine raw_valid and association_valid"
+            )
+
+    invalid_indices = np.flatnonzero(~association_valid)
+    invalid_count = int(invalid_indices.size)
+    valid_count = n - invalid_count
+    invalid_fraction = invalid_count / n
+    longest_invalid_run = current_invalid_run = 0
+    for is_invalid in ~association_valid:
+        current_invalid_run = current_invalid_run + 1 if is_invalid else 0
+        longest_invalid_run = max(
+            longest_invalid_run, current_invalid_run
+        )
+    expected_summary = {
+        "frame_count": n,
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
+        "longest_consecutive_invalid_frames": longest_invalid_run,
+        "max_abs_residual_ns": int(np.max(np.abs(residual))),
+        "invalid_max_abs_residual_ns": (
+            int(np.max(np.abs(residual[invalid_indices])))
+            if invalid_count
+            else None
+        ),
+        "first_invalid_frame_id": (
+            int(invalid_indices[0]) if invalid_count else None
+        ),
+    }
+    for name, expected in expected_summary.items():
+        if association_meta[name] != expected:
+            raise SegmentContractError(
+                f"heading association {name} does not match observations"
+            )
+    reported_fraction = association_meta["invalid_fraction"]
+    if (
+        isinstance(reported_fraction, bool)
+        or not isinstance(reported_fraction, (int, float))
+        or not np.isfinite(float(reported_fraction))
+        or not np.isclose(float(reported_fraction), invalid_fraction, atol=1e-15)
+    ):
+        raise SegmentContractError(
+            "heading association invalid_fraction does not match observations"
+        )
+    if invalid_fraction > float(maximum_fraction):
+        raise SegmentContractError(
+            "heading association exceeds maximum_invalid_fraction"
+        )
+    if longest_invalid_run > maximum_run:
+        raise SegmentContractError(
+            "heading association exceeds maximum_consecutive_invalid_frames"
+        )
+    invalid_max_abs_residual = expected_summary[
+        "invalid_max_abs_residual_ns"
+    ]
+    if (
+        invalid_max_abs_residual is not None
+        and invalid_max_abs_residual > maximum_invalid_residual
+    ):
+        raise SegmentContractError(
+            "heading association exceeds maximum_invalid_abs_residual_ns"
+        )
+    provenance = meta.get("provenance")
+    if not isinstance(provenance, dict) or (
+        provenance.get("heading_association") != association_meta
+    ):
+        raise SegmentContractError(
+            "provenance.heading_association must match heading metadata"
+        )
 
 
 def _validate_imu(values: Arrays) -> None:

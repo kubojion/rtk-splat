@@ -8,6 +8,11 @@ segment:
   validation_every: 8
   stereo_tolerance_s: 0.02
   association_tolerance_s: 0.15
+  # Fail closed unless an evaluated profile explicitly budgets sparse heading
+  # dropouts. This never changes the definition of a fresh observation.
+  maximum_heading_association_invalid_fraction: 0.0
+  maximum_heading_association_invalid_run_frames: 0
+  maximum_heading_association_invalid_residual_s: 0.0
 
 derivation:
   frame_sampling:
@@ -112,7 +117,27 @@ mapper:
 cloud:
   pixel_stride: 6
   voxel_m: 0.02
-  max_points: 4000000
+  # Leave measured VRAM headroom for MCMC to grow rather than clipping the
+  # initialization at the final Gaussian cap on its first step.
+  max_points: auto
+
+# Spatial GS capacity policy. The final plan uses metric depth and the accepted
+# global pose artifact; it never infers visibility from waypoint labels or the
+# feature-matcher view-angle gate. Runtime records every resolved value.
+tiles:
+  strategy: recursive_visibility_workload_v1
+  max_training_frames: auto
+  max_tiles: 64
+  max_support_samples: 2000000
+  support_cell_m: 0.50
+  min_visibility_fraction: 0.01
+  min_visibility_cells: 4
+  context_halo_m: auto
+  minimum_core_train_frames: 8
+  # A few sky/blur/crop frames may have no reliable sampled stereo depth. They
+  # inherit only the tile membership of adjacent supported observations.
+  max_depthless_frame_fraction: 0.02
+  min_core_train_support_coverage: 0.98
 
 colmap:
   executable: colmap
@@ -150,6 +175,10 @@ train:
     max_rot_deg: 1.0
     trans_penalty: 1.0e-2
     rot_penalty: 1.0e-3
+    # Removes the mean per-view delta each step so a georeferenced map cannot
+    # migrate wholesale. It also deletes any correction common to every view,
+    # so only a diagnostic render-only run should ever turn this off.
+    gauge_projection: true
   exposure_opt:
     enabled: true
     lr: 1.0e-3

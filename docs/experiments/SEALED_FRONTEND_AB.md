@@ -1,7 +1,6 @@
 # Sealed Frontend Experiments
 
-These launchers prepare the two controlled headland experiments required before
-changing the production defaults:
+These launchers define two controlled headland experiments:
 
 - `scripts/experiments/feature_profile_ab.sh`: GPU SIFT versus the accepted
   CPU-reference SIFT settings, with all 1,344 frames in both solves.
@@ -10,6 +9,26 @@ changing the production defaults:
 
 They run in the foreground without tmux, stop on the first failure, log every
 stage, and never move from pose-only evaluation to GS automatically.
+
+## Measured status, 2026-08-08
+
+The feature-profile/all-frame experiment is complete. Both arms registered all
+2,688 stereo images and passed fixed-scale RTK gates.
+
+| Measure | GPU | CPU reference |
+|---|---:|---:|
+| Feature extraction | **77 s** | 4,053 s |
+| Matching | 858 s | **835 s** |
+| Global solve | **776 s** | 985 s |
+| Mean reprojection | **1.21287 px** | 1.27528 px |
+| Held-out RTK median | 0.10462 m | **0.10366 m** |
+
+GPU feature extraction was about **52.6x faster**. The GPU arm then completed
+the full matched 65k GS control at **24.3639 dB masked / 25.7326 dB corrected
+masked PSNR**, only -0.0810/-0.1153 dB from the accepted incremental reference.
+The adaptive dense/balanced/sparse pose and GS arms have not run; all claims
+below about their speed or retained quality remain acceptance criteria rather
+than results.
 
 ## Input and output safety
 
@@ -136,15 +155,15 @@ candidate solve counts on this headland sequence were:
 Turns, revisits, GNSS state changes, and quality gates are first-class inputs,
 so the sealed artifact's actual count is authoritative.
 
-Only measured task facts are printed by the launchers:
+Historical and modern measured task facts are:
 
-- CPU-reference feature extraction: 62.7 min
-- GPU feature extraction: about 6 min
-- all-frame sequential matching: 18.7 min
-- all-frame Global Mapper: 18.1 min
+- CPU-reference feature extraction: 4,053 s (67.6 min)
+- GPU feature extraction: 77 s
+- all-frame matching: 835--858 s
+- all-frame Global solve: 776--985 s
 - incremental mapper: 581.0 min, retained only as a fallback/reference
 - one 15k proxy: about 1.2 h
-- one 65k run: about 245 min
+- the completed GPU 65k run: about 245 min
 
 Adaptive matching, non-keyframe registration, and mapper timings are unknown
 until this A/B runs. Logs record actual elapsed seconds per stage.

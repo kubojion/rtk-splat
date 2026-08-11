@@ -1,0 +1,57 @@
+# Rosario colour GS with an EARLY MCMC stop and a long settling tail (v5).
+#
+# Evidence this is built on. Detail (near-field Laplacian variance of the
+# rendered eval view, ground truth 1522):
+#   44,300-step runs, MCMC noise until step 35,440 -> settle to ~2   (v1,v2,v3,v4-full)
+#    6,000-step run,  MCMC noise until step  4,800 -> settles to 8.1 (v4 screen)
+# The short run is 4x sharper on identical data and poses. Densification reaches
+# the 2,462,523 cap at step 4,000 in every run, so MCMC has finished its useful
+# work by then; what follows is position noise and relocation that a low-SNR
+# colour signal cannot recover from. The 6,000-step run simply escaped it sooner.
+#
+# So: keep the full Gaussian budget, stop the noise at step 5,000 (just past the
+# cap), and give the model 15,000 noise-free steps to sharpen -- 12x the settling
+# the 6,000-step run got.
+#
+# Pose refinement stays at the profile default (off, gauge projection ON). The
+# v4 experiment that freed per-view poses tracked the control and then fell BELOW
+# it (detail 0.5 at step 26,000 vs the control's 2.2), so free poses are not
+# carried forward. Keeping the gauge also means this run does not forfeit the
+# metric georeferencing claim the way v4 did.
+profile: quality_v1
+robot: rosario_v2_dual_m2_d435
+
+adapter_options:
+  gnss_source: offline_ppk
+
+paths:
+  workdir: ~/agromap4d_work/rosario_v2_sequence5_ppk_140_250_v1
+  bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15.compressed.bag
+  gnss_bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15_ppk_gnss.bag
+
+pose:
+  time_offset_s: 0.0
+
+segment:
+  window_s: [140.0, 250.0]
+  window_epoch_source: first_bag_log
+  frame_spacing_m: auto
+
+frontend:
+  keyframes:
+    preset: all
+
+mapper:
+  name: rosario-seq5-ppk-140-250-global-v1
+  pose_artifact_name: rosario-seq5-ppk-140-250-global-v1
+  alignment_ransac_threshold_m: 0.30
+  max_rtk_median_error_m: 0.20
+  max_rtk_p95_inlier_error_m: 0.40
+
+train:
+  run_name: rosario-seq5-ppk-140-250-rgb-gs-shortrefine-v5
+  # 0.25 of the 20,000 iterations this run is launched with = MCMC stops at
+  # step 5,000, just after densification fills the cap at step 4,000.
+  refine_stop_frac: 0.25

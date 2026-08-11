@@ -123,20 +123,156 @@ def detect_cuda_total_memory_gib() -> float:
         import torch
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError(
-            "automatic max_gaussians needs PyTorch CUDA or "
+            "automatic Gaussian capacity needs PyTorch CUDA or "
             "derivation.training.vram_gib_override"
         ) from exc
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "automatic max_gaussians needs CUDA or "
+            "automatic Gaussian capacity needs CUDA or "
             "derivation.training.vram_gib_override"
         )
     return float(torch.cuda.get_device_properties(0).total_memory / 2**30)
 
 
-def _training_view_count(segment: Any, use_right_camera: bool) -> tuple[int, int]:
+def _gaussian_capacity_policy(
+    policy: Any,
+    *,
+    cuda_total_memory_gib: float | None,
+) -> dict[str, int | float | str]:
+    """Measure the common VRAM-bound capacity used by cloud and training."""
+    configured_vram = getattr(policy, "vram_gib_override", None)
+    if configured_vram is not None:
+        total_vram = _positive(
+            configured_vram, "derivation.training.vram_gib_override"
+        )
+        vram_source = "policy_override"
+    elif cuda_total_memory_gib is not None:
+        total_vram = _positive(
+            cuda_total_memory_gib, "cuda_total_memory_gib"
+        )
+        vram_source = "injected_measurement"
+    else:
+        total_vram = detect_cuda_total_memory_gib()
+        vram_source = "torch_cuda_device_total_memory"
+    reserve = _positive(
+        policy.reserve_vram_gib,
+        "derivation.training.reserve_vram_gib",
+    )
+    per_gib = _positive(
+        policy.gaussians_per_gib,
+        "derivation.training.gaussians_per_gib",
+    )
+    growth = _positive(
+        policy.initial_cloud_growth_factor,
+        "derivation.training.initial_cloud_growth_factor",
+    )
+    minimum_gaussians = _positive_int(
+        policy.min_gaussians, "derivation.training.min_gaussians"
+    )
+    maximum_gaussians = _positive_int(
+        policy.max_gaussians, "derivation.training.max_gaussians"
+    )
+    usable_vram = total_vram - reserve
+    if usable_vram <= 0:
+        raise ValueError("reserved VRAM leaves no memory for Gaussian training")
+    vram_budget = int(math.floor(usable_vram * per_gib))
+    if vram_budget < minimum_gaussians:
+        raise ValueError(
+            "measured VRAM budget is below quality_v1 min_gaussians; "
+            "choose a smaller explicit cap or a different policy"
+        )
+    return {
+        "total_vram_gib": total_vram,
+        "vram_measurement_source": vram_source,
+        "reserve_vram_gib": reserve,
+        "gaussians_per_gib": per_gib,
+        "initial_cloud_growth_factor": growth,
+        "min_gaussians": minimum_gaussians,
+        "max_gaussians": maximum_gaussians,
+        "vram_budget_gaussians": vram_budget,
+        "effective_gaussian_capacity": min(maximum_gaussians, vram_budget),
+    }
+
+
+def resolve_cloud_max_points(
+    cfg: Any,
+    *,
+    cuda_total_memory_gib: float | None = None,
+) -> int:
+    """Resolve an initialization size that leaves room for MCMC growth."""
+    current = runtime_control_value(
+        cfg,
+        "cloud_max_points",
+        getattr(cfg.cloud, "max_points", None),
+        config_path="cloud.max_points",
+    )
+    if not _is_auto(current):
+        maximum = _positive_int(current, "cloud.max_points")
+        record_runtime_resolution(
+            cfg,
+            "cloud_max_points",
+            source="override",
+            formula="authored or CLI numeric value; no runtime formula applied",
+            inputs={},
+            policy={},
+            chosen=maximum,
+        )
+        cfg.cloud.max_points = maximum
+        return maximum
+
+    policy = _section(_section(cfg, "derivation"), "training")
+    capacity = _gaussian_capacity_policy(
+        policy, cuda_total_memory_gib=cuda_total_memory_gib
+    )
+    growth = float(capacity["initial_cloud_growth_factor"])
+    gaussian_capacity = int(capacity["effective_gaussian_capacity"])
+    maximum = int(math.floor(gaussian_capacity / growth))
+    if maximum <= 0:
+        raise ValueError(
+            "derived cloud.max_points is zero; adjust the Gaussian capacity "
+            "or initial-cloud growth policy"
+        )
+    record_runtime_resolution(
+        cfg,
+        "cloud_max_points",
+        source="derived",
+        formula="floor(min(policy_max_gaussians, vram_budget_gaussians) / initial_cloud_growth_factor)",
+        inputs={
+            "total_vram_gib": capacity["total_vram_gib"],
+            "vram_measurement_source": capacity["vram_measurement_source"],
+            "vram_budget_gaussians": capacity["vram_budget_gaussians"],
+            "effective_gaussian_capacity": gaussian_capacity,
+        },
+        policy={
+            "reserve_vram_gib": capacity["reserve_vram_gib"],
+            "gaussians_per_gib": capacity["gaussians_per_gib"],
+            "initial_cloud_growth_factor": growth,
+            "min_gaussians": capacity["min_gaussians"],
+            "max_gaussians": capacity["max_gaussians"],
+        },
+        chosen=maximum,
+    )
+    cfg.cloud.max_points = maximum
+    return maximum
+
+
+def _training_view_count(
+    segment: Any,
+    use_right_camera: bool,
+    training_frame_ids: Any | None = None,
+) -> tuple[int, int]:
     manifest = segment.manifest
-    train_pairs = len(manifest["train"])
+    if training_frame_ids is None:
+        train_pairs = len(manifest["train"])
+    else:
+        selected = tuple(int(value) for value in training_frame_ids)
+        if len(selected) != len(set(selected)) or not set(selected) <= set(
+            int(value) for value in manifest["train"]
+        ):
+            raise ValueError(
+                "tile training IDs must be unique members of manifest.train"
+            )
+        train_pairs = len(selected)
     if train_pairs <= 0:
         raise ValueError("training derivation needs at least one training frame")
     return train_pairs, train_pairs * (2 if use_right_camera else 1)
@@ -148,6 +284,7 @@ def resolve_training_controls(
     initial_cloud: str | Path,
     *,
     cuda_total_memory_gib: float | None = None,
+    training_frame_ids: Any | None = None,
 ) -> tuple[int, int]:
     """Resolve GS iterations and capacity after segment/cloud publication."""
     iteration_value = runtime_control_value(
@@ -171,7 +308,9 @@ def resolve_training_controls(
     records = []
     if _is_auto(iteration_value):
         train_pairs, train_views = _training_view_count(
-            segment, bool(getattr(cfg.train, "use_right_camera", False))
+            segment,
+            bool(getattr(cfg.train, "use_right_camera", False)),
+            training_frame_ids,
         )
         presentations = _positive(
             policy.image_presentations_per_view,
@@ -231,47 +370,17 @@ def resolve_training_controls(
             ) from exc
         if initial_points <= 0:
             raise ValueError("initial cloud contains no points")
-        configured_vram = getattr(policy, "vram_gib_override", None)
-        if configured_vram is not None:
-            total_vram = _positive(
-                configured_vram, "derivation.training.vram_gib_override"
-            )
-            vram_source = "policy_override"
-        elif cuda_total_memory_gib is not None:
-            total_vram = _positive(
-                cuda_total_memory_gib, "cuda_total_memory_gib"
-            )
-            vram_source = "injected_measurement"
-        else:
-            total_vram = detect_cuda_total_memory_gib()
-            vram_source = "torch_cuda_device_total_memory"
-        reserve = _positive(
-            policy.reserve_vram_gib,
-            "derivation.training.reserve_vram_gib",
+        capacity = _gaussian_capacity_policy(
+            policy, cuda_total_memory_gib=cuda_total_memory_gib
         )
-        per_gib = _positive(
-            policy.gaussians_per_gib,
-            "derivation.training.gaussians_per_gib",
-        )
-        growth = _positive(
-            policy.initial_cloud_growth_factor,
-            "derivation.training.initial_cloud_growth_factor",
-        )
-        minimum_gaussians = _positive_int(
-            policy.min_gaussians, "derivation.training.min_gaussians"
-        )
-        maximum_gaussians = _positive_int(
-            policy.max_gaussians, "derivation.training.max_gaussians"
-        )
-        usable_vram = total_vram - reserve
-        if usable_vram <= 0:
-            raise ValueError("reserved VRAM leaves no memory for Gaussian training")
-        vram_budget = int(math.floor(usable_vram * per_gib))
-        if vram_budget < minimum_gaussians:
-            raise ValueError(
-                "measured VRAM budget is below quality_v1 min_gaussians; "
-                "choose a smaller explicit cap or a different policy"
-            )
+        total_vram = float(capacity["total_vram_gib"])
+        vram_source = str(capacity["vram_measurement_source"])
+        reserve = float(capacity["reserve_vram_gib"])
+        per_gib = float(capacity["gaussians_per_gib"])
+        growth = float(capacity["initial_cloud_growth_factor"])
+        minimum_gaussians = int(capacity["min_gaussians"])
+        maximum_gaussians = int(capacity["max_gaussians"])
+        vram_budget = int(capacity["vram_budget_gaussians"])
         scene_demand = max(
             minimum_gaussians,
             int(math.ceil(initial_points * growth)),

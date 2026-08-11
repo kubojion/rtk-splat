@@ -21,8 +21,10 @@ _RUNTIME_TARGETS = {
     "frame_stride": ("segment", "frame_stride"),
     "frame_spacing_m": ("segment", "frame_spacing_m"),
     "depth_max_z_m": ("depth", "max_z_m"),
+    "cloud_max_points": ("cloud", "max_points"),
     "train_iterations": ("train", "iterations"),
     "train_max_gaussians": ("train", "max_gaussians"),
+    "tile_max_training_frames": ("tiles", "max_training_frames"),
 }
 
 

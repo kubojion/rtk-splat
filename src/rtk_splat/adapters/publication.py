@@ -15,7 +15,12 @@ from typing import Any
 import numpy as np
 
 from rtk_splat.adapters.image_decode import detect_compressed_format
-from rtk_splat.adapters.records import FrameRecord, RELPOS_FLAG_NAMES, RtkTrack
+from rtk_splat.adapters.records import (
+    FrameRecord,
+    RELPOS_FLAG_NAMES,
+    RtkTrack,
+    StagedPayload,
+)
 from rtk_splat.adapters.synchronization import nearest_matches
 from rtk_splat.core.segment import (
     CAPABILITIES,
@@ -27,14 +32,34 @@ from rtk_splat.core.segment import (
 )
 
 
-def _payload_format(payload: bytes | Path) -> str:
+def _payload_format(payload: bytes | Path | StagedPayload) -> str:
     """Detect an in-memory payload or staged image without loading it."""
+    if isinstance(payload, StagedPayload):
+        payload = payload.path
     if isinstance(payload, Path):
         if not payload.is_file():
             raise ValueError(f"staged image does not exist: {payload}")
         with payload.open("rb") as stream:
             return detect_compressed_format(stream.read(8))
     return detect_compressed_format(payload)
+
+
+def _publish_image_payload(
+    payload: bytes | Path | StagedPayload, destination: Path
+) -> None:
+    """Write one payload, consuming only explicitly disposable staged files."""
+    if isinstance(payload, StagedPayload):
+        source = payload.path
+        if not source.is_file() or source.is_symlink():
+            raise ValueError(f"staged image must be a regular file: {source}")
+        # The ROS2 spool is created beside the destination, so rename is both
+        # atomic and zero-copy.  An unexpected cross-filesystem setup fails
+        # loudly instead of silently doubling a large ingest's disk usage.
+        source.replace(destination)
+    elif isinstance(payload, Path):
+        shutil.copyfile(payload, destination)
+    else:
+        destination.write_bytes(payload)
 
 
 def _exact_ns(value: Any, label: str) -> int:
@@ -162,14 +187,16 @@ def _rectified_calibration(
 
 
 def _capability_record(
-    requested: Mapping[str, bool] | None, dual_available: bool
+    requested: Mapping[str, bool] | None,
+    dual_available: bool,
+    recorded_depth_available: bool,
 ) -> dict[str, bool]:
     capabilities = {
         "stereo": True,
         "rgbd": False,
         "single_rtk": not dual_available,
         "dual_rtk": dual_available,
-        "depth_recorded": False,
+        "depth_recorded": recorded_depth_available,
         "depth_computed": False,
         "imu_present": False,
         "images_raw": False,
@@ -187,7 +214,7 @@ def _capability_record(
     fixed = {
         "stereo": True,
         "rgbd": False,
-        "depth_recorded": False,
+        "depth_recorded": recorded_depth_available,
         "depth_computed": False,
         "imu_present": False,
         "images_raw": False,
@@ -196,7 +223,7 @@ def _capability_record(
     for name, expected in fixed.items():
         if capabilities[name] is not expected:
             raise ValueError(
-                f"ROS2 rectified stereo writer requires {name}={expected}"
+                f"rectified stereo writer requires {name}={expected}"
             )
     if capabilities["single_rtk"] == capabilities["dual_rtk"]:
         raise ValueError("declare exactly one of single_rtk or dual_rtk")
@@ -224,6 +251,74 @@ def _associate_all(
     ):
         raise RuntimeError(f"{label} association returned incomplete ordering")
     return matches.sample_indices, matches.residual_ns
+
+
+def _associate_nearest_with_validity(
+    query_ns: np.ndarray,
+    source_ns: np.ndarray,
+    tolerance_ns: int,
+    label: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Associate every query while marking, rather than hiding, stale rows.
+
+    This is deliberately separate from :func:`_associate_all`: absolute GNSS
+    position remains fail-closed, while a dual-antenna heading stream may have
+    a small, explicitly budgeted dropout.  The nearest source row and its exact
+    signed residual are retained even when it is outside the validity
+    tolerance; consumers must use ``association_valid``/``valid`` before
+    treating that row as a heading observation.
+    """
+    query = np.asarray(query_ns)
+    source = np.asarray(source_ns)
+    if query.ndim != 1 or source.ndim != 1 or source.size == 0:
+        raise ValueError(f"{label} association needs non-empty 1-D timestamps")
+
+    # Compute this in Python integers so the bound itself cannot overflow.
+    maximum_residual = max(
+        abs(int(source[0]) - int(query[-1])),
+        abs(int(source[-1]) - int(query[0])),
+    )
+    if maximum_residual > np.iinfo(np.int64).max:
+        raise ValueError(f"{label} timestamp span is outside int64")
+    matches = nearest_matches(
+        query,
+        source,
+        tolerance_ns=maximum_residual,
+    )
+    if matches.match_count != len(query) or not np.array_equal(
+        matches.reference_indices, np.arange(len(query), dtype=np.int64)
+    ):
+        raise RuntimeError(f"{label} association returned incomplete ordering")
+    association_valid = np.abs(matches.residual_ns) <= tolerance_ns
+    return matches.sample_indices, matches.residual_ns, association_valid
+
+
+def _fraction(value: Any, label: str) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{label} must be a finite fraction in [0, 1]")
+    result = float(value)
+    if not np.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError(f"{label} must be a finite fraction in [0, 1]")
+    return result
+
+
+def _nonnegative_count(value: Any, label: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{label} must be a non-negative integer")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{label} must be a non-negative integer")
+    return result
+
+
+def _longest_true_run(values: np.ndarray) -> int:
+    longest = current = 0
+    for value in np.asarray(values, dtype=bool):
+        current = current + 1 if value else 0
+        longest = max(longest, current)
+    return longest
 
 
 def _split_manifest(
@@ -425,12 +520,18 @@ def publish_segment_v2(
     clock_offset_ns: int,
     association_tolerance_ns: int,
     stereo_tolerance_ns: int,
+    maximum_heading_association_invalid_fraction: float = 0.0,
+    maximum_heading_association_invalid_run_frames: int = 0,
+    maximum_heading_association_invalid_residual_ns: int = 0,
     capabilities: Mapping[str, bool] | None = None,
     splits: Mapping[str, Sequence[int]] | None = None,
     provenance: Mapping[str, Any] | None = None,
     adapter_name: str = "ros2_zed_ublox",
+    recorded_depth: Sequence[Mapping[str, Any]] | None = None,
+    recorded_depth_semantics: Mapping[str, Any] | None = None,
+    acquisition_id: str | None = None,
 ) -> SegmentReader:
-    """Atomically publish selected ROS2 evidence as segment contract v2.
+    """Atomically publish adapter-selected evidence as segment contract v2.
 
     ``clock_offset_ns`` maps each camera header timestamp into the RTK clock
     before nearest-neighbour association. Stored frame timestamps remain the
@@ -443,6 +544,18 @@ def publish_segment_v2(
     )
     stereo_tolerance = _nonnegative_ns(
         stereo_tolerance_ns, "stereo_tolerance_ns"
+    )
+    maximum_heading_invalid_fraction = _fraction(
+        maximum_heading_association_invalid_fraction,
+        "maximum_heading_association_invalid_fraction",
+    )
+    maximum_heading_invalid_run = _nonnegative_count(
+        maximum_heading_association_invalid_run_frames,
+        "maximum_heading_association_invalid_run_frames",
+    )
+    maximum_heading_invalid_residual = _nonnegative_ns(
+        maximum_heading_association_invalid_residual_ns,
+        "maximum_heading_association_invalid_residual_ns",
     )
     frame_records = tuple(frames)
     poses = tuple(posed_frames)
@@ -485,9 +598,9 @@ def publish_segment_v2(
                 )
             left_payload = frame.left_jpeg
             right_payload = frame.right_jpeg
-            if not isinstance(left_payload, Path):
+            if not isinstance(left_payload, (Path, StagedPayload)):
                 left_payload = bytes(left_payload)
-            if not isinstance(right_payload, Path):
+            if not isinstance(right_payload, (Path, StagedPayload)):
                 right_payload = bytes(right_payload)
             left_ns_values.append(left_ns)
             right_ns_values.append(right_ns)
@@ -535,14 +648,8 @@ def publish_segment_v2(
         ):
             left_name = f"left_{index:06d}{extension[left_format]}"
             right_name = f"right_{index:06d}{extension[right_format]}"
-            if isinstance(left_payload, Path):
-                shutil.copyfile(left_payload, image_dir / left_name)
-            else:
-                (image_dir / left_name).write_bytes(left_payload)
-            if isinstance(right_payload, Path):
-                shutil.copyfile(right_payload, image_dir / right_name)
-            else:
-                (image_dir / right_name).write_bytes(right_payload)
+            _publish_image_payload(left_payload, image_dir / left_name)
+            _publish_image_payload(right_payload, image_dir / right_name)
             left_paths.append(f"images/{left_name}")
             right_paths.append(f"images/{right_name}")
 
@@ -575,10 +682,69 @@ def publish_segment_v2(
                 right_log_values, dtype=np.int64
             )
 
+        depth_available = recorded_depth is not None
+        if depth_available:
+            depth_records = tuple(recorded_depth)
+            if len(depth_records) != n_frames:
+                raise ValueError(
+                    "recorded_depth must contain exactly one record per frame"
+                )
+            if recorded_depth_semantics is None:
+                raise ValueError(
+                    "recorded_depth_semantics is required with recorded_depth"
+                )
+            depth_directory = writer.directory("depth")
+            depth_paths: list[str] = []
+            depth_header_ns: list[int] = []
+            depth_log_ns: list[int] = []
+            depth_source_encoding: list[str] = []
+            for index, record in enumerate(depth_records):
+                if not isinstance(record, Mapping):
+                    raise ValueError("recorded_depth records must be mappings")
+                payload = record.get("payload")
+                if not isinstance(payload, Path) or not payload.is_file():
+                    raise ValueError(
+                        f"recorded_depth[{index}].payload must be a staged file"
+                    )
+                header_ns = _exact_ns(
+                    record.get("header_ns"),
+                    f"recorded_depth[{index}].header_ns",
+                )
+                log_ns = _exact_ns(
+                    record.get("log_ns"), f"recorded_depth[{index}].log_ns"
+                )
+                name = f"{index:06d}.npz"
+                shutil.copyfile(payload, depth_directory / name)
+                depth_paths.append(f"depth/{name}")
+                depth_header_ns.append(header_ns)
+                depth_log_ns.append(log_ns)
+                depth_source_encoding.append(str(record.get("source_encoding", "")))
+            depth_header_array = np.asarray(depth_header_ns, dtype=np.int64)
+            if np.any(np.diff(depth_header_array) <= 0):
+                raise ValueError("recorded depth timestamps must be strictly increasing")
+            frame_values["depth_path"] = np.asarray(depth_paths, dtype=np.str_)
+            frame_values["depth_timestamp_ns"] = depth_header_array
+            frame_values["depth_log_timestamp_ns"] = np.asarray(
+                depth_log_ns, dtype=np.int64
+            )
+            frame_values["depth_sync_residual_ns"] = (
+                depth_header_array - left_ns_array
+            )
+            frame_values["depth_source_encoding"] = np.asarray(
+                depth_source_encoding, dtype=np.str_
+            )
+
         fix_count = len(fix_header_ns)
         fix_enu = np.asarray(getattr(track, "enu_xyz", None), dtype=np.float64)
         fix_covariance = np.asarray(
             track.fix_covariance_enu_m2, dtype=np.float64
+        )
+        raw_message_covariance = track.raw_message_covariance_enu_m2
+        message_fix_covariance = np.asarray(
+            fix_covariance
+            if raw_message_covariance is None
+            else raw_message_covariance,
+            dtype=np.float64,
         )
         fix_status = np.asarray(track.fix_status, dtype=np.int16)
         fix_carrier = np.asarray(track.fix_carrier_status, dtype=np.int16)
@@ -596,6 +762,7 @@ def publish_segment_v2(
         expected_fix_shapes = {
             "enu_xyz": (fix_count, 3),
             "fix_covariance_enu_m2": (fix_count, 3, 3),
+            "message_fix_covariance_enu_m2": (fix_count, 3, 3),
             "fix_status": (fix_count,),
             "fix_carrier_status": (fix_count,),
             "fix_log_ns": (fix_count,),
@@ -605,6 +772,7 @@ def publish_segment_v2(
         actual_fix = {
             "enu_xyz": fix_enu,
             "fix_covariance_enu_m2": fix_covariance,
+            "message_fix_covariance_enu_m2": message_fix_covariance,
             "fix_status": fix_status,
             "fix_carrier_status": fix_carrier,
             "fix_log_ns": fix_log_ns,
@@ -658,7 +826,8 @@ def publish_segment_v2(
             "raw_log_timestamp_ns": fix_log_ns,
             "raw_enu_m": fix_enu,
             "raw_geodetic_deg_m": fix_geodetic,
-            "raw_covariance_enu_m2": fix_covariance,
+            "raw_covariance_enu_m2": message_fix_covariance,
+            "raw_effective_covariance_enu_m2": fix_covariance,
             "raw_fix_status": fix_status,
             "raw_carrier_status": fix_carrier,
             "raw_covariance_type": fix_covariance_type,
@@ -668,7 +837,7 @@ def publish_segment_v2(
                 track.pvt_carrier_status, dtype=np.int16
             ),
         }
-        if hasattr(track, "fix_service"):
+        if track.fix_service is not None:
             service = np.asarray(track.fix_service, dtype=np.int16)
             if service.shape != (fix_count,):
                 raise ValueError(
@@ -767,7 +936,9 @@ def publish_segment_v2(
                 gnss[f"receiver_state_raw_{name}"] = value
 
         dual_available = _dual_evidence_available(track)
-        capability_record = _capability_record(capabilities, dual_available)
+        capability_record = _capability_record(
+            capabilities, dual_available, depth_available
+        )
         sensor_frames, camera_primary_transform, semantics = _sensor_semantics(
             camera_frame_id=camera_frame_id,
             primary_antenna_frame_id=primary_antenna_frame_id,
@@ -779,6 +950,7 @@ def publish_segment_v2(
             dual_rtk=capability_record["dual_rtk"],
         )
         heading = None
+        heading_association_summary = None
         if capability_record["dual_rtk"]:
             relpos_header_ns = np.asarray(track.relpos_header_ns, dtype=np.int64)
             relpos_log_ns = np.asarray(track.relpos_log_ns, dtype=np.int64)
@@ -806,15 +978,86 @@ def publish_segment_v2(
             for name, shape in expected.items():
                 if values[name].shape != shape:
                     raise ValueError(f"RtkTrack {name} must have shape {shape}")
-            heading_indices, heading_residual_ns = _associate_all(
+            (
+                heading_indices,
+                heading_residual_ns,
+                heading_association_valid,
+            ) = _associate_nearest_with_validity(
                 pose_query_ns,
                 relpos_header_ns,
                 association_tolerance,
                 "heading",
             )
-            raw_valid = _heading_validity(
-                baseline, accuracy, carrier, flags
+            invalid_indices = np.flatnonzero(~heading_association_valid)
+            invalid_count = int(invalid_indices.size)
+            invalid_fraction = invalid_count / n_frames
+            longest_invalid_run = _longest_true_run(
+                ~heading_association_valid
             )
+            invalid_max_abs_residual = (
+                int(np.max(np.abs(heading_residual_ns[invalid_indices])))
+                if invalid_count
+                else None
+            )
+            heading_association_summary = {
+                "method": "nearest",
+                "validity_field": "association_valid",
+                "tolerance_ns": association_tolerance,
+                "maximum_invalid_fraction": maximum_heading_invalid_fraction,
+                "maximum_consecutive_invalid_frames": (
+                    maximum_heading_invalid_run
+                ),
+                "maximum_invalid_abs_residual_ns": (
+                    maximum_heading_invalid_residual
+                ),
+                "frame_count": n_frames,
+                "valid_count": n_frames - invalid_count,
+                "invalid_count": invalid_count,
+                "invalid_fraction": invalid_fraction,
+                "longest_consecutive_invalid_frames": longest_invalid_run,
+                "max_abs_residual_ns": int(
+                    np.max(np.abs(heading_residual_ns))
+                ),
+                "invalid_max_abs_residual_ns": invalid_max_abs_residual,
+                "first_invalid_frame_id": (
+                    int(invalid_indices[0]) if invalid_count else None
+                ),
+            }
+            if invalid_fraction > maximum_heading_invalid_fraction:
+                raise ValueError(
+                    "heading association invalid fraction "
+                    f"{invalid_fraction:.9f} exceeds configured maximum "
+                    f"{maximum_heading_invalid_fraction:.9f} "
+                    f"({invalid_count}/{n_frames} frames; tolerance "
+                    f"{association_tolerance} ns; first invalid frame "
+                    f"{int(invalid_indices[0])})"
+                )
+            if longest_invalid_run > maximum_heading_invalid_run:
+                raise ValueError(
+                    "heading association longest invalid run "
+                    f"{longest_invalid_run} frames exceeds configured maximum "
+                    f"{maximum_heading_invalid_run} frames"
+                )
+            if (
+                invalid_max_abs_residual is not None
+                and invalid_max_abs_residual
+                > maximum_heading_invalid_residual
+            ):
+                raise ValueError(
+                    "heading association invalid residual "
+                    f"{invalid_max_abs_residual} ns exceeds configured maximum "
+                    f"{maximum_heading_invalid_residual} ns"
+                )
+            if track.heading_quality_kind == "dual_position":
+                raw_valid = np.asarray(track.heading_valid, dtype=bool)
+                if raw_valid.shape != (relpos_count,):
+                    raise ValueError(
+                        "dual-position heading_valid must have one value per sample"
+                    )
+            else:
+                raw_valid = _heading_validity(
+                    baseline, accuracy, carrier, flags
+                )
             heading = {
                 "frame_id": frame_ids,
                 "frame_timestamp_ns": left_ns_array,
@@ -824,11 +1067,14 @@ def publish_segment_v2(
                 "source_header_timestamp_ns": relpos_header_ns[heading_indices],
                 "source_log_timestamp_ns": relpos_log_ns[heading_indices],
                 "source_residual_ns": heading_residual_ns,
+                "association_valid": heading_association_valid,
                 "baseline_ned_m": baseline[heading_indices],
                 "acc_heading_rad": accuracy[heading_indices],
                 "carrier_status": carrier[heading_indices],
                 "flags": flags[heading_indices],
-                "valid": raw_valid[heading_indices],
+                "valid": (
+                    raw_valid[heading_indices] & heading_association_valid
+                ),
                 "raw_timestamp_ns": relpos_header_ns,
                 "raw_header_timestamp_ns": relpos_header_ns,
                 "raw_log_timestamp_ns": relpos_log_ns,
@@ -838,6 +1084,25 @@ def publish_segment_v2(
                 "raw_flags": flags,
                 "raw_valid": raw_valid,
             }
+            secondary = track.secondary_gnss
+            if secondary is not None:
+                secondary_fields = {
+                    "timestamp_ns": secondary.header_ns,
+                    "header_timestamp_ns": secondary.header_ns,
+                    "log_timestamp_ns": secondary.log_ns,
+                    "enu_m": secondary.enu_m,
+                    "geodetic_deg_m": secondary.geodetic_deg_m,
+                    "covariance_enu_m2": secondary.raw_covariance_enu_m2,
+                    "effective_covariance_enu_m2": (
+                        secondary.effective_covariance_enu_m2
+                    ),
+                    "fix_status": secondary.fix_status,
+                    "carrier_status": secondary.carrier_status,
+                    "covariance_type": secondary.covariance_type,
+                    "service": secondary.service,
+                }
+                for name, value in secondary_fields.items():
+                    heading[f"secondary_raw_{name}"] = value
 
         calibration = _rectified_calibration(
             left_camera_info, right_camera_info
@@ -855,6 +1120,23 @@ def publish_segment_v2(
         }
         crs = semantics["crs"]
         normalized_provenance = _json_value({} if provenance is None else provenance)
+        if acquisition_id is not None:
+            if (
+                not isinstance(acquisition_id, str)
+                or not acquisition_id
+                or len(acquisition_id) > 256
+                or acquisition_id.strip() != acquisition_id
+                or any(character.isspace() for character in acquisition_id)
+            ):
+                raise ValueError(
+                    "acquisition_id must be a non-empty opaque identifier"
+                )
+            existing_acquisition_id = normalized_provenance.get("acquisition_id")
+            if existing_acquisition_id not in (None, acquisition_id):
+                raise ValueError(
+                    "segment provenance acquisition_id conflicts with publication"
+                )
+            normalized_provenance["acquisition_id"] = acquisition_id
         receiver_state_metadata = None
         if receiver_state is not None:
             receiver_state_metadata = {
@@ -934,6 +1216,8 @@ def publish_segment_v2(
                     "components": ["north", "east", "down"],
                     "primary_frame_id": sensor_frames["primary_antenna"],
                     "secondary_frame_id": sensor_frames["secondary_antenna"],
+                    "quality_source": str(track.heading_quality_kind),
+                    "association": heading_association_summary,
                 }
                 if capability_record["dual_rtk"]
                 else None
@@ -980,6 +1264,19 @@ def publish_segment_v2(
             },
             "provenance": normalized_provenance,
         }
+        if acquisition_id is not None:
+            meta["acquisition_id"] = acquisition_id
+        if heading_association_summary is not None:
+            # Also place the measured result in provenance so downstream
+            # reports that carry only provenance do not lose the dropout gate.
+            meta["provenance"]["heading_association"] = (
+                heading_association_summary
+            )
+        if depth_available:
+            normalized_depth = _json_value(recorded_depth_semantics)
+            if not isinstance(normalized_depth, dict):
+                raise ValueError("recorded_depth_semantics must be a mapping")
+            meta["depth_observation"] = normalized_depth
         manifest = _split_manifest(splits, n_frames)
         writer.write_frames(frame_values)
         writer.write_calibration(calibration)

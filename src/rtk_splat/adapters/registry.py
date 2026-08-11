@@ -13,7 +13,12 @@ from typing import Any
 from rtk_splat.core.segment import SegmentReader
 
 
-ADAPTER_NAMES = ("agrigs", "ros1_citrusfarm", "ros2_zed_ublox")
+ADAPTER_NAMES = (
+    "agrigs",
+    "ros1_citrusfarm",
+    "ros1_rosario_v2",
+    "ros2_zed_ublox",
+)
 
 
 def _reject_unsupported_adapter_options(cfg, name: str) -> None:
@@ -42,7 +47,8 @@ def publish_from_config(
 ) -> SegmentReader:
     """Publish one immutable contract-v2 segment with the selected adapter."""
     name = str(getattr(cfg, "adapter", "")).strip()
-    _reject_unsupported_adapter_options(cfg, name)
+    if name != "ros1_rosario_v2":
+        _reject_unsupported_adapter_options(cfg, name)
     if name == "ros2_zed_ublox":
         from .ros2_zed_ublox import ingest_config_v2
 
@@ -50,6 +56,11 @@ def publish_from_config(
     if name == "ros1_citrusfarm":
         from .ros1_citrusfarm import ingest_config_v2
 
+        return ingest_config_v2(cfg, destination, window=selection)
+    if name == "ros1_rosario_v2":
+        from .ros1_rosario_v2 import ingest_config_v2, validate_adapter_options
+
+        validate_adapter_options(getattr(cfg, "adapter_options", None))
         return ingest_config_v2(cfg, destination, window=selection)
     if name == "agrigs":
         if selection is not None:

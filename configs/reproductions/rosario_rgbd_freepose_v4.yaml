@@ -1,0 +1,63 @@
+# Rosario colour GS with UNCONSTRAINED per-view pose refinement (v4).
+#
+# Diagnosis this tests. The colour model never develops detail: its render's
+# high-frequency energy is flat at 1-2 from step 2,000 to 44,300, while the IR
+# run on the same trajectory climbs 6 -> 45 (ground truth 1522). Its Gaussians
+# sit at 7.81 px projected radius (p10 3.21) against IR's 2.18 px (p10 0.26) --
+# the model represents the scene as blobs it never shrinks. A splat cannot be
+# sharper than its views agree, and adjacent colour frames disagree by 3.74 px
+# median where IR frames disagree by 0.34 px. One 6-dof rigid correction per
+# frame collapses that to 0.70 px, so the correction is exactly what pose_opt
+# parameterises -- but as shipped pose_opt realises 0.05% of it, because
+# project_gauge deletes the mean delta (98.6% of the required correction is
+# that global mode) and trans_penalty caps the remainder near 12-17 mm.
+#
+# So: gauge projection off, translation/rotation penalties off, trust region
+# widened to comfortably contain the measured 37 mm / 0.25 deg, and refinement
+# started early so every view is visited many times while it still matters.
+#
+# This is render-only by construction: without gauge projection the map may
+# translate as a whole, so it can never support a metric georeferencing claim.
+# The artifact is stamped DIAGNOSTIC_ONLY and that is correct, not a shortfall.
+profile: quality_v1
+robot: rosario_v2_dual_m2_d435
+
+adapter_options:
+  gnss_source: offline_ppk
+
+paths:
+  workdir: ~/agromap4d_work/rosario_v2_sequence5_ppk_140_250_v1
+  bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15.compressed.bag
+  gnss_bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15_ppk_gnss.bag
+
+pose:
+  time_offset_s: 0.0
+
+segment:
+  window_s: [140.0, 250.0]
+  window_epoch_source: first_bag_log
+  frame_spacing_m: auto
+
+frontend:
+  keyframes:
+    preset: all
+
+mapper:
+  name: rosario-seq5-ppk-140-250-global-v1
+  pose_artifact_name: rosario-seq5-ppk-140-250-global-v1
+  alignment_ransac_threshold_m: 0.30
+  max_rtk_median_error_m: 0.20
+  max_rtk_p95_inlier_error_m: 0.40
+
+train:
+  run_name: rosario-seq5-ppk-140-250-rgb-gs-freepose-v4
+  pose_opt:
+    enabled: true
+    gauge_projection: false
+    start_iter: 200
+    trans_penalty: 0.0
+    rot_penalty: 0.0
+    max_trans_m: 0.10
+    max_rot_deg: 2.0

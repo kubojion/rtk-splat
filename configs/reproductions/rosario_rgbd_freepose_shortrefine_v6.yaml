@@ -1,0 +1,64 @@
+# Rosario colour GS: free per-view poses AND an early MCMC stop (v6).
+#
+# The two levers that help have never been combined with enough training time.
+# Rendered detail (near-field Laplacian variance; ground truth 1522):
+#
+#                          MCMC stopped early      MCMC stopped late
+#   normal poses           v5: 2.3 @6k, 3.9 @20k   v1/v2/v3: 2.1 @44k
+#   free per-view poses    v4: 8.1 @6k             v4-full:  0.5 @44k
+#
+# At step 6,000 with the same MCMC stop, free poses give 8.1 against 2.3 --
+# a controlled 3.5x. And v5 showed extra settling steps lift normal poses
+# 2.3 -> 3.9 (1.7x) between 6k and 20k. The bottom-left cell has only ever run
+# 6,000 steps. This config fills it: free poses, MCMC stopped at step 5,000,
+# 20,000 total.
+#
+# Free poses require gauge_projection off, so the map may translate as a whole
+# and this artifact is permanently DIAGNOSTIC_ONLY -- a rendering result, not a
+# georeferenced one. That is the price of the 3.5x and it is why the headline
+# stereo+RTK result stays with the headland configuration.
+profile: quality_v1
+robot: rosario_v2_dual_m2_d435
+
+adapter_options:
+  gnss_source: offline_ppk
+
+paths:
+  workdir: ~/agromap4d_work/rosario_v2_sequence5_ppk_140_250_v1
+  bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15.compressed.bag
+  gnss_bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15_ppk_gnss.bag
+
+pose:
+  time_offset_s: 0.0
+
+segment:
+  window_s: [140.0, 250.0]
+  window_epoch_source: first_bag_log
+  frame_spacing_m: auto
+
+frontend:
+  keyframes:
+    preset: all
+
+mapper:
+  name: rosario-seq5-ppk-140-250-global-v1
+  pose_artifact_name: rosario-seq5-ppk-140-250-global-v1
+  alignment_ransac_threshold_m: 0.30
+  max_rtk_median_error_m: 0.20
+  max_rtk_p95_inlier_error_m: 0.40
+
+train:
+  run_name: rosario-seq5-ppk-140-250-rgb-gs-freepose-shortrefine-v6
+  # 0.25 x 20,000 = MCMC noise stops at step 5,000, just past the point where
+  # densification fills the 2,462,523 cap (step 4,000).
+  refine_stop_frac: 0.25
+  pose_opt:
+    enabled: true
+    gauge_projection: false
+    start_iter: 200
+    trans_penalty: 0.0
+    rot_penalty: 0.0
+    max_trans_m: 0.10
+    max_rot_deg: 2.0

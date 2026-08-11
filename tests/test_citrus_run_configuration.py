@@ -12,6 +12,7 @@ from rtk_splat.workflows.configio import load_config
 REPOSITORY = Path(__file__).resolve().parents[1]
 CONFIG = REPOSITORY / "configs/sequences/citrusfarm_05_13d_uturn.yaml"
 SCRIPT = REPOSITORY / "scripts/runs/citrusfarm_05_13d_uturn.sh"
+COMMON_SCRIPT = REPOSITORY / "scripts/runs/_citrusfarm_05_13d_common.sh"
 FROZEN = (
     REPOSITORY / "configs/reproductions/citrusfarm_05_13d_uturn_v2.yaml"
 )
@@ -44,6 +45,7 @@ class CitrusRunConfigurationTests(unittest.TestCase):
         self.assertFalse(hasattr(cfg, "rtk_refinement"))
         self.assertEqual(cfg.train.iterations, "auto")
         self.assertEqual(cfg.train.max_gaussians, "auto")
+        self.assertEqual(cfg.cloud.max_points, "auto")
         self.assertEqual(
             cfg.topics.receiver_state, "/piksi/debug/receiver_state"
         )
@@ -101,10 +103,11 @@ class CitrusRunConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.mapper.min_rtk_chi2_inlier_fraction, 0.80)
 
     def test_launcher_has_valid_shell_and_plan_is_non_mutating(self):
-        syntax = subprocess.run(
-            ["bash", "-n", str(SCRIPT)], capture_output=True, text=True
-        )
-        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        for script in (SCRIPT, COMMON_SCRIPT):
+            syntax = subprocess.run(
+                ["bash", "-n", str(script)], capture_output=True, text=True
+            )
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
         planned = subprocess.run(
             ["bash", str(SCRIPT), "plan"], capture_output=True, text=True
@@ -136,15 +139,21 @@ class CitrusRunConfigurationTests(unittest.TestCase):
         self.assertIn("metric georeferencing claim", diagnostic.stdout)
 
     def test_launcher_separates_and_propagates_diagnostic_outputs(self):
-        contents = SCRIPT.read_text(encoding="utf-8")
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        common = COMMON_SCRIPT.read_text(encoding="utf-8")
+        contents = wrapper + common
 
         self.assertIn(
-            'DIAGNOSTIC_POSE_NAME="${BACKEND_NAME}-diagnostic-render"',
-            contents,
+            'CITRUS_PRODUCTION_TRAIN_NAME="citrus-05-13d-543-735-auto-gs-v1"',
+            wrapper,
         )
         self.assertIn(
-            'DIAGNOSTIC_TRAIN_NAME="citrus-05-13d-543-735-auto-gs-v1-diagnostic-render"',
-            contents,
+            'DIAGNOSTIC_POSE_NAME="${PRODUCTION_POSE_NAME}-diagnostic-render"',
+            common,
+        )
+        self.assertIn(
+            'DIAGNOSTIC_TRAIN_NAME="${PRODUCTION_TRAIN_NAME}-diagnostic-render"',
+            common,
         )
         self.assertIn("--allow-failed-georeferencing-for-render", contents)
         self.assertIn("verify_pose_georeferencing_artifact", contents)

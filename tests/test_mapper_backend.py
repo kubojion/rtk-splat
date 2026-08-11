@@ -473,6 +473,13 @@ class MapperBackendTests(unittest.TestCase):
             self.assertEqual(
                 provenance["source_backend_workspace"], str(workspace)
             )
+            backend_plan = json.loads(
+                (workspace / "backend_plan.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                provenance["source_segment_binding"],
+                backend_plan["source_segment_binding"],
+            )
             georeferencing = json.loads(
                 (pose_artifact / "georeferencing.json").read_text()
             )

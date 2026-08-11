@@ -457,6 +457,17 @@ def collect_provenance(
         if repo_root is not None
         else discover_source_repository()
     )
+    contract_inputs = {
+        "segment_root": str(reader.root.resolve()),
+        "files": _contract_checksums(reader.root),
+        "image_inventory_count": len(inventory),
+        "image_inventory_sha256": canonical_hash(inventory),
+    }
+    acquisition_id = reader.meta.get("acquisition_id")
+    if acquisition_id is not None:
+        if not isinstance(acquisition_id, str) or not acquisition_id:
+            raise ArtifactError("segment acquisition_id is invalid")
+        contract_inputs["acquisition_id"] = acquisition_id
     return {
         "schema_version": 1,
         "source": collect_package_state(),
@@ -472,12 +483,7 @@ def collect_provenance(
         ),
         "colmap": colmap_record,
         "seed": seed,
-        "contract_inputs": {
-            "segment_root": str(reader.root.resolve()),
-            "files": _contract_checksums(reader.root),
-            "image_inventory_count": len(inventory),
-            "image_inventory_sha256": canonical_hash(inventory),
-        },
+        "contract_inputs": contract_inputs,
     }
 
 
@@ -501,6 +507,9 @@ def _validate_provenance(
         "image_inventory_count": len(inventory),
         "image_inventory_sha256": canonical_hash(inventory),
     }
+    acquisition_id = reader.meta.get("acquisition_id")
+    if acquisition_id is not None or "acquisition_id" in expected:
+        current["acquisition_id"] = acquisition_id
     if _normal(expected) != current:
         raise ArtifactError("segment inputs changed after provenance collection")
 

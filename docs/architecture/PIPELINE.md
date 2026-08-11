@@ -4,11 +4,11 @@
 
 The contract-v2 architecture for Phases 0, 1, 3, and 4 is implemented and
 covered by unit and synthetic tests, and the real headland input has been
-published under the normalized contract. The mapper-neutral COLMAP frontend
-and adaptive keyframe arms are prepared for a controlled real-data A/B, but
-that A/B has not yet been run. Historical headland results in `PROGRESS.md`
-were produced before this frontend refactor and remain the measured quality
-and runtime reference.
+published under the normalized contract. The mapper-neutral all-frame GPU and
+CPU frontends both registered 2,688/2,688 images. The GPU arm continued through
+Global and a 65k GS control and reproduced the accepted headland result within
+0.115 dB corrected masked PSNR. Adaptive dense/balanced/sparse GS arms remain
+unmeasured.
 
 An ordered ROS 1 CitrusFarm adapter, robot/sequence profiles, and a staged
 543--735 s reproduction launcher are also implemented. The full window has
@@ -72,8 +72,8 @@ tests enforce that boundary.
 - optional dual-antenna heading data; and
 - external trajectory or ground-truth parsing.
 
-The registry currently implements `ros2_zed_ublox`, `ros1_citrusfarm`, and
-`agrigs`. The Citrus adapter reads an explicitly ordered ROS 1 bag chain
+The registry currently implements `ros2_zed_ublox`, `ros1_citrusfarm`,
+`ros1_rosario_v2`, and `agrigs`. The Citrus adapter reads an explicitly ordered ROS 1 bag chain
 without a ROS installation, validates chunk gaps/overlaps and required topics,
 decodes raw rectified stereo losslessly, preserves Piksi timestamps,
 status/covariance and ROS bag-log times, estimates single-antenna course
@@ -102,7 +102,8 @@ and are remeasured before reuse.
 A published segment retains:
 
 - exact integer nanosecond timestamps;
-- both rectified RGB streams and both camera calibrations;
+- both rectified image streams and both camera calibrations (colour or
+  grayscale as declared by the adapter);
 - the metric stereo transform and explicit transform semantics;
 - RTK position, complete covariance, and receiver status;
 - the complete dual-antenna N/E/D baseline when available; and
@@ -121,8 +122,9 @@ headland input. The normalized output is
 `~/agromap4d_work/field_turn_contract_v2_normalized/segment`; its compact
 hashes, exact association residuals, capabilities, and resource use are
 recorded in `docs/experiments/migrations/headland_contract_v2.json`. Neither
-the source v1 segment nor the earlier v2 migration was modified. No new COLMAP
-or GS result is claimed from this migration yet.
+the source v1 segment nor the earlier v2 migration was modified. A separate
+modern all-frame experiment subsequently reproduced the golden GS quality; it
+did not modify this migration artifact.
 
 The CitrusFarm primary candidate follows the same boundary. Its completed
 source segment contains 1,495 stereo pairs plus single-RTK evidence; SGBM
@@ -176,8 +178,9 @@ attachment edges. Before optional edge pruning, it reserves a deterministic
 physically admissible bounded-degree spanning graph across solve frames; an
 unbridgeable or degree-infeasible solve fails with component diagnostics.
 
-These policies are implemented and tested. Their registration, speed, and GS
-quality on the real headland segment remain unmeasured.
+These policies are implemented and tested. The `all` GPU/CPU arms are measured;
+the registration, speed, and GS quality of reduced adaptive presets on the real
+headland segment remain unmeasured.
 
 ## Mapper backends
 
@@ -307,6 +310,7 @@ backend-register
 backend-quality
 backend-refine-rtk
 backend-export
+tiles-plan
 cloud
 train
 ```
@@ -315,6 +319,12 @@ Every command requires `--config`. Artifact names, expected frame counts,
 frontend profile, keyframe preset, backend, and run name can be overridden
 explicitly. There is no `all` command and no normal training path silently
 launches COLMAP, calibration, or an experimental sidecar.
+
+`tiles-plan` is the implemented boundary between one global pose solution and
+future bounded GS training. It content-seals the segment, images, depth, pose,
+measured visibility, disjoint ENU cores, and overlapping camera context. It
+does not yet make `cloud` or `train` tile-aware and does not publish a merged
+scene. See [TILED_SCENE.md](../methods/TILED_SCENE.md).
 
 `scripts/runs/citrusfarm_05_13d_uturn.sh` is a reproduction launcher, not a
 second workflow API. It invokes the explicit commands above in order, requires
@@ -357,21 +367,22 @@ The first cross-dataset Citrus run completed through visual reconstruction and
 the optional RTK continuation experiments, then correctly stopped. The Cauchy
 arm improved held-out median from 0.266 m to 0.249 m and support from 59.2% to
 67.2%. The later quadratic arm reached 0.228 m and 95.3% support, but still
-missed the 0.15 m median and 0.30 m inlier-p95 gates. A from-start quadratic
-pose-prior mapping arm is prepared but has not run. Only a complete stereo registration with
-acceptable held-out fixed-scale RTK behavior may proceed to cloud construction
-and the 65,000-iteration GS evaluation. The headland score is not a
-cross-dataset PSNR threshold.
+missed its gates. A fresh from-start pose-prior arm also completed and remained
+a rejected control. The later bounded 330--410 s retrace registered all 1,576
+images and passed its fixed-scale gate, but retained diagnostic-only status
+because that mode was explicitly requested. These results motivate bounded
+tiles; the headland score is not a cross-dataset PSNR threshold.
 
-The remaining headland efficiency A/B begins from one validated contract-v2
-segment:
+The remaining headland adaptive-efficiency A/B begins from one validated
+contract-v2 segment. The GPU/CPU all-frame comparison and GPU 65k control are
+already complete; what remains is:
 
-1. compare `gpu` with `cpu_reference` features using the `all` preset;
-2. run pose-only `all`, `dense`, `balanced`, and `sparse` arms with identical
+1. run pose-only `dense`, `balanced`, and `sparse` arms with identical
    feature evidence and mapper settings;
-3. require 100% left/right registration and no georeferencing regression;
-4. use cheap pose and rendering proxies to choose candidates; and
-5. run GS only for the baseline and selected candidate.
+2. require 100% left/right registration and no georeferencing regression;
+3. use cheap pose and rendering proxies to choose candidates; and
+4. run GS only for a selected reduced-density candidate, comparing it with the
+   completed all-frame control.
 
 The acceptance target is a material runtime reduction with no more than
 0.2--0.3 dB masked-PSNR loss. Until that experiment is completed, Phase 4 is

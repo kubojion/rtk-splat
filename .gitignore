@@ -34,3 +34,6 @@ agromap4d_work/
 work/
 /runs/
 segment/
+
+# Local timing/config probes are never reproducibility inputs.
+configs/sequences/.probe*.yaml

@@ -26,8 +26,10 @@ configs/
   independent acceptance gates. It cannot redefine topics, sensor geometry,
   feature extraction, or loss terms.
 - Runtime derivation owns values which are neither method constants nor robot
-  or recording facts: frame stride/spacing, stereo maximum range, iteration
-  count, and Gaussian capacity. An authored value is either `auto` or an
+  or recording facts: frame stride/spacing, stereo maximum range, initial
+  cloud capacity, iteration count, and Gaussian capacity. The cloud limit is
+  derived below the final VRAM-bound Gaussian cap so MCMC retains growth
+  headroom. An authored value is either `auto` or an
   explicit override. Each stage logs its formula, measurements, bounds, source
   origin and chosen value.
 - `reproductions/` freezes machine-specific settings for accepted project
@@ -39,10 +41,64 @@ Unknown keys and keys placed in the wrong layer fail before a stage starts.
 `reproductions/` is the deliberate exception: a frozen historical run is a
 complete monolithic record and may own every supported key.
 
+## Planned release-facing simplification
+
+The current schema is explicit and auditable, but the public new-dataset path
+is still too verbose. Its simplification is tracked in `../TODO.md` and is not
+implemented yet. The intended user-authored surface is:
+
+- robot facts that must actually be measured: intrinsics, stereo transform,
+  camera-to-antenna prior and uncertainty, timestamps/topics, GNSS status and
+  covariance semantics;
+- sequence facts: input location, optional time/window selection, output root,
+  and quality profile; and
+- rare explicit overrides, each labelled as an override.
+
+Sampling density, usable stereo range, iteration count, Gaussian capacity, and
+tile training-view workload belong to sealed runtime derivation. A new recording must
+not require guessing them, while a scientific reproduction must retain the
+fully resolved values and formula inputs. Until that interface is implemented
+and tested, the existing strict schema remains authoritative.
+
+`quality_v1.yaml` now also owns the generic `tiles:` planning policy. Its
+automatic frame capacity is derived from the training iteration/presentation
+budget, while support-cell size, bounded depthless-frame tolerance, minimum
+core training support, and visibility halo policy are sealed in each TilePlan.
+A sequence may name a TilePlan but cannot redefine the planning method. Do not
+put row numbers, per-tile time windows, or dataset-specific boundaries in a
+profile. See [the tiled-scene method](../docs/methods/TILED_SCENE.md).
+
+`profiles/headland_quality_accepted_v1.yaml` is the deliberately frozen first
+full-field transfer profile. It inherits `quality_v1` but keeps the measured
+4M initialization cloud, 65k presentations, 2.5M Gaussian cap, and 0.20 m
+scale cap that reproduced the accepted headland. It is not a claim that these
+limits are optimal for a 3090. A higher-capacity policy needs a matched
+one-tile A/B and a new versioned profile rather than an in-place edit.
+
+The same profile keeps heading freshness at 150 ms but permits a sparse,
+auditable receiver dropout: at most 0.5% of selected frames, no more than two
+consecutively, and never farther than 0.5 s from the nearest raw heading. Such
+rows are stored with `association_valid=false` and cannot become heading
+evidence. The generic `quality_v1` default remains fail-closed at zero invalid
+heading associations.
+
+`sequences/field1_0703_full_77min.yaml` names artifacts and the complete local
+recording only. The local/server procedure is documented in
+[`SERVER_RUN.md`](../SERVER_RUN.md); server commands override the segment and
+work roots while retaining the same authored configuration identity.
+
 `configs/robots/zed_dual_rtk.example.yaml` and
 `configs/sequences/headland.example.yaml` show the intended split. Copy and
 measure a new robot profile; do not hide a changed camera mount or antenna
 offset in a sequence file.
+
+`robots/rosario_v2_dual_m2_d435.yaml` and
+`sequences/rosario_v2_sequence5_ppk_140_250.yaml` are the cross-dataset ROS 1
+example. The robot file owns topics, calibration priors, and predeclared
+real-sensor acceptance gates. The sequence owns only its input bags, offline
+PPK choice, bounded window, output names, and independent georeferencing caps.
+Its online-GNSS ablation is a separate sequence and is expected to fail rather
+than silently replace the configured PPK evidence.
 
 ## Profile, robot and sequence merge
 

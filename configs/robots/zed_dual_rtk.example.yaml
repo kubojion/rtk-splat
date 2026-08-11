@@ -2,6 +2,11 @@
 # measure the geometry for that robot rather than editing sequence files.
 adapter: ros2_zed_ublox
 
+# The rtk_dual_antenna pose source deserialises custom UBX types, so it
+# needs their .msg definitions. Read-only; robot-stable, not per-recording.
+paths:
+  ublox_msgs_dir: ~/agrorob_ws/src/ublox_dgnss/ublox_ubx_msgs/msg
+
 topics:
   left_image: /zed/zed_node/left/color/rect/image/compressed
   right_image: /zed/zed_node/right/color/rect/image/compressed

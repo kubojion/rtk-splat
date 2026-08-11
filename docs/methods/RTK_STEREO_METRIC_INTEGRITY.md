@@ -1,4 +1,7 @@
-# RTK–Stereo Metric-Integrity Sidecar
+# Historical RTK–Stereo Metric-Integrity Sidecar
+
+> Archived v1 experiment record. It is not part of the current public workflow
+> surface; preserve it for evidence and do not copy its commands into a new run.
 
 This diagnostic stage audits and calibrates an existing metric stereo-COLMAP
 trajectory against a primary RTK position antenna and the complete

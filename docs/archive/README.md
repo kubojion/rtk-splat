@@ -6,4 +6,4 @@ implementation estimates.
 
 They are not current instructions and should not be cited as supported method
 claims. Use the repository `README.md`, `PROGRESS.md`, architecture documents,
-and golden experiment manifest for current information.
+golden experiment manifests, and `TODO.md` for current information.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,15 @@ def cloud_path(seg_dir: Path, cfg) -> Path:
             )
         root = Path(workdir) / "cloud_artifacts"
     return Path(root).expanduser() / pose_artifact_name(cfg) / "init_cloud.npz"
+
+
+def tile_cloud_path(seg_dir: Path, cfg, plan_name: str, tile_id: str) -> Path:
+    """Return an isolated initial-cloud path for one sealed TilePlan member."""
+    base = cloud_path(seg_dir, cfg).parent
+    for label, value in (("tile-plan name", plan_name), ("tile ID", tile_id)):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(value)):
+            raise ValueError(f"invalid {label} {value!r}")
+    return base / "tile_plans" / str(plan_name) / str(tile_id) / "init_cloud.npz"
 
 
 def pose_fingerprint(viewmats: np.ndarray) -> str:
@@ -179,4 +189,25 @@ def verify_cloud_matches_poses(
     if stored != pose_fingerprint(viewmats):
         raise ValueError(
             f"{cloud_file} was built from different poses; rebuild the cloud"
+        )
+
+
+def verify_cloud_tile_binding(
+    cloud_file: Path,
+    expected: Mapping[str, object],
+) -> None:
+    """Refuse a cloud from another tile, plan revision, or frame selection."""
+    canonical = json.dumps(
+        expected, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    try:
+        with np.load(cloud_file, allow_pickle=False) as cloud:
+            stored = str(cloud["tile_plan_json"].item())
+    except (OSError, KeyError, ValueError) as exc:
+        raise ValueError(
+            f"tile cloud has no valid sealed TilePlan binding: {cloud_file}"
+        ) from exc
+    if stored != canonical:
+        raise ValueError(
+            f"{cloud_file} was built for a different tile or TilePlan"
         )

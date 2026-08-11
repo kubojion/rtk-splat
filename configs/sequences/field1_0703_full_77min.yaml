@@ -1,0 +1,35 @@
+# Full 77-minute field-1 nav2 row-following recording (2026-07-03).
+#
+# Six crop rows plus seven headland turns, 415.4 m of path at a mean 0.09 m/s.
+# The accepted headland result is the [2750, 3200] s window of this same bag,
+# so every sampling and quality control here matches that frozen reproduction:
+# frame_stride 5 (3.0 Hz, ~3 cm on the ground) is carried over deliberately and
+# is NOT the automatic value -- the derivation would choose 17 at this speed,
+# and no A/B has ever tested a coarser stride.
+robot: agrorob_zed_dual_rtk
+profile: headland_quality_accepted_v1
+
+paths:
+  bags:
+    - /media/jion_kubo/Buffalo SSD/0703-nav2-follow-field1-row3-6-2-5-1-4-raw-localization-inputs-zed
+  workdir: ~/agromap4d_work/field1_0703_full_77min
+
+segment:
+  # Whole recording. Override on the command line for a short probe window.
+  window_s: [0.0, 4638.0]
+  frame_stride: 5
+
+frontend:
+  name: field1-0703-full77-all-gpu-v1
+  keyframes:
+    preset: all
+
+mapper:
+  name: field1-0703-full77-global-v1
+  pose_artifact_name: field1-0703-full77-global-pose-v1
+
+tiles:
+  name: field1-0703-full77-visibility-v1
+
+train:
+  run_name: field1-0703-full77-tile-gs-v1

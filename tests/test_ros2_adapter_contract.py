@@ -11,6 +11,7 @@ from rtk_splat.adapters.ros2_zed_ublox import (
     RtkTrack,
     publish_segment_v2,
 )
+from rtk_splat.adapters.records import StagedPayload
 
 
 BASE_NS = 1_700_000_000_123_456_789
@@ -137,6 +138,44 @@ def _track(*, dual: bool) -> RtkTrack:
     return track
 
 
+def _track_with_one_heading_gap() -> RtkTrack:
+    """Synthetic dual-RTK stream with one camera query outside 2 ms."""
+    track = _track(dual=True)
+    keep = np.array([0, 2], dtype=np.int64)
+    for name in (
+        "relpos_t",
+        "relpos_yaw",
+        "relpos_carr",
+        "relpos_header_ns",
+        "relpos_log_ns",
+        "relpos_ned_m",
+        "relpos_acc_heading_rad",
+        "relpos_flags",
+        "heading_valid",
+    ):
+        setattr(track, name, np.asarray(getattr(track, name))[keep])
+    return track
+
+
+def _track_with_heading_gap_cluster() -> RtkTrack:
+    """Synthetic dual-RTK stream with two consecutive stale associations."""
+    track = _track(dual=True)
+    keep = np.array([0], dtype=np.int64)
+    for name in (
+        "relpos_t",
+        "relpos_yaw",
+        "relpos_carr",
+        "relpos_header_ns",
+        "relpos_log_ns",
+        "relpos_ned_m",
+        "relpos_acc_heading_rad",
+        "relpos_flags",
+        "heading_valid",
+    ):
+        setattr(track, name, np.asarray(getattr(track, name))[keep])
+    return track
+
+
 def _writer_kwargs(*, dual: bool) -> dict:
     return {
         "camera_frame_id": "zed_left_camera_optical_frame",
@@ -217,6 +256,55 @@ def assert_ros2_contract(
 
 
 class Ros2AdapterContractTests(unittest.TestCase):
+    def test_disposable_spooled_images_are_moved_into_atomic_publication(self):
+        timestamps, frames, poses = _frames_and_poses()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spool = root / "spool"
+            spool.mkdir()
+            staged = []
+            expected_inodes = []
+            for index, frame in enumerate(frames):
+                left = spool / f"left-{index}.payload"
+                right = spool / f"right-{index}.payload"
+                left.write_bytes(frame.left_jpeg)
+                right.write_bytes(frame.right_jpeg)
+                expected_inodes.append((left.stat().st_ino, right.stat().st_ino))
+                staged.append(
+                    FrameRecord(
+                        t=frame.t,
+                        t_right=frame.t_right,
+                        left_jpeg=StagedPayload(left),
+                        right_jpeg=StagedPayload(right),
+                        left_header_ns=frame.left_header_ns,
+                        right_header_ns=frame.right_header_ns,
+                    )
+                )
+
+            destination = root / "segment"
+            reader = publish_segment_v2(
+                destination,
+                staged,
+                poses,
+                _track(dual=True),
+                _camera_info(right=False),
+                _camera_info(right=True),
+                **_writer_kwargs(dual=True),
+            ).validate()
+
+            self.assertEqual(list(spool.iterdir()), [])
+            stored = reader.frames
+            for index, (left_inode, right_inode) in enumerate(expected_inodes):
+                self.assertEqual(
+                    (destination / str(stored["left_image_path"][index])).stat().st_ino,
+                    left_inode,
+                )
+                self.assertEqual(
+                    (destination / str(stored["right_image_path"][index])).stat().st_ino,
+                    right_inode,
+                )
+            np.testing.assert_array_equal(stored["timestamp_ns"], timestamps)
+
     def test_dual_rtk_writer_preserves_complete_evidence_and_calibration(self):
         timestamps, frames, poses = _frames_and_poses()
         track = _track(dual=True)
@@ -292,6 +380,7 @@ class Ros2AdapterContractTests(unittest.TestCase):
             heading = reader.observations("heading")
             assert heading is not None
             np.testing.assert_array_equal(heading["source_index"], [0, 1, 2])
+            self.assertTrue(heading["association_valid"].all())
             np.testing.assert_allclose(
                 heading["raw_baseline_ned_m"],
                 np.tile([1.20, 0.10, -0.02], (3, 1)),
@@ -300,6 +389,10 @@ class Ros2AdapterContractTests(unittest.TestCase):
             self.assertEqual(
                 reader.meta["heading_evidence"]["quantity"],
                 "primary-to-secondary antenna baseline",
+            )
+            self.assertEqual(
+                reader.meta["heading_observation"]["association"]["invalid_count"],
+                0,
             )
             np.testing.assert_allclose(
                 frame_values["initial_camera_center_m"][:, 0], [0, 1, 2]
@@ -342,6 +435,131 @@ class Ros2AdapterContractTests(unittest.TestCase):
                 )
             self.assertFalse(destination.exists())
             self.assertEqual(list(root.glob(".segment.writing-*")), [])
+
+    def test_bounded_heading_gap_is_retained_but_explicitly_invalid(self):
+        _, frames, poses = _frames_and_poses()
+        with tempfile.TemporaryDirectory() as temporary:
+            options = _writer_kwargs(dual=True)
+            options["maximum_heading_association_invalid_fraction"] = 0.34
+            options["maximum_heading_association_invalid_run_frames"] = 1
+            options["maximum_heading_association_invalid_residual_ns"] = 150_000_000
+            reader = publish_segment_v2(
+                Path(temporary) / "segment",
+                frames,
+                poses,
+                _track_with_one_heading_gap(),
+                _camera_info(right=False),
+                _camera_info(right=True),
+                **options,
+            ).validate()
+
+            heading = reader.observations("heading")
+            assert heading is not None
+            np.testing.assert_array_equal(heading["source_index"], [0, 1, 1])
+            np.testing.assert_array_equal(
+                heading["association_valid"], [True, False, True]
+            )
+            np.testing.assert_array_equal(heading["valid"], [True, False, True])
+            self.assertGreater(abs(int(heading["source_residual_ns"][1])), 2_000_000)
+            self.assertEqual(len(heading["raw_timestamp_ns"]), 2)
+            association = reader.meta["heading_observation"]["association"]
+            self.assertEqual(association["invalid_count"], 1)
+            self.assertAlmostEqual(association["invalid_fraction"], 1 / 3)
+            self.assertEqual(
+                association["longest_consecutive_invalid_frames"], 1
+            )
+            self.assertEqual(association["first_invalid_frame_id"], 1)
+            self.assertEqual(
+                reader.meta["provenance"]["heading_association"], association
+            )
+
+    def test_excessive_heading_gap_fraction_fails_closed(self):
+        _, frames, poses = _frames_and_poses()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "segment"
+            options = _writer_kwargs(dual=True)
+            options["maximum_heading_association_invalid_fraction"] = 0.30
+            options["maximum_heading_association_invalid_run_frames"] = 1
+            options["maximum_heading_association_invalid_residual_ns"] = 150_000_000
+            with self.assertRaisesRegex(
+                ValueError, "heading association invalid fraction"
+            ):
+                publish_segment_v2(
+                    destination,
+                    frames,
+                    poses,
+                    _track_with_one_heading_gap(),
+                    _camera_info(right=False),
+                    _camera_info(right=True),
+                    **options,
+                )
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.glob(".segment.writing-*")), [])
+
+    def test_clustered_heading_gap_fails_consecutive_frame_gate(self):
+        _, frames, poses = _frames_and_poses()
+        with tempfile.TemporaryDirectory() as temporary:
+            options = _writer_kwargs(dual=True)
+            options["maximum_heading_association_invalid_fraction"] = 0.70
+            options["maximum_heading_association_invalid_run_frames"] = 1
+            options["maximum_heading_association_invalid_residual_ns"] = 500_000_000
+            with self.assertRaisesRegex(ValueError, "longest invalid run"):
+                publish_segment_v2(
+                    Path(temporary) / "segment",
+                    frames,
+                    poses,
+                    _track_with_heading_gap_cluster(),
+                    _camera_info(right=False),
+                    _camera_info(right=True),
+                    **options,
+                )
+
+    def test_heading_gap_outlier_fails_absolute_residual_gate(self):
+        _, frames, poses = _frames_and_poses()
+        with tempfile.TemporaryDirectory() as temporary:
+            options = _writer_kwargs(dual=True)
+            options["maximum_heading_association_invalid_fraction"] = 0.34
+            options["maximum_heading_association_invalid_run_frames"] = 1
+            options["maximum_heading_association_invalid_residual_ns"] = 50_000_000
+            with self.assertRaisesRegex(ValueError, "invalid residual"):
+                publish_segment_v2(
+                    Path(temporary) / "segment",
+                    frames,
+                    poses,
+                    _track_with_one_heading_gap(),
+                    _camera_info(right=False),
+                    _camera_info(right=True),
+                    **options,
+                )
+
+    def test_heading_association_validity_is_contract_checked(self):
+        _, frames, poses = _frames_and_poses()
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "segment"
+            options = _writer_kwargs(dual=True)
+            options["maximum_heading_association_invalid_fraction"] = 0.34
+            options["maximum_heading_association_invalid_run_frames"] = 1
+            options["maximum_heading_association_invalid_residual_ns"] = 150_000_000
+            reader = publish_segment_v2(
+                destination,
+                frames,
+                poses,
+                _track_with_one_heading_gap(),
+                _camera_info(right=False),
+                _camera_info(right=True),
+                **options,
+            )
+            heading = reader.observations("heading")
+            assert heading is not None
+            heading["association_valid"][1] = True
+            np.savez_compressed(
+                destination / "observations" / "heading.npz", **heading
+            )
+            with self.assertRaisesRegex(
+                ValueError, "association_valid disagrees"
+            ):
+                reader.validate()
 
     def test_existing_destination_is_never_modified(self):
         _, frames, poses = _frames_and_poses()

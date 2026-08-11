@@ -207,6 +207,25 @@ def cmd_depth(cfg, args) -> None:
     print(f"published derived depth segment -> {result.root}")
 
 
+def cmd_segment_materialize(cfg, args) -> None:
+    from rtk_splat.workflows.segment_transfer import materialize_portable_segment
+
+    source = _reader(cfg, args)
+    destination = args.portable_segment.expanduser()
+    result = materialize_portable_segment(
+        source.root, destination, link_mode=(args.link_mode or "auto")
+    )
+    print(f"published portable transfer segment -> {result}")
+
+
+def cmd_segment_transfer_verify(cfg, args) -> None:
+    from rtk_splat.workflows.segment_transfer import verify_portable_segment
+
+    source = _reader(cfg, args)
+    result = verify_portable_segment(source.root)
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def _frontend_configs(cfg, args):
     from rtk_splat.frontends.keyframes import KEYFRAME_PRESETS, KeyframeConfig
     from rtk_splat.frontends.pair_graph import PairGraphConfig
@@ -429,18 +448,66 @@ def cmd_backend_export(cfg, args) -> None:
 
 def cmd_cloud(cfg, args) -> None:
     from rtk_splat.workflows.cloud import construct_initial_cloud
+    from rtk_splat.workflows.tiles import load_tile_execution
 
     reader = _reader(cfg, args)
     if args.pose_name:
         cfg.pose.artifact = args.pose_name
+    if getattr(args, "pose_artifact_root", None) is not None:
+        cfg.pose.artifact_root = args.pose_artifact_root.expanduser()
+    execution = None
+    if getattr(args, "tile_plan", None) is not None:
+        execution = load_tile_execution(
+            args.tile_plan, args.tile_id, reader, cfg
+        )
     output, point_count = construct_initial_cloud(
         reader,
         cfg,
         allow_failed_georeferencing_for_render=(
             bool(getattr(args, "allow_failed_georeferencing_for_render", False))
         ),
+        tile_execution=execution,
     )
     print(f"initial cloud: {point_count:,} points -> {output}")
+
+
+def cmd_tiles_plan(cfg, args) -> None:
+    from rtk_splat.workflows.tiles import build_tile_plan
+
+    reader = _reader(cfg, args)
+    if args.pose_name:
+        cfg.pose.artifact = args.pose_name
+    if getattr(args, "pose_artifact_root", None) is not None:
+        cfg.pose.artifact_root = args.pose_artifact_root.expanduser()
+    tiles = _section(cfg, "tiles")
+    name = str(
+        args.tile_plan_name
+        or getattr(tiles, "name", None)
+        or "visibility-workload-v1"
+    )
+    output = build_tile_plan(
+        reader,
+        cfg,
+        name=name,
+        output_root=cfg.paths.workdir,
+        tile_count=args.tile_count,
+    )
+    plan = json.loads((output / "tile_plan.json").read_text())
+    print(
+        json.dumps(
+            {
+                "tile_plan": str(output),
+                "plot": str(output / "plan.svg"),
+                **plan["summary"],
+                "tiles": [
+                    {"tile_id": item["tile_id"], **item["summary"]}
+                    for item in plan["tiles"]
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def cmd_train(cfg, args) -> None:
@@ -449,12 +516,64 @@ def cmd_train(cfg, args) -> None:
     if args.run_name:
         cfg.train.run_name = args.run_name
     from rtk_splat.backends.gsplat import train_tile
-    from rtk_splat.core.pose_artifacts import cloud_path
+    from rtk_splat.core.pose_artifacts import cloud_path, tile_cloud_path
+    from rtk_splat.workflows.cloud import load_tile_context_masks, verify_tile_cloud
     from rtk_splat.workflows.runtime_config import resolve_training_controls
+    from rtk_splat.workflows.tiles import load_tile_execution
 
     reader = _reader(cfg, args)
-    resolve_training_controls(cfg, reader, cloud_path(reader.root, cfg))
-    run = Path(cfg.paths.workdir) / "runs" / str(cfg.train.run_name)
+    if getattr(args, "pose_artifact_root", None) is not None:
+        cfg.pose.artifact_root = args.pose_artifact_root.expanduser()
+    execution = None
+    initial_cloud = cloud_path(reader.root, cfg)
+    if getattr(args, "tile_plan", None) is not None:
+        execution = load_tile_execution(
+            args.tile_plan, args.tile_id, reader, cfg
+        )
+        initial_cloud = tile_cloud_path(
+            reader.root,
+            cfg,
+            execution.binding["name"],
+            execution.tile_id,
+        )
+        from rtk_splat.backends.pose_evidence import pose_georeferencing_evidence
+        from rtk_splat.core.pose_artifacts import load_pose_artifact
+        viewmats, _ = load_pose_artifact(
+            reader.root,
+            cfg,
+            allow_failed_georeferencing_for_render=bool(
+                getattr(args, "allow_failed_georeferencing_for_render", False)
+            ),
+        )
+        verify_tile_cloud(
+            initial_cloud,
+            execution,
+            viewmats,
+            georeferencing=pose_georeferencing_evidence(reader.root, cfg),
+            allow_failed_georeferencing_for_render=bool(
+                getattr(args, "allow_failed_georeferencing_for_render", False)
+            ),
+        )
+    resolve_training_controls(
+        cfg,
+        reader,
+        initial_cloud,
+        training_frame_ids=(execution.train_ids if execution else None),
+    )
+    run = (
+        Path(cfg.paths.workdir) / "runs" / str(cfg.train.run_name)
+        if execution is None
+        else Path(cfg.paths.workdir)
+        / "tile_runs"
+        / str(execution.binding["name"])
+        / execution.tile_id
+        / str(cfg.train.run_name)
+    )
+    context_masks = (
+        load_tile_context_masks(initial_cloud, execution)
+        if execution is not None
+        else None
+    )
     result = train_tile(
         reader.root,
         run,
@@ -462,7 +581,80 @@ def cmd_train(cfg, args) -> None:
         allow_failed_georeferencing_for_render=(
             bool(getattr(args, "allow_failed_georeferencing_for_render", False))
         ),
+        initial_cloud=initial_cloud,
+        train_frame_ids=(execution.train_ids if execution else None),
+        eval_frame_ids=(execution.val_ids if execution else None),
+        tile_plan=(execution.binding if execution else None),
+        context_masks=context_masks,
     )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _scene_tile_runs(values: list[str] | None) -> dict[str, Path]:
+    result = {}
+    for value in values or []:
+        tile_id, separator, path = str(value).partition("=")
+        if not separator or not tile_id or not path:
+            raise ValueError("--scene-tile-run must be TILE_ID=/path/to/run")
+        if tile_id in result:
+            raise ValueError(f"duplicate --scene-tile-run for {tile_id}")
+        result[tile_id] = Path(path).expanduser()
+    return result
+
+
+def cmd_scene_publish(cfg, args) -> None:
+    if args.pose_name:
+        cfg.pose.artifact = args.pose_name
+    cfg.pose.artifact_root = args.pose_artifact_root.expanduser()
+    common = {
+        "segment": _segment_path(cfg),
+        "cfg": cfg,
+        "tile_plan_root": args.tile_plan,
+        "pose_root": (
+            args.pose_artifact_root.expanduser() / str(cfg.pose.artifact)
+        ),
+        "tile_runs": _scene_tile_runs(args.scene_tile_run),
+        "output_root": cfg.paths.workdir,
+        "scene_name": args.scene_name,
+        "opacity_threshold": (
+            0.05 if args.scene_opacity_threshold is None
+            else args.scene_opacity_threshold
+        ),
+        "maximum_combined_gaussians": args.max_combined_gaussians,
+        "device": ("cuda" if args.scene_device is None else args.scene_device),
+    }
+    if (args.scene_mode or "controlled-ab") == "production":
+        from rtk_splat.workflows.tile_scene import publish_production_tiled_scene
+
+        result = publish_production_tiled_scene(
+            **common,
+            allow_nonproduction_georeferencing_for_diagnostic=(
+                bool(args.diagnostic_scene)
+            ),
+        )
+    else:
+        from rtk_splat.workflows.tile_scene import publish_tiled_scene
+
+        result = publish_tiled_scene(
+            **common,
+            reference_run=args.reference_run,
+            reference_hashes={
+                "params_sha256": args.reference_params_sha256,
+                "metrics_sha256": args.reference_metrics_sha256,
+                "provenance_sha256": args.reference_provenance_sha256,
+            },
+            maximum_psnr_loss_db=(
+                0.30 if args.max_psnr_loss_db is None else args.max_psnr_loss_db
+            ),
+            maximum_ssim_loss=(
+                0.015 if args.max_ssim_loss is None else args.max_ssim_loss
+            ),
+            maximum_lpips_cc_increase=(
+                0.030
+                if args.max_lpips_cc_increase is None
+                else args.max_lpips_cc_increase
+            ),
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -470,6 +662,8 @@ COMMANDS = {
     "validate": cmd_validate,
     "ingest": cmd_ingest,
     "depth": cmd_depth,
+    "segment-materialize": cmd_segment_materialize,
+    "segment-transfer-verify": cmd_segment_transfer_verify,
     "frontend-build": cmd_frontend_build,
     "frontend-features": cmd_frontend_features,
     "frontend-rig": cmd_frontend_rig,
@@ -481,8 +675,10 @@ COMMANDS = {
     "backend-quality": cmd_backend_quality,
     "backend-refine-rtk": cmd_backend_refine_rtk,
     "backend-export": cmd_backend_export,
+    "tiles-plan": cmd_tiles_plan,
     "cloud": cmd_cloud,
     "train": cmd_train,
+    "scene-publish": cmd_scene_publish,
 }
 
 
@@ -501,6 +697,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--derived-segment",
         type=Path,
         help="new contract-v2 destination for the depth stage",
+    )
+    parser.add_argument(
+        "--portable-segment",
+        type=Path,
+        help="new self-contained, checksum-sealed segment destination",
+    )
+    parser.add_argument(
+        "--link-mode",
+        choices=("auto", "hardlink", "copy"),
+        help=(
+            "portable materialization policy; auto hardlinks on one filesystem "
+            "and copies across filesystems"
+        ),
     )
     parser.add_argument("--frontend-name")
     parser.add_argument(
@@ -526,7 +735,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="RTK position-prior loss for backend-refine-rtk only",
     )
     parser.add_argument("--pose-name")
+    parser.add_argument(
+        "--pose-artifact-root",
+        type=Path,
+        help=(
+            "pose-artifact parent override for tiles-plan, cloud, train, "
+            "or scene-publish"
+        ),
+    )
+    parser.add_argument("--tile-plan-name")
+    parser.add_argument(
+        "--tile-plan",
+        type=Path,
+        help="sealed TilePlan artifact to consume during cloud/train/scene-publish",
+    )
+    parser.add_argument("--tile-id")
+    parser.add_argument(
+        "--tile-count",
+        type=int,
+        help="explicit tile count for a controlled tiles-plan experiment",
+    )
     parser.add_argument("--run-name")
+    parser.add_argument(
+        "--scene-tile-run",
+        action="append",
+        help="completed tiled run as TILE_ID=/path; repeat for every tile",
+    )
+    parser.add_argument("--scene-name")
+    parser.add_argument(
+        "--scene-mode",
+        choices=("controlled-ab", "production"),
+        help=(
+            "controlled-ab requires a sealed monolithic reference; production "
+            "publishes absolute whole-scene/seam evidence without one"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-scene",
+        action="store_true",
+        help=(
+            "with --scene-mode production, explicitly allow a provisional "
+            "diagnostic-only scene from non-production georeferencing"
+        ),
+    )
+    parser.add_argument("--reference-run", type=Path)
+    parser.add_argument("--reference-params-sha256")
+    parser.add_argument("--reference-metrics-sha256")
+    parser.add_argument("--reference-provenance-sha256")
+    parser.add_argument("--scene-opacity-threshold", type=float)
+    parser.add_argument("--max-psnr-loss-db", type=float)
+    parser.add_argument("--max-ssim-loss", type=float)
+    parser.add_argument("--max-lpips-cc-increase", type=float)
+    parser.add_argument("--max-combined-gaussians", type=int)
+    parser.add_argument("--scene-device")
     parser.add_argument("--train-iters", type=int)
     parser.add_argument("--expected-frames", type=int)
     parser.add_argument(
@@ -549,18 +810,28 @@ def build_parser() -> argparse.ArgumentParser:
 def _stage_overrides(args) -> dict[str, Any]:
     """Return only explicit command-line controls, separate from YAML."""
     names = (
-        "workdir", "segment", "derived_segment", "frontend_name",
+        "workdir", "segment", "derived_segment", "portable_segment",
+        "link_mode", "frontend_name",
         "feature_profile", "keyframe_preset", "backend", "backend_name",
         "refinement_name", "initialization_mode", "prior_position_loss",
         "pose_name", "run_name", "train_iters", "expected_frames",
+        "pose_artifact_root", "tile_plan_name", "tile_count",
+        "tile_plan", "tile_id",
+        "scene_tile_run", "scene_name", "scene_mode", "reference_run",
+        "reference_params_sha256", "reference_metrics_sha256",
+        "reference_provenance_sha256", "scene_opacity_threshold",
+        "max_psnr_loss_db", "max_ssim_loss", "max_lpips_cc_increase",
+        "max_combined_gaussians", "scene_device",
     )
     result = {
-        name: _plain(getattr(args, name))
+        name: _plain(getattr(args, name, None))
         for name in names
-        if getattr(args, name) is not None
+        if getattr(args, name, None) is not None
     }
     if args.skip_image_quality:
         result["skip_image_quality"] = True
+    if args.diagnostic_scene:
+        result["diagnostic_scene"] = True
     if args.allow_failed_georeferencing_for_render:
         result["allow_failed_georeferencing_for_render"] = True
     return result
@@ -607,6 +878,87 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--train-iters must be positive")
     if args.expected_frames is not None and args.expected_frames <= 0:
         raise ValueError("--expected-frames must be positive")
+    if args.tile_count is not None and args.tile_count <= 0:
+        raise ValueError("--tile-count must be positive")
+    if args.stage == "segment-materialize" and args.portable_segment is None:
+        raise ValueError("segment-materialize requires --portable-segment")
+    if args.stage != "segment-materialize" and args.portable_segment is not None:
+        raise ValueError(
+            "--portable-segment is valid only for segment-materialize"
+        )
+    if args.stage != "segment-materialize" and args.link_mode is not None:
+        raise ValueError("--link-mode is valid only for segment-materialize")
+    plan_only = ("tile_plan_name", "tile_count")
+    if args.stage != "tiles-plan" and any(
+        getattr(args, name) is not None for name in plan_only
+    ):
+        raise ValueError(
+            "--tile-plan-name and --tile-count are "
+            "valid only for tiles-plan"
+        )
+    if (
+        args.pose_artifact_root is not None
+        and args.stage not in {"tiles-plan", "cloud", "train", "scene-publish"}
+    ):
+        raise ValueError(
+            "--pose-artifact-root is valid only for tiles-plan, cloud, train, "
+            "and scene-publish"
+        )
+    scene_options = (
+        "scene_tile_run", "scene_name", "scene_mode", "reference_run",
+        "reference_params_sha256", "reference_metrics_sha256",
+        "reference_provenance_sha256", "scene_opacity_threshold",
+        "max_psnr_loss_db", "max_ssim_loss", "max_lpips_cc_increase",
+        "max_combined_gaussians", "scene_device",
+    )
+    if args.stage == "scene-publish":
+        mode = args.scene_mode or "controlled-ab"
+        required = [
+            "tile_plan", "pose_artifact_root", "scene_tile_run", "scene_name",
+        ]
+        if mode == "controlled-ab":
+            required.extend((
+                "reference_run", "reference_params_sha256",
+                "reference_metrics_sha256", "reference_provenance_sha256",
+            ))
+        missing = [name for name in required if getattr(args, name) is None]
+        if missing:
+            raise ValueError(
+                "scene-publish is missing: "
+                + ", ".join("--" + name.replace("_", "-") for name in missing)
+            )
+        if args.tile_id is not None:
+            raise ValueError("scene-publish consumes the whole plan, not --tile-id")
+        if mode == "controlled-ab" and args.diagnostic_scene:
+            raise ValueError("--diagnostic-scene requires --scene-mode production")
+        if mode == "production":
+            relative_options = (
+                "reference_run", "reference_params_sha256",
+                "reference_metrics_sha256", "reference_provenance_sha256",
+                "max_psnr_loss_db", "max_ssim_loss",
+                "max_lpips_cc_increase",
+            )
+            supplied = [
+                name for name in relative_options
+                if getattr(args, name) is not None
+            ]
+            if supplied:
+                raise ValueError(
+                    "production scene publication accepts absolute evidence only; "
+                    "remove "
+                    + ", ".join("--" + name.replace("_", "-") for name in supplied)
+                )
+    else:
+        if args.diagnostic_scene or any(
+            getattr(args, name) is not None for name in scene_options
+        ):
+            raise ValueError("scene publication options require scene-publish")
+        if (args.tile_plan is None) != (args.tile_id is None):
+            raise ValueError("--tile-plan and --tile-id must be supplied together")
+        if args.tile_plan is not None and args.stage not in {"cloud", "train"}:
+            raise ValueError(
+                "--tile-plan and --tile-id are valid only for cloud and train"
+            )
     if (
         args.prior_position_loss is not None
         and args.stage != "backend-refine-rtk"

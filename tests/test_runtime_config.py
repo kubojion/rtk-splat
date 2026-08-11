@@ -11,6 +11,7 @@ from rtk_splat.adapters.sampling import (
 )
 from rtk_splat.core.runtime_resolution import runtime_resolution_plain
 from rtk_splat.workflows.runtime_config import (
+    resolve_cloud_max_points,
     resolve_depth_max_z,
     resolve_training_controls,
 )
@@ -20,6 +21,7 @@ def _policy_config():
     return NS(
         segment=NS(frame_stride="auto", frame_spacing_m="auto"),
         depth=NS(min_z_m=0.5, max_z_m="auto"),
+        cloud=NS(max_points="auto"),
         train=NS(
             iterations="auto",
             max_gaussians="auto",
@@ -151,6 +153,62 @@ class RuntimeConfigTests(unittest.TestCase):
             records["train_max_gaussians"]["measured_inputs"]["initial_cloud_points"],
             1_000_000,
         )
+
+    def test_tile_training_policy_counts_only_selected_training_frames(self):
+        cfg = _policy_config()
+        segment = NS(manifest={"train": list(range(1000))})
+        with tempfile.TemporaryDirectory() as tmp:
+            cloud = Path(tmp) / "cloud.npz"
+            np.savez(cloud, xyz=np.zeros((10, 3), dtype=np.float32))
+            iterations, _ = resolve_training_controls(
+                cfg,
+                segment,
+                cloud,
+                cuda_total_memory_gib=8.0,
+                training_frame_ids=list(range(800)),
+            )
+        self.assertEqual(iterations, 40000)
+        record = runtime_resolution_plain(cfg)["derivations"]["train_iterations"]
+        self.assertEqual(record["measured_inputs"]["training_pairs"], 800)
+        with self.assertRaisesRegex(ValueError, "unique members"):
+            resolve_training_controls(
+                _policy_config(),
+                segment,
+                cloud,
+                cuda_total_memory_gib=8.0,
+                training_frame_ids=[0, 0],
+            )
+
+    def test_cloud_policy_leaves_growth_headroom_inside_vram_cap(self):
+        cfg = _policy_config()
+
+        chosen = resolve_cloud_max_points(cfg, cuda_total_memory_gib=8.0)
+
+        self.assertEqual(chosen, 866_666)
+        record = runtime_resolution_plain(cfg)["derivations"][
+            "cloud_max_points"
+        ]
+        self.assertEqual(record["source"], "derived")
+        self.assertEqual(
+            record["measured_inputs"]["effective_gaussian_capacity"],
+            2_600_000,
+        )
+        self.assertEqual(
+            record["policy_bounds"]["initial_cloud_growth_factor"], 3.0
+        )
+        self.assertEqual(
+            resolve_cloud_max_points(cfg, cuda_total_memory_gib=8.0), chosen
+        )
+
+    def test_explicit_cloud_limit_is_recorded_without_gpu_policy(self):
+        cfg = NS(cloud=NS(max_points=750_000))
+
+        self.assertEqual(resolve_cloud_max_points(cfg), 750_000)
+        record = runtime_resolution_plain(cfg)["derivations"][
+            "cloud_max_points"
+        ]
+        self.assertEqual(record["source"], "override")
+        self.assertEqual(record["chosen_value"], 750_000)
 
     def test_explicit_training_values_need_no_policy_gpu_or_cloud(self):
         cfg = NS(train=NS(iterations=65000, max_gaussians=2500000))

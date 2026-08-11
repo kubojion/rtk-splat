@@ -1,4 +1,7 @@
-# Calibrated stereo pose sidecar (accepted v1 experiment)
+# Historical calibrated stereo pose sidecar (accepted v1 experiment)
+
+> Archived v1 experiment record. The current implementation is the sealed
+> frontend plus named mapper backend described in `GLOBAL_MAPPER_BACKEND.md`.
 
 This document preserves how the accepted `tile_turn3_stereo_ba` result was
 produced. Its v1 launcher and flat CLI were deliberately retired during the

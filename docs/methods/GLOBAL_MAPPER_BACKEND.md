@@ -5,13 +5,15 @@
 The Phase 3/4 backend interface is implemented and unit-tested. It can consume
 a sealed contract-v2 frontend, solve a keyframe model, register all remaining
 stereo images, run quality gates, and publish a fixed-scale metric pose
-artifact. No fresh real-headland A/B has yet exercised this new interface.
+artifact. The modern all-frame GPU and CPU headland arms exercised this
+interface and registered 2,688/2,688 images. GPU feature extraction took 77 s
+versus 4,053 s for CPU; the GPU Global pose followed by a matched 65k GS run
+reproduced the accepted corrected masked PSNR within 0.115 dB.
 
-The measured Global Mapper result later in this document is a historical golden
-experiment. It established that a reduced Global solve could match the
-incremental reconstruction's GS quality much faster, but it reused the older
-incremental run's feature/match database. It does not prove the speed or quality
-of the new standalone frontend or adaptive keyframes.
+The historical result later in this document first established Global's
+quality/runtime benefit using an older database. The modern all-frame control
+now validates the standalone frontend as well. Reduced adaptive keyframes are
+still an unmeasured hypothesis.
 
 ## Purpose
 
@@ -204,26 +206,28 @@ the historical 581-minute incremental mapper stage because both arms reused
 the same completed frontend evidence. The experiment did not show a quality
 gain and is not evidence for the unrun adaptive-keyframe workflow.
 
-## Planned controlled A/B
+## Remaining controlled A/B
 
-The next experiment must use a newly validated contract-v2 segment and the
-current sealed frontend:
+The all-frame GPU/CPU frontend comparison and GPU 65k GS control are complete.
+The remaining efficiency experiment uses the same validated contract-v2
+segment and sealed evidence:
 
-1. `gpu` versus `cpu_reference` features with every frame retained;
-2. pose-only `all`, `dense`, `balanced`, and `sparse` keyframe arms;
-3. Global primary and incremental fallback/control from verified snapshots;
-4. 100% all-frame stereo registration and no georegistration regression;
-5. pose/rendering proxies to select one candidate; and
-6. GS only for the baseline and selected candidate.
+1. pose-only `dense`, `balanced`, and `sparse` keyframe arms;
+2. Global primary and incremental fallback/control from verified snapshots;
+3. 100% all-frame stereo registration and no georegistration regression;
+4. pose/rendering proxies to select one candidate; and
+5. GS only for the selected candidate, matched to the completed all-frame
+   control.
 
 The acceptance target is a material pose-runtime reduction, no structural or
 georeferencing regression, and no more than 0.2--0.3 dB masked-PSNR loss.
-Those outcomes remain hypotheses until the real A/B completes.
+Those reduced-density outcomes remain hypotheses until the real A/B completes.
 
 ## Scientific scope
 
 Global Mapper is an efficient backend, not the paper contribution by itself.
-The current implementation establishes clean evidence boundaries and a fair
-way to measure mapper/keyframe choices. Covariance-weighted RTK factors inside
-local BA, RTK-anchored submaps, CitrusFarm support, and rendering-quality
-experiments belong to later Phases 5--7 and are not implemented here.
+The implementation establishes clean evidence boundaries and a fair way to
+measure mapper/keyframe choices. CitrusFarm and Rosario source support now
+exist; covariance-weighted RTK factors inside local BA, full-field submaps,
+scene-level seam validation, and production RGB timing refinement remain
+future method work.

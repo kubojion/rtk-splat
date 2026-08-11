@@ -1,0 +1,36 @@
+# Quality pilot: one 110 s / ~103 m interval with two opposing passes and a
+# U-turn. PPK is an explicitly postprocessed method input, never called online.
+profile: quality_v1
+robot: rosario_v2_dual_m2_d435
+
+adapter_options:
+  gnss_source: offline_ppk
+
+paths:
+  workdir: ~/agromap4d_work/rosario_v2_sequence5_ppk_140_250_v1
+  bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15.compressed.bag
+  gnss_bags:
+    - /media/jion_kubo/Buffalo SSD/rosario/sequence5/2023-12-26-15-10-15_ppk_gnss.bag
+
+pose:
+  time_offset_s: 0.0
+
+segment:
+  window_s: [140.0, 250.0]
+  window_epoch_source: first_bag_log
+  frame_spacing_m: auto
+
+frontend:
+  keyframes:
+    preset: all
+
+mapper:
+  name: rosario-seq5-ppk-140-250-global-v1
+  pose_artifact_name: rosario-seq5-ppk-140-250-global-v1
+  alignment_ransac_threshold_m: 0.30
+  max_rtk_median_error_m: 0.20
+  max_rtk_p95_inlier_error_m: 0.40
+
+train:
+  run_name: rosario-seq5-ppk-140-250-gs-v1

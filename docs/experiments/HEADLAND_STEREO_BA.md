@@ -27,3 +27,8 @@ This result measures reconstruction quality, not frozen-map localization.
 The complete provenance, hashes, structural COLMAP statistics, environment, and
 acceptance gates are in
 [golden/headland_stereo_ba.json](golden/headland_stereo_ba.json).
+
+The later contract-v2 all-frame GPU frontend + Global + 65k GS control
+reproduced this reference at 24.3639 dB masked and 25.7326 dB corrected masked
+PSNR (-0.0810/-0.1153 dB). That validates the modern all-frame path; adaptive
+frame-density arms remain pending. See [SEALED_FRONTEND_AB.md](SEALED_FRONTEND_AB.md).
