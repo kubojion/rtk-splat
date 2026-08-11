@@ -23,6 +23,13 @@ frontend:
   name: field1-0703-full77-all-gpu-v1
   keyframes:
     preset: all
+  pairs:
+    # The sealed full recording contains 26 bounded camera-acquisition gaps
+    # between 3.014 and 4.019 s. Across them the measured camera displacement
+    # is only 0.21--0.40 m and the view-direction change is at most 1.69 deg.
+    # Five seconds reconnects those physically admissible chronological
+    # neighbors while the unchanged 1.5 m / 100 deg gates still fail closed.
+    temporal_max_seconds: 5.0
 
 mapper:
   name: field1-0703-full77-global-v1

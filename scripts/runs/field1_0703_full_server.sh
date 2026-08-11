@@ -23,7 +23,7 @@ CONFIG="$REPO/configs/sequences/field1_0703_full_77min.yaml"
 PREFLIGHT_TOOL="$REPO/scripts/tools/server_preflight.py"
 SERVER_ROOT="${RTK_SPLAT_SERVER_ROOT:-/data/jkobo/rtk-splat}"
 SEGMENT_DEFAULT="$SERVER_ROOT/datasets/field1_0703_full77/segment"
-WORKDIR_DEFAULT="$SERVER_ROOT/runs/field1_0703_full77_v1"
+WORKDIR_DEFAULT="$SERVER_ROOT/runs/field1_0703_full77_v2"
 
 SEGMENT="$SEGMENT_DEFAULT"
 WORKDIR="$WORKDIR_DEFAULT"
@@ -367,15 +367,19 @@ if [[ "$ACTION" == status ]]; then status; exit 0; fi
 # Long actions remain foreground jobs. This wrapper only prevents the host from
 # sleeping; callers may safely put the command under nohup if desired.
 if [[ -z "${RTK_SPLAT_INHIBITED:-}" ]] && command -v systemd-inhibit >/dev/null; then
-    export RTK_SPLAT_INHIBITED=1
-    argv=("$ACTION" --segment "$SEGMENT" --workdir "$WORKDIR" \
-        --python "$PY" --colmap "$COLMAP" \
-        --minimum-free-gib "$MINIMUM_FREE_GIB" \
-        --minimum-ram-gib "$MINIMUM_RAM_GIB" \
-        --max-visible-gaussians "$MAXIMUM_VISIBLE_GAUSSIANS")
-    exec systemd-inhibit --what=sleep:idle --mode=block \
-        --why="RTK-Splat full-field production build" \
-        bash "$SCRIPT_PATH" "${argv[@]}"
+    if systemd-inhibit --what=sleep:idle --mode=block \
+        --why="RTK-Splat permission probe" true >/dev/null 2>&1; then
+        export RTK_SPLAT_INHIBITED=1
+        argv=("$ACTION" --segment "$SEGMENT" --workdir "$WORKDIR" \
+            --python "$PY" --colmap "$COLMAP" \
+            --minimum-free-gib "$MINIMUM_FREE_GIB" \
+            --minimum-ram-gib "$MINIMUM_RAM_GIB" \
+            --max-visible-gaussians "$MAXIMUM_VISIBLE_GAUSSIANS")
+        exec systemd-inhibit --what=sleep:idle --mode=block \
+            --why="RTK-Splat full-field production build" \
+            bash "$SCRIPT_PATH" "${argv[@]}"
+    fi
+    echo "WARNING: systemd-inhibit is not permitted; continuing without a sleep lock" >&2
 fi
 
 lock_directory() {

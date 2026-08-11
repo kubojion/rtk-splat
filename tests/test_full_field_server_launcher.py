@@ -5,12 +5,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rtk_splat.workflows.configio import load_config
+
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "scripts/runs/field1_0703_full_server.sh"
 
 
 class FullFieldServerLauncherTests(unittest.TestCase):
+    def test_full_field_pair_policy_bridges_measured_acquisition_gaps(self):
+        config = load_config(
+            REPOSITORY / "configs/sequences/field1_0703_full_77min.yaml"
+        )
+        self.assertEqual(config.frontend.keyframes.preset, "all")
+        self.assertEqual(config.frontend.pairs.temporal_max_seconds, 5.0)
+        self.assertEqual(config.frontend.pairs.temporal_max_distance_m, 1.5)
+        self.assertEqual(config.frontend.pairs.max_view_angle_deg, 100.0)
+
     def test_embedded_python_programs_parse(self):
         lines = SCRIPT.read_text(encoding="utf-8").splitlines()
         programs = []
@@ -122,6 +133,10 @@ class FullFieldServerLauncherTests(unittest.TestCase):
             'SEGMENT_DEFAULT="$SERVER_ROOT/datasets/field1_0703_full77/segment"',
             contents,
         )
+        self.assertIn(
+            'WORKDIR_DEFAULT="$SERVER_ROOT/runs/field1_0703_full77_v2"',
+            contents,
+        )
         self.assertIn("verify_portable_segment", (
             REPOSITORY / "scripts/tools/server_preflight.py"
         ).read_text(encoding="utf-8"))
@@ -153,6 +168,7 @@ class FullFieldServerLauncherTests(unittest.TestCase):
         self.assertIn("PRESERVED: incomplete", contents)
         self.assertIn("SKIP: $tile already has one verified completed attempt", contents)
         self.assertIn("systemd-inhibit", contents)
+        self.assertIn("continuing without a sleep lock", contents)
         self.assertIn("XDG_RUNTIME_DIR", contents)
         self.assertIn('candidate="$(dirname "$WORKDIR")/run_locks"', contents)
         self.assertIn("chmod 700", contents)

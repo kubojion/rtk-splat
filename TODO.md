@@ -52,18 +52,26 @@ item only after its artifact or test result exists.
 - [x] Record the initial server hardware inventory: idle RTX 4090 24 GB,
   driver 580.95.05, 125 GiB reported RAM, 24 CPU threads, and about 17 TiB
   free below `/data`. System `nvcc` and COLMAP are absent, as expected.
-- [ ] Commit and push the current full-field plus environment-bootstrap changes;
-  remote `main` was seven commits behind local `HEAD` before this prompt's
-  edits. Then pull that exact clean commit on the server.
-- [ ] Pull the environment-bootstrap/4090-preflight commit on the server,
-  install the two isolated prefix Conda environments, and pass bootstrap plus
-  full server preflight. Do not modify system CUDA, base Conda, or other users.
-  The first install exposed an upstream wheel-index change; the requirements
-  now pin the official gsplat v1.5.3 release asset by SHA-256. Resume the
-  existing prefix rather than deleting it.
+- [x] Commit and push the full-field/bootstrap snapshot. Remote `main` and the
+  local tree now agree at `465937d` after pinning the official gsplat wheel.
+- [x] Install and verify both isolated server Conda prefixes. Python 3.10.20,
+  PyTorch CUDA 12.1, gsplat CUDA rasterization, RTX 4090, COLMAP 4.1.1 CUDA,
+  editable RTK-Splat checkout, and LPIPS cache all passed on 2026-08-11.
+- [x] Pass the complete server preflight, including the portable segment byte
+  rehash, real COLMAP GPU-SIFT smoke, 120 GiB RAM and 500 GiB storage gates.
+  The first invocation correctly failed closed because it was launched from
+  Conda `base` (Python 3.13.5). The verified Python 3.10 `prepare` retry passed
+  preflight and sealed the v1 run identity before frontend planning. The shared
+  host denies the optional sleep lock; v2 now warns and continues while retaining
+  every real preflight gate.
 - [ ] On the server, solve and seal the complete global pose artifact, then
   generate the final automatic TilePlan.
   The full pose solve, not per-tile GS, is now the main unmeasured scaling risk.
+  The first `prepare` attempt stopped safely in `frontend-build` after 2m37s;
+  all 26 graph cuts were measured camera-acquisition gaps of 3.014--4.019 s
+  with only 0.21--0.40 m displacement and at most 1.69 deg view change. A
+  sequence-scoped 5.0 s bridge retains the unchanged 1.5 m / 100 deg physical
+  gates; validate it under a new immutable server run identity before COLMAP.
 - [ ] Run one complete 2.5-million-Gaussian tile on the RTX 4090 to measure
   wall time, VRAM, RAM, and output size before launching the remaining tiles.
 - [ ] Build and validate the full 77-minute field as independently sealed,

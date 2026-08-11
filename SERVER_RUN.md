@@ -26,6 +26,10 @@ two launchers below are guarded reproductions for this recording and server.
 - [x] The first full-field profile freezes the accepted 65k / 2.5M-Gaussian /
   4M-cloud settings. Higher capacity is a later one-tile A/B, not a silent
   change to the first transfer test.
+- [x] The first server `frontend-build` exposed 26 bounded acquisition gaps of
+  3.014--4.019 s. Measured displacement was only 0.21--0.40 m and view change
+  at most 1.69 deg, so the v2 sequence policy uses a 5.0 s temporal bridge
+  while retaining the accepted 1.5 m distance and 100 deg view gates.
 - [x] The server workflow restarts only an interrupted tile under a new
   immutable attempt name and preserves completed tiles.
 - [x] Run local ingest/depth and publish the portable segment.
@@ -55,7 +59,7 @@ Keep source code, immutable data, and generated work separate:
 /data/jkobo/rtk-splat/code/rtk-splat
 /data/jkobo/rtk-splat/datasets/field1_0703_full77/segment
 /data/jkobo/rtk-splat/envs/{rtk-splat-server,colmap-rtk}
-/data/jkobo/rtk-splat/runs/field1_0703_full77_v1
+/data/jkobo/rtk-splat/runs/field1_0703_full77_v2
 /data/jkobo/rtk-splat/logs
 ```
 
@@ -292,10 +296,15 @@ SIFT extraction, supported RTX 3090/4090 memory, the VGG checksum, at least
 cd /data/jkobo/rtk-splat/code/rtk-splat
 conda activate /data/jkobo/rtk-splat/envs/rtk-splat-server
 export RTK_SPLAT_SERVER_ROOT=/data/jkobo/rtk-splat
+export RTK_SPLAT_PYTHON=/data/jkobo/rtk-splat/envs/rtk-splat-server/bin/python
 export COLMAP_BIN=/data/jkobo/rtk-splat/envs/colmap-rtk/bin/colmap
 
 bash scripts/runs/field1_0703_full_server.sh preflight
 ```
+
+The launcher probes `systemd-inhibit`. Shared hosts that deny the optional
+sleep lock now emit a warning and continue; all hardware, environment, data,
+and scientific gates remain mandatory.
 
 The preferred RAM target is 128 GB until the full Global Mapper is measured.
 The measured 19 TiB data-volume capacity is ample, but capacity is not I/O
