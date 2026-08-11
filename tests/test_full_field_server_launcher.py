@@ -115,7 +115,11 @@ class FullFieldServerLauncherTests(unittest.TestCase):
         contents = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("scripts/tools/server_preflight.py", contents)
         self.assertIn(
-            'SEGMENT_DEFAULT="/data/jkobo/datasets/field1_0703_full77/segment"',
+            'SERVER_ROOT="${RTK_SPLAT_SERVER_ROOT:-/data/jkobo/rtk-splat}"',
+            contents,
+        )
+        self.assertIn(
+            'SEGMENT_DEFAULT="$SERVER_ROOT/datasets/field1_0703_full77/segment"',
             contents,
         )
         self.assertIn("verify_portable_segment", (
@@ -142,6 +146,10 @@ class FullFieldServerLauncherTests(unittest.TestCase):
         self.assertIn('"cuda_feature_extraction_smoke"', (
             REPOSITORY / "scripts/tools/server_preflight.py"
         ).read_text(encoding="utf-8"))
+        preflight = (
+            REPOSITORY / "scripts/tools/server_preflight.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('("RTX 3090", "RTX 4090")', preflight)
         self.assertIn("PRESERVED: incomplete", contents)
         self.assertIn("SKIP: $tile already has one verified completed attempt", contents)
         self.assertIn("systemd-inhibit", contents)

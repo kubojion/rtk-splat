@@ -200,7 +200,7 @@ claim.
 
 ## Full 77-minute field analysis
 
-The recording contains about 4,640 s and 69,088 stereo frames. The executed
+The recording contains about 4,640 s and 69,088 raw stereo frames. The executed
 route contains six long traversals plus substantial entry, exit, pause, and
 headland motion. Roughly one quarter of the duration is outside the six
 straight intervals. Recording-order traversals alternate direction, but
@@ -208,23 +208,21 @@ physical neighbouring rows include both same- and opposite-heading cases;
 therefore neither “six row tiles” nor “no cross-row visibility” is justified
 without the actual reconstructed support graph.
 
-At stride five, the recording would contain roughly 13,800 frame pairs and
-about 12,100 training frames. With the current 1,300-frame presentation budget,
-that implies a lower bound near ten tiles before halo duplication. Metric
-0.10 m sampling may reduce the total substantially, but that must be measured
-after ingest rather than assumed.
+The completed stride-five ingest retained 10,227 frame pairs; the inherited
+7:1 split should yield about 8,949 training views. With the current 1,300-frame
+presentation budget, that implies a lower bound near seven tiles before halo
+duplication and likely roughly 8--12 after visibility context. The sealed plan,
+not this estimate, will be authoritative.
 
-There is currently no complete 77-minute contract-v2 depth segment or global
-pose artifact. The route/GNSS audit can estimate workload, but it cannot
-produce a scientifically final visibility plan. The server workflow must
-ingest once, compute depth once, solve and seal one global pose artifact, and
-then run `tiles-plan` without a forced count. The resulting plan—not waypoint
-names—will determine whether headlands become their own cores or context for
-neighbouring tiles.
+The complete portable contract-v2 depth segment now exists, but no global pose
+artifact does. The server workflow must solve and seal one global pose artifact
+and then run `tiles-plan` without a forced count. The resulting plan—not
+waypoint names—will determine whether headlands become their own cores or
+context for neighbouring tiles.
 
 The successful experiment validates the downstream GS tiling path only. The
 full pose stage is still one global visual solve and has not been exercised at
-roughly 13,800 stereo pairs/27,600 images. That frontend, matcher, and mapper
+10,227 stereo pairs/20,454 images. That frontend, matcher, and mapper
 memory/runtime is now the largest scaling uncertainty. Arbitrary-tile
 production publication is implemented; the remaining prerequisite is to
 create and verify the full pose/TilePlan and tile runs.
@@ -270,12 +268,15 @@ new immutable attempt. Exact within-optimizer resume remains deliberately
 unclaimed because the CUDA/MCMC path is not guaranteed bitwise deterministic
 across process restarts.
 
-The RTX 3090 and 40 TB storage are sufficient for sequential tile training at
-the validated per-tile cap. They do not by themselves prove that the upstream
+The discovered RTX 4090 and 19 TiB data volume are sufficient for sequential
+tile training at the validated per-tile cap. They do not by themselves prove
+that the upstream
 global pose solve or final arbitrary-tile evaluator scales. Reserve 0.5--1 TB
 of fast working storage. The guarded first run defaults to a 120 GiB physical-
 RAM gate (a 128 GB-class host) because a linear extrapolation of the accepted
 Global Mapper memory is already near 91 GiB before OS/database headroom. A
 provisional end-to-end estimate is 2--4 days, not a single overnight: roughly
-10--15 tiles at 1.5--3.5 hours each on the 3090, plus an uncertain 10--30 hours
+8--12 tiles for the measured 10,227-frame segment, using the conservative
+earlier 1.5--3.5-hour 3090 range until the 4090 smoke measures the real cost,
+plus an uncertain 10--30 hours
 for frontend, matching, pose solve, and final publication.

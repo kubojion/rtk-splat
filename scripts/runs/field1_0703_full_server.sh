@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full 77-minute field build on the RTX 3090 server.
+# Full 77-minute field build on a supported 24 GB RTX server.
 #
 # Input is the portable, checksum-sealed derived segment prepared locally. The
 # launcher performs the visual pose solve once, plans an arbitrary number of
@@ -21,8 +21,9 @@ export PYTHONNOUSERSITE=1
 
 CONFIG="$REPO/configs/sequences/field1_0703_full_77min.yaml"
 PREFLIGHT_TOOL="$REPO/scripts/tools/server_preflight.py"
-SEGMENT_DEFAULT="/data/jkobo/datasets/field1_0703_full77/segment"
-WORKDIR_DEFAULT="/data/jkobo/runs/field1_0703_full77_v1"
+SERVER_ROOT="${RTK_SPLAT_SERVER_ROOT:-/data/jkobo/rtk-splat}"
+SEGMENT_DEFAULT="$SERVER_ROOT/datasets/field1_0703_full77/segment"
+WORKDIR_DEFAULT="$SERVER_ROOT/runs/field1_0703_full77_v1"
 
 SEGMENT="$SEGMENT_DEFAULT"
 WORKDIR="$WORKDIR_DEFAULT"
@@ -33,7 +34,7 @@ elif [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
 else
     PY="$(command -v python3 || true)"
 fi
-COLMAP="${COLMAP_BIN:-$HOME/miniconda3/envs/colmap-rtk/bin/colmap}"
+COLMAP="${COLMAP_BIN:-$SERVER_ROOT/envs/colmap-rtk/bin/colmap}"
 MINIMUM_FREE_GIB=500
 MINIMUM_RAM_GIB=120
 MAXIMUM_VISIBLE_GAUSSIANS=12000000
@@ -170,7 +171,7 @@ Full 77-minute field production build (server side only)
   tile training:      65,000 iterations, 2,500,000 Gaussian cap, sequential
   final publication:  absolute whole-scene + seam evaluation; no monolithic reference
 
-Conservative RTX 3090 timing after the segment is on server:
+Conservative 24 GB RTX timing after the segment is on server:
   preflight and full transfer hash          5-20 min
   frontend feature/match graph              2-6 h
   Global Mapper, registration and export    8-24 h (largest uncertainty)

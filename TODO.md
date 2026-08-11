@@ -1,6 +1,6 @@
 # RTK-Splat TODO
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 This is the only active project tracker. Evidence and completed experiment
 details belong in `PROGRESS.md` and `docs/experiments/`, not here. Check an
@@ -43,13 +43,25 @@ item only after its artifact or test result exists.
 - [ ] Add per-frame and temporal-block regression reporting to the production
   scene gate. The accepted two-tile mean improved, but 28/168 held-out frames
   lost more than 0.3 dB raw masked PSNR; five lost more than 1 dB.
-- [ ] Ingest and depth-process the 77-minute bag locally, publish the portable
-  checksum-sealed segment, transfer it to server-local storage, and record the
-  server CPU RAM, storage, CUDA, and COLMAP inventory.
+- [x] Ingest and depth-process the 77-minute bag locally and publish the
+  portable checksum-sealed segment.
+- [ ] Finish copying the portable segment to
+  `/data/jkobo/rtk-splat/datasets/field1_0703_full77/segment`, restore ownership
+  of only the private project subtree to `imoroz`, and pass its terminal hash
+  verification.
+- [x] Record the initial server hardware inventory: idle RTX 4090 24 GB,
+  driver 580.95.05, 125 GiB reported RAM, 24 CPU threads, and about 17 TiB
+  free below `/data`. System `nvcc` and COLMAP are absent, as expected.
+- [ ] Commit and push the current full-field plus environment-bootstrap changes;
+  remote `main` was seven commits behind local `HEAD` before this prompt's
+  edits. Then pull that exact clean commit on the server.
+- [ ] Pull the environment-bootstrap/4090-preflight commit on the server,
+  install the two isolated prefix Conda environments, and pass bootstrap plus
+  full server preflight. Do not modify system CUDA, base Conda, or other users.
 - [ ] On the server, solve and seal the complete global pose artifact, then
   generate the final automatic TilePlan.
   The full pose solve, not per-tile GS, is now the main unmeasured scaling risk.
-- [ ] Run one complete 2.5-million-Gaussian tile on the RTX 3090 to measure
+- [ ] Run one complete 2.5-million-Gaussian tile on the RTX 4090 to measure
   wall time, VRAM, RAM, and output size before launching the remaining tiles.
 - [ ] Build and validate the full 77-minute field as independently sealed,
   georeferenced tiles; publish a scene manifest and optional viewer export.
@@ -127,11 +139,11 @@ item only after its artifact or test result exists.
   `legacy_unassessed`/provisional georeferencing status. The automatic arm
   correctly retained one tile because 1,176 training frames fit the 1,300-frame
   budget.
-- [x] Audited the whole 77-minute source inventory and route. A stride-five
-  build would be about 13,800 pairs/12,100 training frames and therefore at
-  least roughly ten current-capacity tiles before halo duplication. The final
-  automatic topology remains blocked on the full depth segment and global pose,
-  not on waypoint interpretation.
+- [x] Audited the whole source inventory and completed the stride-five ingest:
+  10,227 pairs (about 8,949 eventual training views), implying at least about
+  seven current-capacity tiles and likely roughly 8--12 after halo duplication.
+  The final automatic topology is now blocked on the global pose, not depth or
+  waypoint interpretation.
 - [x] Source validation after TilePlan implementation passed 329 tests plus 35
   subtests on 2026-08-09.
 - [x] Implemented the downstream Option A path: selected/context-cropped tile
@@ -162,6 +174,12 @@ item only after its artifact or test result exists.
 - [x] Passed the finalized 120-second real-bag ingest probe: 316 frames,
   29 min 18 s on USB 2, 453 MB peak RSS, and one explicitly invalid 190 ms
   heading association within the bounded sparse-dropout policy.
+- [x] Completed local full-field ingest/depth/portable publication, made the
+  repository public, and prepared a project-local server bootstrap that
+  supports the discovered RTX 4090 without changing system or shared software.
+- [x] Revalidated the complete source tree after the server adaptation: 364
+  tests plus 35 subtests passed on 2026-08-11; shell syntax and diff checks
+  passed.
 
 ## Update rule
 

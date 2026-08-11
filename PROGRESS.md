@@ -1,6 +1,6 @@
 # RTK-Splat Progress
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 This is the current source of truth for this repository. Superseded plans are
 kept under `docs/archive/`.
@@ -21,9 +21,10 @@ artifact or accepted metric:
 - `63b8a36` documented the final cleanup/runtime ownership; and
 - `abfa4c1` made the active Citrus controls data-derived and auditable.
 
-The current source-tree gate passed **362 tests plus 35 subtests** on
-2026-08-10, including memory-bounded ingest, portable transfer, sealed
-TilePlan, tile execution, production scene publication, server-launcher,
+The current source-tree gate passed **364 tests plus 35 subtests** on
+2026-08-11, including memory-bounded ingest, portable transfer, isolated
+server-environment bootstrap, RTX 4090 preflight support, sealed TilePlan,
+tile execution, production scene publication, server-launcher,
 scientific-control, and source-mutation gates. At the earlier cleanup freeze,
 the historical incremental and
 Global external verifiers passed **38/38** and **42/42** exact checks. After the
@@ -835,12 +836,13 @@ temporal-block checks. Stage-level recovery verifies completed artifacts;
 exact within-optimizer resume remains future work for the multi-day server
 build.
 
-The whole recording audit found about 4,640 s and 69,088 stereo frames. At
-stride five it would contain roughly 13,800 pairs and 12,100 training frames,
-so the current presentation budget implies at least about ten tiles before
-halo duplication. Metric 0.10 m sampling may reduce that count, but the final
-topology cannot be known until the complete depth segment and global pose
-artifact exist. See [TILED_SCENE.md](docs/methods/TILED_SCENE.md).
+The whole recording audit found about 4,640 s and 69,088 raw stereo frames.
+The completed stride-five ingest retained 10,227 pairs; its eventual split is
+expected to yield about 8,949 training frames. The current presentation budget
+therefore implies at least about seven tiles before halo duplication, likely
+roughly 8--12 after visibility context. The final topology cannot be known
+until the global pose artifact exists. See
+[TILED_SCENE.md](docs/methods/TILED_SCENE.md).
 
 ## Full-field deployment preparation
 
@@ -858,7 +860,8 @@ The first guarded laptop/server path is implemented and documented in
   terminally SHA-256-sealed directory with no symlinks, so the raw bag does not
   need to move to the server;
 - the server preflight binds the portable data, clean Git snapshot, exact
-  Python/COLMAP stack, RTX 3090/driver, RAM, storage mount, and LPIPS weights;
+  Python/COLMAP stack, supported 24 GB RTX GPU/driver, RAM, storage mount, and
+  LPIPS weights;
   the first unmeasured full solve defaults to 120 GiB RAM and 500 GiB free
   space; and
 - the full launcher prepares one global pose/automatic TilePlan, selects the
@@ -867,10 +870,29 @@ The first guarded laptop/server path is implemented and documented in
   reference. Completed stages are verified and reused; an interrupted tile is
   preserved and retried under a new immutable attempt name.
 
-No full bag ingest, server pose solve, or server GS has been started. The
-current Buffalo connection is USB 2 at a measured 35.7 MB/s and is expected to
-dominate local ingest until reconnected at USB 3. Exact optimizer-level resume
-is not claimed; the recovery boundary is the completed tile.
+The full local ingest/depth/portable publication has now completed, the
+repository was made public, and the portable segment is being transferred to
+the server. The latest implementation is not yet on remote `main`: on
+2026-08-11 local `HEAD` was `ece3855` (already seven commits ahead before the
+new bootstrap edits) while remote `main` was `8dff161`. No server pose solve or
+server GS has started. Exact optimizer-level resume is not claimed; the
+recovery boundary is the completed tile.
+
+The local artifact has 10,227 frames over 4,621.30 s and 30,687 sealed files
+totalling 31,546,138,468 bytes (29.38 GiB), with no symlinks. USB-2 ingest took
+2 h 03 min, SGBM 44 min 50 s, and materialization 1 min 32 s; every stage
+exited zero without swap. The portable inventory identity is
+`2d10e9f39dee8e89125b4644b269c06d3344611d7b341fb271e45dcea17b843c`.
+
+The server inventory on 2026-08-11 found an idle NVIDIA GeForce RTX 4090 with
+24,564 MiB, driver 580.95.05, 24 available CPU threads, 125 GiB reported RAM,
+and about 17 TiB free on the 19 TiB `/data` volume. System `nvcc` and COLMAP are
+absent. This is expected: the tested PyTorch wheel carries its CUDA 12.1
+runtime and COLMAP 4.1.1 CUDA is installed in a separate project-local Conda
+prefix. A guarded bootstrap now places both environments and their package
+caches under `/data/jkobo/rtk-splat`, leaving base Conda, system CUDA/drivers,
+Docker, and other users unchanged. The server preflight now accepts either a
+24 GB RTX 3090 or 4090 and still performs real gsplat and COLMAP CUDA smokes.
 
 The finalized real-bag ingest probe covered the first 120 s and published 316
 frames over 108.92 s in **29 min 18 s**. It peaked at **452,984 KiB RSS** with
@@ -912,19 +934,21 @@ runtime or final georeferencing.
 
 ## Next full-field preparation
 
-1. Run the memory-bounded local ingest and SGBM stage once, materialize the
-   derived segment without symlinks, and transfer its terminal SHA-256 inventory
-   to server-local storage. The raw 151.9 GB MCAP does not need to move.
-2. Freeze and push one clean tested source snapshot, install the pinned Python
-   and COLMAP environments, and pass the server preflight. The first full solve
-   defaults to a 120 GiB RAM and 500 GiB free-space gate.
+1. Finish transferring the completed portable segment, restore ownership of
+   only `/data/jkobo/rtk-splat` to `imoroz`, and verify its terminal SHA-256
+   inventory. The raw 151.9 GB MCAP does not need to move.
+2. Pull the environment-bootstrap commit into a clean server checkout, install
+   the pinned project-local Python and COLMAP environments, and pass the server
+   preflight. The first full solve defaults to a 120 GiB RAM and 500 GiB free-
+   space gate.
 3. Run and gate the complete global visual pose
    reconstruction, and generate an automatic TilePlan without a forced count.
-   The roughly 27,600-image pose solve is now the main unvalidated bottleneck.
-4. Train one 2.5-million-Gaussian tile on the RTX 3090 as a resource/quality
-   smoke, then launch the remaining roughly 10--15 planned tiles.
+   The exact 20,454-image pose solve is now the main unvalidated bottleneck.
+4. Train one 2.5-million-Gaussian tile on the RTX 4090 as a resource/quality
+   smoke, then launch the remaining roughly 8--12 planned tiles (the planner's
+   sealed output is authoritative).
 
-The RTX 3090 and 40 TB storage are sufficient for the validated sequential
+The RTX 4090 and 19 TiB data volume are sufficient for the validated sequential
 per-tile GS workload. A separate guarded arbitrary-tile server launcher is now
 implemented; the cached two-tile script must still not be repurposed. Recovery
 is exact between sealed stages and tile attempts, but an interrupted optimizer

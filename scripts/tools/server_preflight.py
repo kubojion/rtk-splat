@@ -158,8 +158,12 @@ def _cuda() -> dict[str, object]:
         raise RuntimeError("PyTorch CUDA is unavailable")
     name = torch.cuda.get_device_name(0)
     free, total = torch.cuda.mem_get_info(0)
-    if "3090" not in name or total < 22 * 1024**3:
-        raise RuntimeError(f"expected a 24 GB RTX 3090, got {name} ({_gib(total):.1f} GiB)")
+    supported_markers = ("RTX 3090", "RTX 4090")
+    if not any(marker in name for marker in supported_markers) or total < 22 * 1024**3:
+        raise RuntimeError(
+            "expected a supported 24 GB RTX 3090/4090, got "
+            f"{name} ({_gib(total):.1f} GiB)"
+        )
     if free < 18 * 1024**3:
         raise RuntimeError(f"only {_gib(free):.1f} GiB GPU memory is free")
     driver_lines = subprocess.run(

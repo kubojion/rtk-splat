@@ -29,6 +29,12 @@ of tiles with immutable per-tile retry attempts and production scene
 publication. These remain recording/site launchers; the generic implementation
 lives in the package CLI. See [`SERVER_RUN.md`](../SERVER_RUN.md).
 
+`tools/bootstrap_server_env.sh` creates and verifies the pinned Python/gsplat
+and COLMAP Conda prefixes entirely inside a private `/data/.../rtk-splat`
+project root. It never installs system software or changes base Conda. The
+separate `tools/server_preflight.py` then validates the real GPU/CUDA/COLMAP
+paths and portable segment before a production launcher may write artifacts.
+
 Personal absolute paths, delayed-start wrappers, power/sleep scheduling, and
 one-off experiment names should not ship as the main release workflow. They
 remain in place for now because the current CitrusFarm/Rosario work is

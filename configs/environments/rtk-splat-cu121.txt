@@ -1,0 +1,22 @@
+# Tested RTK-Splat GPU stack for Linux x86_64, CPython 3.10 and a
+# 24 GB NVIDIA RTX 3090 or RTX 4090.  The PyTorch wheel carries its own
+# CUDA 12.1 runtime; a system CUDA toolkit (nvcc) is not required.
+#
+# Install this file inside a fresh Conda environment, then install the
+# repository itself with `python -m pip install -e . --no-deps`.
+--extra-index-url https://download.pytorch.org/whl/cu121
+--find-links https://docs.gsplat.studio/whl/pt24cu121
+
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+gsplat==1.5.3+pt24cu121
+torchmetrics==1.9.0
+numpy==2.2.6
+opencv-python-headless==5.0.0.93
+pymap3d==3.2.0
+PyYAML==6.0.3
+scipy==1.15.3
+matplotlib==3.10.9
+pytest==9.1.1
+# Test-only adapter coverage; pure Python and does not install or require ROS.
+rosbags==0.11.2
