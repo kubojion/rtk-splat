@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -40,6 +41,7 @@ from rtk_splat.frontends.artifact import (
     collect_provenance,
     create_frontend_seal,
     sha256_file,
+    sqlite_logical_record,
 )
 
 
@@ -207,6 +209,10 @@ def _create_database(artifact: Path) -> list[str]:
     ]
     by_name = {name: index + 1 for index, name in enumerate(names)}
     with sqlite3.connect(artifact / "database.db") as connection:
+        journal = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        if str(journal).lower() != "wal":
+            raise RuntimeError("test COLMAP database did not enter WAL mode")
+        connection.execute("PRAGMA user_version=4010100")
         connection.executescript(
             """
             CREATE TABLE cameras(
@@ -256,8 +262,15 @@ def _create_database(artifact: Path) -> list[str]:
               corr_sensor_type INTEGER NOT NULL, position BLOB,
               position_covariance BLOB, gravity BLOB,
               coordinate_system INTEGER NOT NULL);
-            CREATE UNIQUE INDEX pose_priors_sensor_assignment
+            CREATE UNIQUE INDEX frame_sensor_assignment
+              ON frame_data(data_id, sensor_type);
+            CREATE UNIQUE INDEX index_name ON images(name);
+            CREATE UNIQUE INDEX pose_prior_data_assignment
               ON pose_priors(corr_data_id, corr_sensor_id, corr_sensor_type);
+            CREATE UNIQUE INDEX rig_ref_sensor_assignment
+              ON rigs(ref_sensor_id, ref_sensor_type);
+            CREATE UNIQUE INDEX rig_sensor_assignment
+              ON rig_sensors(sensor_id, sensor_type);
             INSERT INTO cameras VALUES(1, 1, 16, 12, X'00', 1);
             INSERT INTO cameras VALUES(2, 1, 16, 12, X'00', 1);
             INSERT INTO rigs VALUES(1, 1, 0);
@@ -360,9 +373,16 @@ def _option(command, name: str) -> str:
 
 
 class _Runner:
-    def __init__(self, names: list[str], *, fail_pose_mapper: bool = False):
+    def __init__(
+        self,
+        names: list[str],
+        *,
+        fail_pose_mapper: bool = False,
+        mutate_pose_mapper_database: bool = False,
+    ):
         self.names = names
         self.fail_pose_mapper = fail_pose_mapper
+        self.mutate_pose_mapper_database = mutate_pose_mapper_database
         self.commands: list[tuple[str, ...]] = []
 
     def __call__(self, command, **_kwargs):
@@ -378,6 +398,21 @@ class _Runner:
         if action == "pose_prior_mapper":
             if self.fail_pose_mapper:
                 raise RuntimeError("injected pose mapper failure")
+            database = Path(_option(command, "--database_path"))
+            with sqlite3.connect(database) as connection:
+                journal = connection.execute(
+                    "PRAGMA journal_mode=WAL"
+                ).fetchone()[0]
+                if str(journal).lower() != "wal":
+                    raise RuntimeError("fake COLMAP database did not enter WAL mode")
+                # Real COLMAP writes its database format marker on open, even
+                # if no semantic table row is changed.
+                connection.execute("PRAGMA user_version=4010100")
+                if self.mutate_pose_mapper_database:
+                    connection.execute(
+                        "UPDATE cameras SET width=width+1 WHERE camera_id=1"
+                    )
+                connection.commit()
             _model(Path(_option(command, "--output_path")) / "0", b"refined")
             return SimpleNamespace(returncode=0)
         if action == "model_converter":
@@ -591,6 +626,28 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
             )
             self.assertEqual(inventory["camera_ids"], [1, 2])
             self.assertEqual(inventory["rig_ids"], [1])
+            geodetic_plan = json.loads(
+                (plan / "geodetic_submap_plan.json").read_text()
+            )
+            self.assertEqual(
+                geodetic_plan["private_database_sqlite_metadata"],
+                {
+                    "application_id": 0,
+                    "journal_mode": "wal",
+                    "user_version": 4_010_100,
+                },
+            )
+            with sqlite3.connect(
+                f"file:{plan / 'database.db'}?mode=ro", uri=True
+            ) as connection:
+                self.assertEqual(
+                    str(connection.execute("PRAGMA journal_mode").fetchone()[0]),
+                    "wal",
+                )
+                self.assertEqual(
+                    int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                    4_010_100,
+                )
             self.assertEqual(len(inventory["database_frame_ids"]), 7)
             self.assertNotIn("left_000005.jpg", {item["name"] for item in inventory["images"]})
             self.assertTrue(inventory["pair_evidence_byte_exact"])
@@ -671,6 +728,52 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
                 run_geodetic_submap_plan(
                     plan, result_path, colmap, runner=_Runner(names)
                 )
+
+    def test_real_colmap_open_preserves_normalized_database_logical_view(self):
+        executable = os.environ.get("RTK_SPLAT_TEST_COLMAP")
+        if not executable:
+            self.skipTest("RTK_SPLAT_TEST_COLMAP is not configured")
+        colmap = Path(executable).resolve()
+        if not colmap.is_file():
+            self.fail(f"RTK_SPLAT_TEST_COLMAP does not exist: {colmap}")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, _, _, plan, _, _ = _fixture(root / "fixture")
+            probe = root / "real-colmap-open.db"
+            shutil.copyfile(plan / "database.db", probe)
+            before = sqlite_logical_record(probe)
+            completed = subprocess.run(
+                [
+                    str(colmap),
+                    "database_creator",
+                    "--database_path",
+                    str(probe),
+                    "--log_target",
+                    "stderr",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            after = sqlite_logical_record(probe)
+            self.assertEqual(after, before)
+            self.assertEqual(after["user_version"], 4_010_100)
+
+    def test_semantic_database_mutation_after_mapper_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, _, _, plan, colmap, names = _fixture(root)
+            result = root / "mutated-result"
+            runner = _Runner(names, mutate_pose_mapper_database=True)
+            with self.assertRaisesRegex(
+                ArtifactError, "changed private database contents"
+            ):
+                run_geodetic_submap_plan(
+                    plan, result, colmap, runner=runner
+                )
+            self.assertFalse(result.exists())
+            self.assertEqual(list(root.glob(".mutated-result.writing-*")), [])
 
     def test_injected_failure_leaves_no_result_or_staging_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

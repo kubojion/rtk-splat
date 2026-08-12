@@ -430,15 +430,139 @@ def _image_metadata(
     return result
 
 
-def _readonly_database(database: Path) -> sqlite3.Connection:
+def _readonly_database(
+    database: Path, *, immutable: bool = False
+) -> sqlite3.Connection:
     try:
+        uri = f"file:{database.resolve()}?mode=ro"
+        if immutable:
+            uri += "&immutable=1"
         connection = sqlite3.connect(
-            f"file:{database.resolve()}?mode=ro", uri=True
+            uri, uri=True
         )
         connection.execute("PRAGMA query_only=ON")
         return connection
     except sqlite3.Error as exc:
         raise ArtifactError(f"cannot open immutable COLMAP database: {exc}") from exc
+
+
+def _sqlite_metadata(
+    connection: sqlite3.Connection, schema: str = "main"
+) -> dict[str, Any]:
+    if schema not in {"main", "source_db"}:
+        raise ValueError("unsupported SQLite schema name")
+    try:
+        user_version = int(
+            connection.execute(f"PRAGMA {schema}.user_version").fetchone()[0]
+        )
+        application_id = int(
+            connection.execute(f"PRAGMA {schema}.application_id").fetchone()[0]
+        )
+        journal_mode = str(
+            connection.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]
+        ).lower()
+    except (sqlite3.Error, TypeError, ValueError, IndexError) as exc:
+        raise ArtifactError("cannot read COLMAP SQLite metadata") from exc
+    return {
+        "user_version": user_version,
+        "application_id": application_id,
+        "journal_mode": journal_mode,
+    }
+
+
+def _database_sqlite_metadata(database: Path) -> dict[str, Any]:
+    """Read stable SQLite header metadata without opening the sealed database."""
+    try:
+        with database.open("rb") as stream:
+            header = stream.read(100)
+    except OSError as exc:
+        raise ArtifactError("cannot read COLMAP SQLite metadata") from exc
+    if len(header) != 100 or header[:16] != b"SQLite format 3\x00":
+        raise ArtifactError("private COLMAP database has an invalid SQLite header")
+    write_version, read_version = header[18], header[19]
+    if (write_version, read_version) == (1, 1):
+        journal_mode = "delete"
+    elif (write_version, read_version) == (2, 2):
+        journal_mode = "wal"
+    else:
+        raise ArtifactError("private COLMAP database has mixed journal metadata")
+    return {
+        "user_version": int.from_bytes(header[60:64], "big"),
+        "application_id": int.from_bytes(header[68:72], "big"),
+        "journal_mode": journal_mode,
+    }
+
+
+def _normalize_private_database_metadata(
+    database: Path, source_metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Make the private copy metadata-stable before the pinned COLMAP opens it."""
+    try:
+        user_version = int(source_metadata["user_version"])
+        application_id = int(source_metadata["application_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactError("source COLMAP SQLite metadata is invalid") from exc
+    if user_version <= 0:
+        raise ArtifactError(
+            "source COLMAP database has no positive format version marker"
+        )
+    try:
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
+            if journal_mode != "wal":
+                raise ArtifactError("private COLMAP database did not enter WAL mode")
+            connection.execute(f"PRAGMA user_version={user_version}")
+            connection.execute(f"PRAGMA application_id={application_id}")
+            connection.commit()
+            checkpoint = tuple(
+                int(value)
+                for value in connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+            )
+            if len(checkpoint) != 3 or checkpoint[0] != 0:
+                raise ArtifactError(
+                    "private COLMAP database WAL checkpoint did not complete"
+                )
+            integrity = [
+                str(row[0])
+                for row in connection.execute("PRAGMA integrity_check")
+            ]
+            if integrity != ["ok"]:
+                raise ArtifactError(
+                    "private COLMAP database integrity failed after metadata "
+                    "normalization"
+                )
+            metadata = _sqlite_metadata(connection)
+    except (sqlite3.Error, OSError) as exc:
+        raise ArtifactError(
+            f"cannot normalize private COLMAP database metadata: {exc}"
+        ) from exc
+    expected = {
+        "user_version": user_version,
+        "application_id": application_id,
+        "journal_mode": "wal",
+    }
+    if metadata != expected:
+        raise ArtifactError("private COLMAP SQLite metadata normalization failed")
+    # A successful TRUNCATE checkpoint makes empty sidecars disposable. Keeping
+    # them out of the sealed plan also makes copy and inventory semantics exact.
+    _remove_checkpointed_database_sidecars(database)
+    return metadata
+
+
+def _remove_checkpointed_database_sidecars(database: Path) -> None:
+    wal = database.with_name(database.name + "-wal")
+    shm = database.with_name(database.name + "-shm")
+    if wal.exists() and wal.stat().st_size:
+        raise ArtifactError(
+            "private COLMAP database has an uncheckpointed WAL before sealing"
+        )
+    wal.unlink(missing_ok=True)
+    shm.unlink(missing_ok=True)
 
 
 def _pair_candidates(
@@ -741,12 +865,18 @@ def _copy_subset_database(
     source_raw_before = sha256_file(source)
     source_uri = f"{source.resolve().as_uri()}?mode=ro"
     connection: sqlite3.Connection | None = None
+    source_sqlite_metadata: dict[str, Any] | None = None
     succeeded = False
     try:
         connection = sqlite3.connect(destination, uri=True)
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("ATTACH DATABASE ? AS source_db", (source_uri,))
+        source_sqlite_metadata = _sqlite_metadata(connection, "source_db")
+        if source_sqlite_metadata["user_version"] <= 0:
+            raise ArtifactError(
+                "source COLMAP database has no positive format version marker"
+            )
         tables, table_sql, auxiliary_sql = _schema_rows(connection)
         connection.execute("BEGIN")
         for name in _DATABASE_TABLES:
@@ -841,6 +971,8 @@ def _copy_subset_database(
     if source_raw_before != source_raw_after:
         destination.unlink(missing_ok=True)
         raise ArtifactError("source SQLite bytes changed during submap copy")
+    if source_sqlite_metadata is None:
+        raise ArtifactError("source COLMAP SQLite metadata was not captured")
     return {
         "schema_version": 1,
         "method": "read_only_attached_selective_copy_v1",
@@ -848,6 +980,7 @@ def _copy_subset_database(
         "source_raw_sha256_before": source_raw_before,
         "source_raw_sha256_after": source_raw_after,
         "source_bytes_unchanged": True,
+        "source_sqlite_metadata": source_sqlite_metadata,
         "selected_tables": sorted(tables),
     }
 
@@ -1090,7 +1223,12 @@ def _digest_sql_value(digest: Any, value: Any) -> None:
 
 
 def _table_rows_digest(
-    database: Path, table: str, where: str = "", parameters: Sequence[Any] = ()
+    database: Path,
+    table: str,
+    where: str = "",
+    parameters: Sequence[Any] = (),
+    *,
+    immutable: bool = False,
 ) -> dict[str, Any]:
     if table not in set(_DATABASE_TABLES):
         raise ValueError("unsupported COLMAP table digest")
@@ -1101,7 +1239,7 @@ def _table_rows_digest(
     digest = hashlib.sha256()
     count = 0
     try:
-        with _readonly_database(database) as connection:
+        with _readonly_database(database, immutable=immutable) as connection:
             for row in connection.execute(query, tuple(parameters)):
                 count += 1
                 digest.update(b"R\0")
@@ -1298,7 +1436,7 @@ def _database_inventory(
         "retained_pair_evidence": private_pair_digests,
         "source_retained_pair_evidence": source_pair_digests,
         "pair_evidence_byte_exact": True,
-        "committed_view": sqlite_logical_record(database),
+        "committed_view": sqlite_logical_record(database, immutable=True),
     }
 
 
@@ -1507,6 +1645,13 @@ def prepare_geodetic_submap_plan(
             config,
             mapper_config.alignment_temporal_blocks,
         )
+        private_sqlite_metadata = _normalize_private_database_metadata(
+            staging / "database.db",
+            source_database_evidence["source_sqlite_metadata"],
+        )
+        source_database_evidence["private_sqlite_metadata"] = (
+            private_sqlite_metadata
+        )
         inventory = _database_inventory(
             staging / "database.db",
             source_database,
@@ -1524,6 +1669,7 @@ def prepare_geodetic_submap_plan(
             assignments,
             config,
         )
+        _remove_checkpointed_database_sidecars(staging / "database.db")
         _write_lines(staging / "all_images.txt", selected_names)
         _write_lines(
             staging / "constant_cameras.txt", assignments["camera_ids"]
@@ -1565,6 +1711,7 @@ def prepare_geodetic_submap_plan(
             "source_quality_passed": bool(source_quality["passed"]),
             "source_evidence": source_evidence,
             "private_database_committed_view": inventory["committed_view"],
+            "private_database_sqlite_metadata": private_sqlite_metadata,
             "pair_audit_sha256": sha256_file(staging / "pair_audit.json"),
             "prior_split_sha256": sha256_file(staging / "prior_split.json"),
             "database_inventory_sha256": sha256_file(
@@ -1674,11 +1821,19 @@ def _plan_context(
     ):
         if sha256_file(root / filename) != expected:
             raise ArtifactError(f"geodetic plan hash binding changed: {filename}")
-    committed = sqlite_logical_record(root / "database.db")
+    committed = sqlite_logical_record(root / "database.db", immutable=True)
     inventory = _json(root / "database_inventory.json")
+    source_database_evidence = _json(
+        root / "source_database_evidence.json"
+    )
+    sqlite_metadata = _database_sqlite_metadata(root / "database.db")
     if (
         committed != plan.get("private_database_committed_view")
         or committed != inventory.get("committed_view")
+        or sqlite_metadata
+        != plan.get("private_database_sqlite_metadata")
+        or sqlite_metadata
+        != source_database_evidence.get("private_sqlite_metadata")
         or not inventory.get("pair_evidence_byte_exact")
         or not inventory.get("heldout_priors_physically_absent")
         or inventory.get("gravity_or_imu_prior_rows") != 0
@@ -1704,7 +1859,9 @@ def _plan_context(
     for table, expected in calibration.get(
         "database_calibration_rows", {}
     ).items():
-        if _table_rows_digest(root / "database.db", str(table)) != expected:
+        if _table_rows_digest(
+            root / "database.db", str(table), immutable=True
+        ) != expected:
             raise ArtifactError("private calibration rows changed")
     contract = calibration.get("mapper_contract")
     if contract != {
@@ -2104,7 +2261,9 @@ def run_geodetic_submap_plan(
             "database_inventory.json",
         ):
             _copy_execution_input(plan_root / name, staging / name)
-        if sqlite_logical_record(staging / "database.db") != plan[
+        if sqlite_logical_record(
+            staging / "database.db", immutable=True
+        ) != plan[
             "private_database_committed_view"
         ]:
             raise ArtifactError("execution database copy differs from the plan")
@@ -2168,10 +2327,22 @@ def run_geodetic_submap_plan(
             _tree_manifest(staging / "refined_text"),
         )
         # The existing mapper path is required to leave its private DB intact.
+        if _database_sqlite_metadata(staging / "database.db") != plan[
+            "private_database_sqlite_metadata"
+        ]:
+            raise ArtifactError(
+                "pose-prior mapper changed private database metadata"
+            )
         if sqlite_logical_record(staging / "database.db") != plan[
             "private_database_committed_view"
         ]:
-            raise ArtifactError("pose-prior mapper changed the private database")
+            raise ArtifactError(
+                "pose-prior mapper changed private database contents"
+            )
+        _normalize_private_database_metadata(
+            staging / "database.db",
+            plan["private_database_sqlite_metadata"],
+        )
         _plan_context(plan_root)
         quality = _quality_report(
             staging,

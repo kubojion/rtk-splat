@@ -93,14 +93,17 @@ def _sqlite_schema_record(connection: sqlite3.Connection) -> dict[str, Any]:
         raise ArtifactError(f"invalid SQLite database: {exc}") from exc
 
 
-def _sqlite_online_backup(source: Path, destination: Path) -> dict[str, Any]:
+def _sqlite_online_backup(
+    source: Path, destination: Path, *, immutable: bool = False
+) -> dict[str, Any]:
     """Copy one committed SQLite view, including rows present only in WAL."""
     if destination.exists():
         raise FileExistsError(f"refusing to overwrite SQLite snapshot: {destination}")
     try:
-        with sqlite3.connect(
-            f"{source.as_uri()}?mode=ro", uri=True
-        ) as source_connection:
+        source_uri = f"{source.as_uri()}?mode=ro"
+        if immutable:
+            source_uri += "&immutable=1"
+        with sqlite3.connect(source_uri, uri=True) as source_connection:
             source_connection.execute("PRAGMA query_only=ON")
             with sqlite3.connect(destination) as destination_connection:
                 source_connection.backup(destination_connection)
@@ -120,14 +123,20 @@ def _sqlite_online_backup(source: Path, destination: Path) -> dict[str, Any]:
     }
 
 
-def sqlite_logical_record(database: str | Path) -> dict[str, Any]:
-    """Hash a transaction-consistent committed view without altering the source."""
+def sqlite_logical_record(
+    database: str | Path, *, immutable: bool = False
+) -> dict[str, Any]:
+    """Hash a transaction-consistent committed view without altering the source.
+
+    ``immutable`` is reserved for checkpointed private snapshots. It prevents
+    SQLite from creating WAL sidecars while verifying an already sealed file.
+    """
     source = Path(database).expanduser().resolve()
     if not source.is_file():
         raise ArtifactError(f"SQLite database does not exist: {source}")
     with tempfile.TemporaryDirectory(prefix="rtk-splat-sqlite-seal-") as temporary:
         snapshot = Path(temporary) / "database.db"
-        return _sqlite_online_backup(source, snapshot)
+        return _sqlite_online_backup(source, snapshot, immutable=immutable)
 
 
 def _normal(value: Any) -> Any:
