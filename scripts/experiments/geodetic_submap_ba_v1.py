@@ -16,7 +16,9 @@ from typing import Sequence
 
 from rtk_splat.backends.geodetic_pairs import GeodeticPairPolicy
 from rtk_splat.backends.geodetic_submap import (
+    GeodeticInitialPairPolicy,
     GeodeticSubmapConfig,
+    GeodeticTrajectoryPolicy,
     audited_geodetic_submap_result,
     create_geodetic_frame_selection,
     prepare_geodetic_submap_plan,
@@ -55,6 +57,27 @@ def _config(args: argparse.Namespace) -> GeodeticSubmapConfig:
         strong_verified_matches=args.strong_verified_matches,
     )
     base = GeodeticSubmapConfig()
+    initial_pair = GeodeticInitialPairPolicy(
+        boundary_fraction=args.initial_pair_boundary_fraction,
+        minimum_boundary_frames=args.initial_pair_min_boundary_frames,
+        minimum_verified_matches=args.initial_pair_min_verified_matches,
+        minimum_raw_gnss_displacement_m=(
+            args.initial_pair_min_displacement_m
+        ),
+    )
+    trajectory = GeodeticTrajectoryPolicy(
+        max_consecutive_calibration_outliers=(
+            args.max_consecutive_calibration_outliers
+        ),
+        max_adjacent_displacement_error_m=(
+            args.max_adjacent_displacement_error_m
+        ),
+        local_window_frames=args.local_window_frames,
+        max_local_window_path_error_m=args.max_local_window_path_error_m,
+        max_local_window_path_relative_error=(
+            args.max_local_window_path_relative_error
+        ),
+    )
     refinement = replace(
         base.refinement,
         num_threads=args.num_threads,
@@ -64,6 +87,8 @@ def _config(args: argparse.Namespace) -> GeodeticSubmapConfig:
     )
     return GeodeticSubmapConfig(
         pair_policy=pair,
+        initial_pair_policy=initial_pair,
+        trajectory_policy=trajectory,
         refinement=refinement,
         position_quality_weights=base.position_quality_weights,
     )
@@ -96,6 +121,31 @@ def _add_plan_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--covariance-sigma-multiplier", type=float, default=3.0)
     parser.add_argument("--max-endpoint-position-std-m", type=float, default=0.5)
     parser.add_argument("--strong-verified-matches", type=int, default=30)
+    parser.add_argument(
+        "--initial-pair-boundary-fraction", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--initial-pair-min-boundary-frames", type=int, default=1
+    )
+    parser.add_argument(
+        "--initial-pair-min-verified-matches", type=int, default=30
+    )
+    parser.add_argument(
+        "--initial-pair-min-displacement-m", type=float, default=0.15
+    )
+    parser.add_argument(
+        "--max-consecutive-calibration-outliers", type=int, default=5
+    )
+    parser.add_argument(
+        "--max-adjacent-displacement-error-m", type=float, default=0.25
+    )
+    parser.add_argument("--local-window-frames", type=int, default=31)
+    parser.add_argument(
+        "--max-local-window-path-error-m", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--max-local-window-path-relative-error", type=float, default=0.15
+    )
     parser.add_argument("--num-threads", type=int, default=8)
     parser.add_argument("--random-seed", type=int, default=7)
     parser.add_argument("--minimum-free-space-gb", type=float, default=10.0)

@@ -21,6 +21,10 @@ from rtk_splat.backends.geodetic_pairs import (
 )
 from rtk_splat.backends.geodetic_submap import (
     GeodeticSubmapConfig,
+    GeodeticTrajectoryPolicy,
+    _authoritative_checks_pass,
+    _full_trajectory_quality,
+    _similarity_scale,
     build_geodetic_submap_command,
     create_geodetic_frame_selection,
     geodetic_submap_export_context,
@@ -38,6 +42,7 @@ from rtk_splat.core.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
 from rtk_splat.frontends.artifact import (
     ArtifactError,
     FrontendArtifactBuilder,
+    canonical_hash,
     collect_provenance,
     create_frontend_seal,
     sha256_file,
@@ -603,6 +608,93 @@ class GeodeticPairPolicyTests(unittest.TestCase):
             self.assertTrue(decision.retained)
 
 
+class GeodeticTrajectoryGateTests(unittest.TestCase):
+    def _inputs(self, count: int = 40):
+        index = np.arange(count, dtype=np.float64)
+        prior = np.column_stack(
+            (0.10 * index, 0.02 * np.sin(index / 3.0), 0.001 * index)
+        )
+        names = [f"image_{value:06d}.jpg" for value in range(count)]
+        frame_ids = list(range(count))
+        roles = ["calibration"] * count
+        inliers = np.ones(count, dtype=bool)
+        policy = GeodeticTrajectoryPolicy(local_window_frames=31)
+        return prior, names, frame_ids, roles, inliers, policy
+
+    def test_tail_jump_and_long_calibration_outlier_run_are_rejected(self):
+        prior, names, frame_ids, roles, inliers, policy = self._inputs()
+        refined = prior.copy()
+        refined[-6:] += np.array([1.5, 0.0, 0.0])
+        inliers[-6:] = False
+        report = _full_trajectory_quality(
+            refined,
+            prior,
+            prior,
+            roles,
+            inliers,
+            names,
+            frame_ids,
+            policy,
+        )
+        checks = report["checks"]
+        self.assertFalse(
+            checks["consecutive_calibration_prior_outliers"]["passed"]
+        )
+        self.assertFalse(
+            checks["adjacent_camera_prior_displacement_error_m"]["passed"]
+        )
+        self.assertFalse(checks["adjacent_raw_gnss_step_error_m"]["passed"])
+        self.assertFalse(
+            checks["sliding_local_window_path_consistency"]["passed"]
+        )
+
+    def test_sliding_window_rejects_accumulated_local_scale_distortion(self):
+        prior, names, frame_ids, roles, inliers, policy = self._inputs()
+        refined = prior * 1.20
+        report = _full_trajectory_quality(
+            refined,
+            prior,
+            prior,
+            roles,
+            inliers,
+            names,
+            frame_ids,
+            policy,
+        )
+        checks = report["checks"]
+        self.assertTrue(
+            checks["adjacent_camera_prior_displacement_error_m"]["passed"]
+        )
+        self.assertFalse(
+            checks["sliding_local_window_path_consistency"]["passed"]
+        )
+
+    def test_gnss_correct_repair_passes_despite_broken_source_scale(self):
+        prior, names, frame_ids, roles, inliers, policy = self._inputs()
+        report = _full_trajectory_quality(
+            prior,
+            prior,
+            prior,
+            roles,
+            inliers,
+            names,
+            frame_ids,
+            policy,
+        )
+        source = prior * 1.50
+        source_to_repair_scale = _similarity_scale(source, prior)
+        self.assertAlmostEqual(source_to_repair_scale, 2.0 / 3.0)
+        self.assertGreater(abs(source_to_repair_scale - 1.0), 0.005)
+        checks = {
+            "trajectory_similarity_scale": {
+                "authoritative": False,
+                "passed": False,
+            },
+            **report["checks"],
+        }
+        self.assertTrue(_authoritative_checks_pass(checks))
+
+
 class GeodeticSubmapArtifactTests(unittest.TestCase):
     def test_private_inventory_pair_audit_holdout_and_source_immutability(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -712,6 +804,82 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ArtifactError, "sealed artifact file"):
                 build_geodetic_submap_command(plan, execution, colmap)
 
+    def test_initial_pair_is_deterministic_sealed_and_bound_to_mapper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment, frontend, backend, selection, plan, colmap, _ = _fixture(
+                root
+            )
+            first = json.loads(
+                (plan / "geodetic_submap_plan.json").read_text()
+            )["initial_pair"]
+            second_plan = prepare_geodetic_submap_plan(
+                frontend,
+                backend,
+                segment,
+                selection,
+                root / "second-plan",
+                config=GeodeticSubmapConfig(
+                    refinement=replace(
+                        GeodeticSubmapConfig().refinement,
+                        minimum_free_space_gb=0.01,
+                        minimum_runtime_free_space_gb=0.005,
+                        fresh_min_mean_observations_per_image=60.0,
+                    )
+                ),
+            )
+            second = json.loads(
+                (second_plan / "geodetic_submap_plan.json").read_text()
+            )["initial_pair"]
+            self.assertEqual(first, second)
+            self.assertGreaterEqual(
+                first["actual_boundary_margin_frames"],
+                first["required_boundary_margin_frames"],
+            )
+            self.assertGreaterEqual(first["verified_matches"], 30)
+            self.assertGreaterEqual(
+                first["raw_gnss_evidence"]["raw_gnss_displacement_m"],
+                first["raw_gnss_evidence"][
+                    "minimum_raw_gnss_displacement_m"
+                ],
+            )
+            command = build_geodetic_submap_command(
+                plan, root / "execution", colmap
+            )
+            self.assertEqual(
+                _option(command, "--Mapper.init_image_id1"),
+                str(first["image_ids"][0]),
+            )
+            self.assertEqual(
+                _option(command, "--Mapper.init_image_id2"),
+                str(first["image_ids"][1]),
+            )
+
+    def test_resealed_initial_pair_tamper_is_recomputed_and_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, _, _, plan, colmap, _ = _fixture(root)
+            plan_path = plan / "geodetic_submap_plan.json"
+            value = json.loads(plan_path.read_text())
+            value["initial_pair"]["image_ids"][0] += 1
+            _write_json(plan_path, value)
+            seal_path = plan / "plan_seal.json"
+            seal = json.loads(seal_path.read_text())
+            seal["files"][plan_path.name] = {
+                "sha256": sha256_file(plan_path),
+                "size_bytes": plan_path.stat().st_size,
+            }
+            body = {
+                "schema_version": seal["schema_version"],
+                "files": seal["files"],
+            }
+            seal["seal_sha256"] = canonical_hash(body)
+            _write_json(seal_path, seal)
+            with self.assertRaisesRegex(ArtifactError, "initial-pair contract"):
+                build_geodetic_submap_command(
+                    plan, root / "execution", colmap
+                )
+
     def test_atomic_result_success_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -722,6 +890,25 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
             )
             self.assertTrue(result["passed"])
             self.assertTrue(result["publication_eligible"])
+            self.assertFalse(
+                result["quality"]["checks"]["trajectory_similarity_scale"][
+                    "authoritative"
+                ]
+            )
+            for name in (
+                "full_trajectory_raw_gnss_coverage",
+                "consecutive_calibration_prior_outliers",
+                "adjacent_camera_prior_displacement_error_m",
+                "adjacent_raw_gnss_step_error_m",
+                "sliding_local_window_path_consistency",
+            ):
+                self.assertTrue(result["quality"]["checks"][name]["passed"])
+            self.assertEqual(
+                result["solve"]["sealed_initial_pair"]["image_ids"],
+                json.loads(
+                    (plan / "geodetic_submap_plan.json").read_text()
+                )["initial_pair"]["image_ids"],
+            )
             export = geodetic_submap_export_context(result_path)
             self.assertEqual(export["text_model"], result_path / "refined_text")
             with self.assertRaises(FileExistsError):

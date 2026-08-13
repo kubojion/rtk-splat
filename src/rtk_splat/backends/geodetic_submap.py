@@ -80,6 +80,7 @@ _PAIR_ID_BASE = 2_147_483_647
 _SELECTION_KIND = "rtk_splat_geodetic_submap_frame_selection"
 _PLAN_KIND = "rtk_splat_geodetic_submap_plan"
 _RESULT_KIND = "rtk_splat_geodetic_submap_result"
+_HARDENED_PLAN_SCHEMA_VERSION = 2
 _PLAN_FILES = (
     "all_images.txt",
     "calibration_prior_names.txt",
@@ -121,10 +122,89 @@ def _fresh_refinement_config() -> RtkRefinementConfig:
 
 
 @dataclass(frozen=True)
+class GeodeticInitialPairPolicy:
+    """Model-independent controls for a deterministic mapper seed pair."""
+
+    boundary_fraction: float = 0.10
+    minimum_boundary_frames: int = 1
+    minimum_verified_matches: int = 30
+    minimum_raw_gnss_displacement_m: float = 0.15
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.minimum_boundary_frames, bool)
+            or not isinstance(self.minimum_boundary_frames, int)
+            or self.minimum_boundary_frames < 1
+        ):
+            raise ValueError(
+                "minimum_boundary_frames must be a positive integer"
+            )
+        if (
+            isinstance(self.minimum_verified_matches, bool)
+            or not isinstance(self.minimum_verified_matches, int)
+            or self.minimum_verified_matches < 1
+        ):
+            raise ValueError(
+                "minimum_verified_matches must be a positive integer"
+            )
+        if (
+            not math.isfinite(float(self.boundary_fraction))
+            or not 0.0 < float(self.boundary_fraction) < 0.5
+        ):
+            raise ValueError("boundary_fraction must be in (0, 0.5)")
+        if (
+            not math.isfinite(float(self.minimum_raw_gnss_displacement_m))
+            or self.minimum_raw_gnss_displacement_m <= 0.0
+        ):
+            raise ValueError(
+                "minimum_raw_gnss_displacement_m must be finite and positive"
+            )
+
+
+@dataclass(frozen=True)
+class GeodeticTrajectoryPolicy:
+    """Absolute physical acceptance gates for the complete selected path."""
+
+    max_consecutive_calibration_outliers: int = 5
+    max_adjacent_displacement_error_m: float = 0.25
+    local_window_frames: int = 31
+    max_local_window_path_error_m: float = 0.25
+    max_local_window_path_relative_error: float = 0.15
+
+    def __post_init__(self) -> None:
+        for name, minimum in (
+            ("max_consecutive_calibration_outliers", 0),
+            ("local_window_frames", 3),
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum
+            ):
+                relation = "non-negative" if minimum == 0 else "at least 3"
+                raise ValueError(f"{name} must be an integer {relation}")
+        for name in (
+            "max_adjacent_displacement_error_m",
+            "max_local_window_path_error_m",
+            "max_local_window_path_relative_error",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+
+
+@dataclass(frozen=True)
 class GeodeticSubmapConfig:
     """All generic planning and existing mapper controls for one sidecar."""
 
     pair_policy: GeodeticPairPolicy = field(default_factory=GeodeticPairPolicy)
+    initial_pair_policy: GeodeticInitialPairPolicy = field(
+        default_factory=GeodeticInitialPairPolicy
+    )
+    trajectory_policy: GeodeticTrajectoryPolicy = field(
+        default_factory=GeodeticTrajectoryPolicy
+    )
     refinement: RtkRefinementConfig = field(
         default_factory=_fresh_refinement_config
     )
@@ -134,6 +214,14 @@ class GeodeticSubmapConfig:
         if self.refinement.initialization_mode != "fresh":
             raise ValueError(
                 "geodetic submap BA requires fresh pose-prior mapping"
+            )
+        if (
+            self.initial_pair_policy.minimum_raw_gnss_displacement_m
+            > self.pair_policy.revisit_physical_cap_m
+        ):
+            raise ValueError(
+                "initial-pair minimum displacement cannot exceed the pair "
+                "policy physical cap"
             )
         pairs = tuple(self.position_quality_weights)
         names = [name for name, _ in pairs]
@@ -156,11 +244,25 @@ def _config_record(config: GeodeticSubmapConfig) -> dict[str, Any]:
     return asdict(config)
 
 
-def _config_from_record(value: Any) -> GeodeticSubmapConfig:
+def _config_from_record(
+    value: Any, *, legacy_schema: bool = False
+) -> GeodeticSubmapConfig:
     if not isinstance(value, Mapping):
         raise ArtifactError("geodetic submap config must be an object")
     try:
         pair = GeodeticPairPolicy(**dict(value["pair_policy"]))
+        initial_pair = (
+            GeodeticInitialPairPolicy()
+            if legacy_schema
+            else GeodeticInitialPairPolicy(
+                **dict(value["initial_pair_policy"])
+            )
+        )
+        trajectory = (
+            GeodeticTrajectoryPolicy()
+            if legacy_schema
+            else GeodeticTrajectoryPolicy(**dict(value["trajectory_policy"]))
+        )
         refinement = RtkRefinementConfig(**dict(value["refinement"]))
         raw_weights = value["position_quality_weights"]
         if not isinstance(raw_weights, (list, tuple)):
@@ -168,6 +270,8 @@ def _config_from_record(value: Any) -> GeodeticSubmapConfig:
         weights = tuple((str(item[0]), float(item[1])) for item in raw_weights)
         config = GeodeticSubmapConfig(
             pair_policy=pair,
+            initial_pair_policy=initial_pair,
+            trajectory_policy=trajectory,
             refinement=refinement,
             position_quality_weights=weights,
         )
@@ -175,6 +279,9 @@ def _config_from_record(value: Any) -> GeodeticSubmapConfig:
         raise ArtifactError("invalid geodetic submap config") from exc
     # ``asdict`` retains tuples in memory while JSON loads them as lists.
     normalized = _config_record(config)
+    if legacy_schema:
+        normalized.pop("initial_pair_policy")
+        normalized.pop("trajectory_policy")
     normalized["position_quality_weights"] = [
         list(item) for item in config.position_quality_weights
     ]
@@ -671,6 +778,187 @@ def _pair_audit(
         },
         retained,
     )
+
+
+def _initial_pair_gnss_evidence(
+    candidate: PairCandidate,
+    config: GeodeticSubmapConfig,
+) -> dict[str, Any] | None:
+    first_std = candidate.first_gnss.trusted_std_m()
+    second_std = candidate.second_gnss.trusted_std_m()
+    if first_std is None or second_std is None:
+        return None
+    if max(first_std, second_std) > config.pair_policy.max_endpoint_position_std_m:
+        return None
+    first_position = np.asarray(
+        candidate.first_gnss.position_m, dtype=np.float64
+    )
+    second_position = np.asarray(
+        candidate.second_gnss.position_m, dtype=np.float64
+    )
+    first_covariance = np.asarray(
+        candidate.first_gnss.covariance_m2, dtype=np.float64
+    )
+    second_covariance = np.asarray(
+        candidate.second_gnss.covariance_m2, dtype=np.float64
+    )
+    displacement = float(np.linalg.norm(second_position - first_position))
+    combined = 0.5 * (
+        first_covariance
+        + second_covariance
+        + (first_covariance + second_covariance).T
+    )
+    combined_sigma = float(
+        math.sqrt(max(float(np.linalg.eigvalsh(combined)[-1]), 0.0))
+    )
+    covariance_allowance = (
+        config.pair_policy.covariance_sigma_multiplier * combined_sigma
+    )
+    allowed = min(
+        config.pair_policy.revisit_physical_cap_m,
+        config.pair_policy.revisit_distance_m + covariance_allowance,
+    )
+    if (
+        displacement
+        < config.initial_pair_policy.minimum_raw_gnss_displacement_m
+        or displacement > allowed
+    ):
+        return None
+    return {
+        "raw_gnss_displacement_m": displacement,
+        "minimum_raw_gnss_displacement_m": (
+            config.initial_pair_policy.minimum_raw_gnss_displacement_m
+        ),
+        "maximum_allowed_displacement_m": allowed,
+        "combined_position_std_m": combined_sigma,
+        "covariance_allowance_m": covariance_allowance,
+        "endpoints": [
+            candidate.first_gnss.record(),
+            candidate.second_gnss.record(),
+        ],
+    }
+
+
+def _select_initial_pair(
+    candidates: Sequence[PairCandidate],
+    selected_frame_ids: Sequence[int],
+    calibration_names: Sequence[str],
+    config: GeodeticSubmapConfig,
+) -> dict[str, Any]:
+    """Choose a deterministic interior seed without consulting model poses."""
+    frame_order = {
+        int(frame_id): index
+        for index, frame_id in enumerate(selected_frame_ids)
+    }
+    calibration = set(calibration_names)
+    required_margin = max(
+        config.initial_pair_policy.minimum_boundary_frames,
+        int(
+            math.ceil(
+                (len(selected_frame_ids) - 1)
+                * config.initial_pair_policy.boundary_fraction
+            )
+        ),
+    )
+    required_verified_matches = max(
+        config.initial_pair_policy.minimum_verified_matches,
+        config.pair_policy.strong_verified_matches,
+    )
+    eligible: list[
+        tuple[tuple[Any, ...], PairCandidate, dict[str, Any], str]
+    ] = []
+    for candidate in candidates:
+        if (
+            candidate.first_image_name not in calibration
+            or candidate.second_image_name not in calibration
+            or candidate.first_frame_id == candidate.second_frame_id
+            or candidate.first_camera != candidate.second_camera
+            or (candidate.verified_matches or 0)
+            < required_verified_matches
+        ):
+            continue
+        decision = decide_pair(candidate, config.pair_policy)
+        if not decision.retained:
+            continue
+        selection_indices = (
+            frame_order[candidate.first_frame_id],
+            frame_order[candidate.second_frame_id],
+        )
+        boundary_margin = min(
+            *selection_indices,
+            *(len(selected_frame_ids) - 1 - value for value in selection_indices),
+        )
+        if boundary_margin < required_margin:
+            continue
+        gnss_evidence = _initial_pair_gnss_evidence(candidate, config)
+        if gnss_evidence is None:
+            continue
+        # Verified geometry dominates; the remaining fields provide stable,
+        # physically useful tie-breakers before the ascending pair ID.
+        score = (
+            int(candidate.verified_matches or 0),
+            int(candidate.raw_matches or 0),
+            float(gnss_evidence["raw_gnss_displacement_m"]),
+            int(boundary_margin),
+            -candidate.pair_id,
+        )
+        eligible.append((score, candidate, gnss_evidence, decision.reason))
+    if not eligible:
+        raise ArtifactError(
+            "no interior calibration-prior image pair satisfies the sealed "
+            "visual-evidence and raw-GNSS initialization policy"
+        )
+    score, selected, gnss_evidence, retention_reason = max(
+        eligible, key=lambda item: item[0]
+    )
+    selection_indices = [
+        frame_order[selected.first_frame_id],
+        frame_order[selected.second_frame_id],
+    ]
+    boundary_margin = min(
+        *selection_indices,
+        *(len(selected_frame_ids) - 1 - value for value in selection_indices),
+    )
+    return {
+        "schema_version": 1,
+        "method": "deterministic_interior_raw_gnss_seed_v1",
+        "pair_id": selected.pair_id,
+        "image_ids": [selected.first_image_id, selected.second_image_id],
+        "image_names": [
+            selected.first_image_name,
+            selected.second_image_name,
+        ],
+        "frame_ids": [selected.first_frame_id, selected.second_frame_id],
+        "frame_indices": [
+            selected.first_frame_index,
+            selected.second_frame_index,
+        ],
+        "selection_indices": selection_indices,
+        "cameras": [selected.first_camera, selected.second_camera],
+        "timestamps_ns": [
+            selected.first_timestamp_ns,
+            selected.second_timestamp_ns,
+        ],
+        "raw_matches": selected.raw_matches,
+        "verified_matches": selected.verified_matches,
+        "required_verified_matches": required_verified_matches,
+        "pair_retention_reason": retention_reason,
+        "required_boundary_margin_frames": required_margin,
+        "actual_boundary_margin_frames": boundary_margin,
+        "eligible_candidate_count": len(eligible),
+        "score": {
+            "verified_matches": score[0],
+            "raw_matches": score[1],
+            "raw_gnss_displacement_m": score[2],
+            "boundary_margin_frames": score[3],
+            "pair_id_tiebreak": -score[4],
+        },
+        "raw_gnss_evidence": gnss_evidence,
+        "decision_inputs_exclude": [
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+    }
 
 
 def _quoted(identifier: str) -> str:
@@ -1645,6 +1933,12 @@ def prepare_geodetic_submap_plan(
             config,
             mapper_config.alignment_temporal_blocks,
         )
+        initial_pair = _select_initial_pair(
+            candidates,
+            selection["frame_ids"],
+            prior_split["calibration_names"],
+            config,
+        )
         private_sqlite_metadata = _normalize_private_database_metadata(
             staging / "database.db",
             source_database_evidence["source_sqlite_metadata"],
@@ -1661,6 +1955,10 @@ def prepare_geodetic_submap_plan(
             pair_sources,
             prior_split["calibration_names"],
         )
+        if initial_pair["pair_id"] not in inventory["geometry_pair_ids"]:
+            raise ArtifactError(
+                "sealed initial pair lacks private verified geometry evidence"
+            )
         calibration = _calibration_contract(
             staging / "database.db",
             source,
@@ -1690,7 +1988,7 @@ def prepare_geodetic_submap_plan(
             source_database_evidence,
         )
         plan = {
-            "schema_version": 1,
+            "schema_version": _HARDENED_PLAN_SCHEMA_VERSION,
             "kind": _PLAN_KIND,
             "frontend_artifact": str(frontend),
             "completed_backend": str(source),
@@ -1717,11 +2015,13 @@ def prepare_geodetic_submap_plan(
             "database_inventory_sha256": sha256_file(
                 staging / "database_inventory.json"
             ),
+            "initial_pair": initial_pair,
             "calibration_contract": calibration,
             "colmap": _colmap_binding(frontend),
             "optimizer_contract": {
                 "implementation": "existing_rtk_refinement_pose_prior_mapper",
                 "initialization_mode": "fresh",
+                "sealed_initial_pair": True,
                 "position_priors": "raw_gnss_covariance_status_weighted",
                 "heldout_priors_physically_absent": True,
                 "fixed_stereo_rig": True,
@@ -1754,6 +2054,8 @@ def prepare_geodetic_submap_plan(
 
 def _plan_context(
     artifact: str | Path,
+    *,
+    require_hardened: bool = False,
 ) -> tuple[
     Path,
     dict[str, Any],
@@ -1769,9 +2071,21 @@ def _plan_context(
         raise ArtifactError("geodetic submap plan file inventory changed")
     seal = _verify_file_seal(root, "plan_seal.json", _PLAN_FILES)
     plan = _json(root / "geodetic_submap_plan.json")
-    if plan.get("kind") != _PLAN_KIND or plan.get("schema_version") != 1:
+    schema_version = plan.get("schema_version")
+    if (
+        plan.get("kind") != _PLAN_KIND
+        or schema_version not in {1, _HARDENED_PLAN_SCHEMA_VERSION}
+    ):
         raise ArtifactError("invalid geodetic submap plan")
-    config = _config_from_record(plan.get("config"))
+    legacy_schema = schema_version == 1
+    if require_hardened and legacy_schema:
+        raise ArtifactError(
+            "legacy geodetic plan lacks a sealed initial pair and full-path "
+            "acceptance policy; prepare a new immutable plan"
+        )
+    config = _config_from_record(
+        plan.get("config"), legacy_schema=legacy_schema
+    )
     (
         frontend,
         manifest,
@@ -1840,6 +2154,7 @@ def _plan_context(
     ):
         raise ArtifactError("private optimizer database changed")
     prior_split = _json(root / "prior_split.json")
+    pair_audit = _json(root / "pair_audit.json")
     calibration_names = _read_lines(root / "calibration_prior_names.txt")
     holdout_names = _read_lines(root / "holdout_prior_names.txt")
     if (
@@ -1853,6 +2168,26 @@ def _plan_context(
         != inventory.get("rig_ids")
     ):
         raise ArtifactError("geodetic plan optimizer inventory changed")
+    gnss = _raw_gnss_endpoints(reader)
+    candidates, _ = _pair_candidates(
+        frontend / "database.db", metadata, gnss
+    )
+    expected_pair_audit, _ = _pair_audit(candidates, config.pair_policy)
+    if pair_audit != expected_pair_audit:
+        raise ArtifactError("sealed raw-GNSS pair audit changed")
+    if not legacy_schema:
+        expected_initial_pair = _select_initial_pair(
+            candidates,
+            selection["frame_ids"],
+            calibration_names,
+            config,
+        )
+        if plan.get("initial_pair") != expected_initial_pair:
+            raise ArtifactError("sealed mapper initial-pair contract changed")
+        if expected_initial_pair["pair_id"] not in inventory.get(
+            "geometry_pair_ids", ()
+        ):
+            raise ArtifactError("sealed mapper initial pair has no geometry")
     calibration = plan.get("calibration_contract")
     if not isinstance(calibration, Mapping):
         raise ArtifactError("geodetic plan has no calibration contract")
@@ -1891,6 +2226,8 @@ def _plan_context(
         )
     ):
         raise ArtifactError("optimizer contract changed")
+    if not legacy_schema and optimizer.get("sealed_initial_pair") is not True:
+        raise ArtifactError("optimizer initial-pair contract changed")
     # The seal is returned so result artifacts can bind the exact plan seal.
     return root, plan, config, mapper_config, {
         "source_quality": source_quality,
@@ -1898,6 +2235,7 @@ def _plan_context(
         "rows": rows,
         "reader": reader,
         "seal": seal,
+        "hardened_plan": not legacy_schema,
     }
 
 
@@ -1917,6 +2255,8 @@ def _verify_pinned_colmap(
 
 def _option(command: Sequence[str], name: str) -> str:
     try:
+        if command.count(name) != 1:
+            raise ValueError
         index = command.index(name)
         return str(command[index + 1])
     except (ValueError, IndexError) as exc:
@@ -1924,7 +2264,9 @@ def _option(command: Sequence[str], name: str) -> str:
 
 
 def _verify_mapper_command(
-    command: Sequence[str], config: GeodeticSubmapConfig
+    command: Sequence[str],
+    config: GeodeticSubmapConfig,
+    initial_pair: Mapping[str, Any],
 ) -> None:
     if len(command) < 2 or command[1] != "pose_prior_mapper":
         raise ArtifactError("geodetic solve is not pose_prior_mapper")
@@ -1941,6 +2283,8 @@ def _verify_mapper_command(
         "--Mapper.ba_refine_extra_params": "0",
         "--Mapper.ba_refine_sensor_from_rig": "0",
         "--Mapper.ba_use_gpu": "0",
+        "--Mapper.init_image_id1": str(initial_pair["image_ids"][0]),
+        "--Mapper.init_image_id2": str(initial_pair["image_ids"][1]),
     }
     for name, value in expected.items():
         if _option(command, name) != value:
@@ -1966,7 +2310,9 @@ def build_geodetic_submap_command(
     executable: str | Path,
 ) -> tuple[str, ...]:
     """Build and audit the existing fresh pose-prior-mapper command."""
-    plan_root, plan, config, _, _ = _plan_context(plan_artifact)
+    plan_root, plan, config, _, _ = _plan_context(
+        plan_artifact, require_hardened=True
+    )
     colmap = _verify_pinned_colmap(executable, plan["colmap"])
     execution = Path(execution_workspace).expanduser().resolve()
     immutable = (
@@ -1981,8 +2327,13 @@ def build_geodetic_submap_command(
         raise ArtifactError("execution workspace must be outside immutable inputs")
     command = _rtk_refinement_command(
         execution, plan, config.refinement, colmap
+    ) + (
+        "--Mapper.init_image_id1",
+        str(plan["initial_pair"]["image_ids"][0]),
+        "--Mapper.init_image_id2",
+        str(plan["initial_pair"]["image_ids"][1]),
     )
-    _verify_mapper_command(command, config)
+    _verify_mapper_command(command, config, plan["initial_pair"])
     return command
 
 
@@ -1992,6 +2343,217 @@ def _copy_execution_input(source: Path, destination: Path) -> None:
     shutil.copyfile(source, destination)
     with destination.open("rb") as stream:
         os.fsync(stream.fileno())
+
+
+def _maximum_true_run(values: np.ndarray) -> int:
+    maximum = 0
+    current = 0
+    for value in np.asarray(values, dtype=bool):
+        current = current + 1 if value else 0
+        maximum = max(maximum, current)
+    return maximum
+
+
+def _authoritative_checks_pass(checks: Mapping[str, Mapping[str, Any]]) -> bool:
+    return all(
+        bool(check.get("passed"))
+        for check in checks.values()
+        if check.get("authoritative", True)
+    )
+
+
+def _full_trajectory_quality(
+    aligned_refined_centers: np.ndarray,
+    camera_prior_centers: np.ndarray,
+    raw_gnss_centers: np.ndarray,
+    roles: Sequence[str],
+    calibration_inlier_mask: np.ndarray,
+    names: Sequence[str],
+    frame_ids: Sequence[int],
+    policy: GeodeticTrajectoryPolicy,
+) -> dict[str, Any]:
+    """Evaluate absolute local motion over every selected acquisition step."""
+    refined = np.asarray(aligned_refined_centers, dtype=np.float64)
+    camera = np.asarray(camera_prior_centers, dtype=np.float64)
+    raw = np.asarray(raw_gnss_centers, dtype=np.float64)
+    inliers = np.asarray(calibration_inlier_mask, dtype=bool)
+    n = len(refined)
+    if (
+        n < 3
+        or refined.shape != (n, 3)
+        or camera.shape != (n, 3)
+        or raw.shape != (n, 3)
+        or inliers.shape != (n,)
+        or len(roles) != n
+        or len(names) != n
+        or len(frame_ids) != n
+        or not np.isfinite(refined).all()
+    ):
+        raise ArtifactError("full-trajectory gate inputs are inconsistent")
+
+    camera_valid = np.isfinite(camera).all(axis=1)
+    raw_valid = np.isfinite(raw).all(axis=1)
+    full_coverage = bool(camera_valid.all() and raw_valid.all())
+    calibration_outliers = np.asarray(
+        [role == "calibration" for role in roles], dtype=bool
+    ) & ~inliers
+    maximum_outlier_run = _maximum_true_run(calibration_outliers)
+
+    refined_steps = np.diff(refined, axis=0)
+    refined_lengths = np.linalg.norm(refined_steps, axis=1)
+    adjacent_valid = (
+        camera_valid[:-1]
+        & camera_valid[1:]
+        & raw_valid[:-1]
+        & raw_valid[1:]
+    )
+    camera_steps = np.diff(camera, axis=0)
+    raw_steps = np.diff(raw, axis=0)
+    camera_vector_errors = np.linalg.norm(
+        refined_steps - camera_steps, axis=1
+    )
+    raw_length_errors = np.abs(
+        refined_lengths - np.linalg.norm(raw_steps, axis=1)
+    )
+    camera_vector_errors[~adjacent_valid] = np.nan
+    raw_length_errors[~adjacent_valid] = np.nan
+
+    def worst_pair(values: np.ndarray) -> dict[str, Any] | None:
+        finite = np.flatnonzero(np.isfinite(values))
+        if not finite.size:
+            return None
+        index = int(finite[np.argmax(values[finite])])
+        return {
+            "selection_indices": [index, index + 1],
+            "frame_ids": [int(frame_ids[index]), int(frame_ids[index + 1])],
+            "image_names": [str(names[index]), str(names[index + 1])],
+            "error_m": float(values[index]),
+            "refined_displacement_m": float(refined_lengths[index]),
+            "camera_prior_displacement_m": float(
+                np.linalg.norm(camera_steps[index])
+            ),
+            "raw_gnss_displacement_m": float(
+                np.linalg.norm(raw_steps[index])
+            ),
+        }
+
+    worst_camera_pair = worst_pair(camera_vector_errors)
+    worst_raw_pair = worst_pair(raw_length_errors)
+    maximum_camera_error = (
+        float(np.nanmax(camera_vector_errors))
+        if np.isfinite(camera_vector_errors).any()
+        else None
+    )
+    maximum_raw_error = (
+        float(np.nanmax(raw_length_errors))
+        if np.isfinite(raw_length_errors).any()
+        else None
+    )
+
+    window_frames = min(policy.local_window_frames, n)
+    windows: list[dict[str, Any]] = []
+    for start in range(n - window_frames + 1):
+        stop = start + window_frames
+        if not (
+            camera_valid[start:stop].all()
+            and raw_valid[start:stop].all()
+        ):
+            continue
+        prior_path = float(
+            np.linalg.norm(camera_steps[start : stop - 1], axis=1).sum()
+        )
+        refined_path = float(refined_lengths[start : stop - 1].sum())
+        error = abs(refined_path - prior_path)
+        allowed = max(
+            policy.max_local_window_path_error_m,
+            policy.max_local_window_path_relative_error * prior_path,
+        )
+        windows.append(
+            {
+                "selection_indices": [start, stop - 1],
+                "frame_ids": [
+                    int(frame_ids[start]),
+                    int(frame_ids[stop - 1]),
+                ],
+                "image_names": [str(names[start]), str(names[stop - 1])],
+                "prior_path_m": prior_path,
+                "refined_path_m": refined_path,
+                "absolute_error_m": error,
+                "relative_error": (
+                    error / prior_path if prior_path > 1.0e-12 else None
+                ),
+                "allowed_error_m": allowed,
+                "normalized_error": error / allowed,
+            }
+        )
+    worst_window = (
+        max(windows, key=lambda item: item["normalized_error"])
+        if windows
+        else None
+    )
+    window_passed = (
+        full_coverage
+        and worst_window is not None
+        and worst_window["normalized_error"] <= 1.0
+    )
+    checks = {
+        "full_trajectory_raw_gnss_coverage": {
+            "authoritative": True,
+            "value": int((camera_valid & raw_valid).sum()),
+            "expected": n,
+            "passed": full_coverage,
+        },
+        "consecutive_calibration_prior_outliers": {
+            "authoritative": True,
+            "value": maximum_outlier_run,
+            "maximum": policy.max_consecutive_calibration_outliers,
+            "passed": maximum_outlier_run
+            <= policy.max_consecutive_calibration_outliers,
+        },
+        "adjacent_camera_prior_displacement_error_m": {
+            "authoritative": True,
+            "value": maximum_camera_error,
+            "maximum": policy.max_adjacent_displacement_error_m,
+            "passed": full_coverage
+            and maximum_camera_error is not None
+            and maximum_camera_error
+            <= policy.max_adjacent_displacement_error_m,
+        },
+        "adjacent_raw_gnss_step_error_m": {
+            "authoritative": True,
+            "value": maximum_raw_error,
+            "maximum": policy.max_adjacent_displacement_error_m,
+            "passed": full_coverage
+            and maximum_raw_error is not None
+            and maximum_raw_error
+            <= policy.max_adjacent_displacement_error_m,
+        },
+        "sliding_local_window_path_consistency": {
+            "authoritative": True,
+            "value": (
+                worst_window["normalized_error"]
+                if worst_window is not None
+                else None
+            ),
+            "maximum": 1.0,
+            "window_frames": window_frames,
+            "passed": window_passed,
+        },
+    }
+    return {
+        "schema_version": 1,
+        "method": "aligned_raw_gnss_full_path_gates_v1",
+        "selected_frame_count": n,
+        "adjacent_step_count": n - 1,
+        "evaluated_adjacent_step_count": int(adjacent_valid.sum()),
+        "calibration_outlier_indices": np.flatnonzero(
+            calibration_outliers
+        ).astype(int).tolist(),
+        "worst_adjacent_camera_prior_pair": worst_camera_pair,
+        "worst_adjacent_raw_gnss_pair": worst_raw_pair,
+        "worst_local_window": worst_window,
+        "checks": checks,
+    }
 
 
 def _quality_report(
@@ -2029,7 +2591,14 @@ def _quality_report(
     left_names = [str(row["left_image"]["name"]) for row in rows]
     source_centers = np.stack([source_poses[name][1] for name in left_names])
     refined_centers = np.stack([refined_poses[name][1] for name in left_names])
-    scale = _similarity_scale(source_centers, refined_centers)
+    try:
+        scale: float | None = _similarity_scale(
+            source_centers, refined_centers
+        )
+    except ArtifactError:
+        # This source-relative number is deliberately diagnostic-only. The
+        # absolute raw-GNSS path gates below remain authoritative.
+        scale = None
     source_baselines = _stereo_baselines(source_poses, rows)
     refined_baselines = _stereo_baselines(refined_poses, rows)
     baseline_change = float(
@@ -2076,6 +2645,62 @@ def _quality_report(
     ]
     if recorded_roles != expected_roles:
         raise ArtifactError("optimizer and evaluator GNSS splits differ")
+    evaluation_inliers = {
+        str(item["name"]): bool(
+            refined_evaluation.calibration_inlier_mask[index]
+        )
+        for index, item in enumerate(ordered_records)
+    }
+    record_by_name = {
+        str(item["name"]): item for item in split["records"]
+    }
+    raw_endpoints = _raw_gnss_endpoints(context["reader"])
+    nan_position = np.full(3, np.nan, dtype=np.float64)
+    camera_prior_centers = np.stack(
+        [
+            np.asarray(record_by_name[name]["position_m"], dtype=np.float64)
+            if record_by_name.get(name, {}).get("role")
+            in {"calibration", "holdout"}
+            else nan_position
+            for name in left_names
+        ]
+    )
+    raw_gnss_centers = np.stack(
+        [
+            np.asarray(
+                raw_endpoints[int(row["frame_id"])].position_m,
+                dtype=np.float64,
+            )
+            if record_by_name.get(str(row["left_image"]["name"]), {}).get(
+                "role"
+            )
+            in {"calibration", "holdout"}
+            and raw_endpoints[int(row["frame_id"])].trusted_std_m()
+            is not None
+            else nan_position
+            for row in rows
+        ]
+    )
+    aligned_refined_centers = (
+        refined_centers @ refined_evaluation.alignment.rotation.T
+        + refined_evaluation.alignment.translation
+    )
+    trajectory = _full_trajectory_quality(
+        aligned_refined_centers,
+        camera_prior_centers,
+        raw_gnss_centers,
+        [
+            str(record_by_name.get(name, {}).get("role", "excluded"))
+            for name in left_names
+        ],
+        np.asarray(
+            [evaluation_inliers.get(name, False) for name in left_names],
+            dtype=bool,
+        ),
+        left_names,
+        [int(row["frame_id"]) for row in rows],
+        config.trajectory_policy,
+    )
     source_median = float(source_rtk["residual_m"]["median"])
     refined_median = float(refined_rtk["residual_m"]["median"])
     source_rtk_passed = all(
@@ -2134,14 +2759,18 @@ def _quality_report(
             "passed": bool(inventory["pair_evidence_byte_exact"]),
         },
         "trajectory_similarity_scale": {
+            "authoritative": False,
+            "kind": "diagnostic_only_source_comparison",
             "value": scale,
             "expected": 1.0,
             "maximum_abs_deviation": (
                 config.refinement.max_trajectory_scale_deviation
             ),
-            "passed": abs(scale - 1.0)
+            "passed": scale is not None
+            and abs(scale - 1.0)
             <= config.refinement.max_trajectory_scale_deviation,
         },
+        **trajectory["checks"],
         "stereo_baseline_max_change_m": {
             "value": baseline_change,
             "maximum": config.refinement.max_stereo_baseline_change_m,
@@ -2180,7 +2809,7 @@ def _quality_report(
             >= config.refinement.min_holdout_median_improvement_m,
         },
     }
-    passed = all(bool(check["passed"]) for check in checks.values())
+    passed = _authoritative_checks_pass(checks)
     return {
         "schema_version": 1,
         "stage": "quality",
@@ -2199,6 +2828,8 @@ def _quality_report(
             "stock_colmap_strict_se3_only": False,
             "scale_restored_from_fixed_rig": True,
             "trajectory_similarity_scale": scale,
+            "trajectory_similarity_scale_authoritative": False,
+            "full_trajectory": trajectory,
             "source_stereo_baseline_m": {
                 "minimum": float(source_baselines.min()),
                 "median": float(np.median(source_baselines)),
@@ -2232,7 +2863,7 @@ def run_geodetic_submap_plan(
 ) -> dict[str, Any]:
     """Run one plan in staging and atomically publish an experimental result."""
     plan_root, plan, config, mapper_config, context = _plan_context(
-        plan_artifact
+        plan_artifact, require_hardened=True
     )
     output = Path(result_destination).expanduser().resolve()
     if output.exists():
@@ -2359,6 +2990,7 @@ def run_geodetic_submap_plan(
             "stage": "solve",
             "method": "existing_rtk_refinement_pose_prior_mapper_fresh",
             "command": list(command),
+            "sealed_initial_pair": plan["initial_pair"],
             "selected_stats": selected["stats"],
             "candidates": analyses,
             "all_selected_images_retained": quality["checks"][
@@ -2370,7 +3002,7 @@ def run_geodetic_submap_plan(
         _atomic_json(staging / "reports" / "solve.json", solve)
         _atomic_json(staging / "reports" / "quality.json", quality)
         result = {
-            "schema_version": 1,
+            "schema_version": _HARDENED_PLAN_SCHEMA_VERSION,
             "kind": _RESULT_KIND,
             "experimental": True,
             "plan_artifact": str(plan_root),
@@ -2487,7 +3119,9 @@ def geodetic_submap_export_context(
 
 
 __all__ = [
+    "GeodeticInitialPairPolicy",
     "GeodeticSubmapConfig",
+    "GeodeticTrajectoryPolicy",
     "audited_geodetic_submap_result",
     "build_geodetic_submap_command",
     "create_geodetic_frame_selection",
