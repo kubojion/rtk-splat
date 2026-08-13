@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 import shutil
 import sqlite3
 import subprocess
@@ -24,12 +25,28 @@ from rtk_splat.backends.geodetic_submap import (
     GeodeticTrajectoryPolicy,
     _authoritative_checks_pass,
     _full_trajectory_quality,
+    _plan_context,
     _similarity_scale,
     build_geodetic_submap_command,
     create_geodetic_frame_selection,
     geodetic_submap_export_context,
     prepare_geodetic_submap_plan,
     run_geodetic_submap_plan,
+)
+from rtk_splat.backends.geodetic_assembly import (
+    GeodeticAssemblyConfig,
+    GeodeticOverlapPolicy,
+    _aligned_submap_candidate,
+    _evaluate_overlap_candidates,
+    audited_geodetic_assembly_plan,
+    audited_geodetic_full_pose_artifact,
+    audited_geodetic_overlap_report,
+    audited_geodetic_submap_pose_export,
+    export_geodetic_submap_poses,
+    prepare_geodetic_assembly_plan,
+    prepare_geodetic_assembly_window,
+    publish_geodetic_full_pose_artifact,
+    publish_geodetic_overlap_report,
 )
 from rtk_splat.backends.mapper import (
     MapperConfig,
@@ -331,6 +348,10 @@ def _create_database(artifact: Path) -> list[str]:
             pairs.add((left, right))
             if frame_index:
                 previous = manifest["frames"][frame_index - 1]
+                pairs.add((str(previous["left_image"]["name"]), left))
+                pairs.add((str(previous["right_image"]["name"]), right))
+            if frame_index >= 2:
+                previous = manifest["frames"][frame_index - 2]
                 pairs.add((str(previous["left_image"]["name"]), left))
                 pairs.add((str(previous["right_image"]["name"]), right))
         pairs.add((names[0], names[12]))  # nearby nonlocal revisit
@@ -885,9 +906,18 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
             root = Path(tmp)
             _, _, _, _, plan, colmap, names = _fixture(root)
             result_path = root / "result"
-            result = run_geodetic_submap_plan(
-                plan, result_path, colmap, runner=_Runner(names)
-            )
+            with mock.patch(
+                "rtk_splat.backends.geodetic_submap._plan_context",
+                wraps=_plan_context,
+            ) as audited_plan_context:
+                result = run_geodetic_submap_plan(
+                    plan, result_path, colmap, runner=_Runner(names)
+                )
+            # One audit precedes execution and one closes the mapper mutation
+            # race.  Both the command builder and final publication verifier
+            # reuse those audited contexts instead of adding full source-
+            # database snapshots.
+            self.assertEqual(audited_plan_context.call_count, 2)
             self.assertTrue(result["passed"])
             self.assertTrue(result["publication_eligible"])
             self.assertFalse(
@@ -1064,6 +1094,201 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
         contents = launcher.read_text(encoding="utf-8").lower()
         for token in ("field1", "/data/jkobo", "1100", "1800"):
             self.assertNotIn(token, contents)
+
+
+class GeodeticAssemblyArtifactTests(unittest.TestCase):
+    def _completed_assembly(self, root: Path):
+        segment, frontend, backend, _, source_plan, colmap, _ = _fixture(root)
+        selection = create_geodetic_frame_selection(
+            frontend,
+            segment,
+            list(range(8)),
+            root / "assembly-selection.json",
+        )
+        submap_config = _plan_context(source_plan)[2]
+        config = GeodeticAssemblyConfig(
+            submap_frames=6,
+            overlap_frames=2,
+            probe_submaps=2,
+            overlap_policy=GeodeticOverlapPolicy(
+                minimum_overlap_frames=2,
+                max_median_center_disagreement_m=0.01,
+                max_p95_center_disagreement_m=0.01,
+                max_center_disagreement_m=0.01,
+                max_median_rotation_disagreement_deg=0.01,
+                max_p95_rotation_disagreement_deg=0.01,
+                max_rotation_disagreement_deg=0.01,
+            ),
+            submap_config=submap_config,
+        )
+        assembly_plan = prepare_geodetic_assembly_plan(
+            frontend,
+            backend,
+            segment,
+            selection,
+            root / "assembly-plan",
+            config=config,
+        )
+        audited = audited_geodetic_assembly_plan(assembly_plan)
+        runtime = audited_geodetic_assembly_plan(
+            assembly_plan, _include_runtime_context=True
+        )
+        # run-all uses spawned worker processes because the mapper's resource
+        # monitor owns process-level signal handlers.
+        pickle.loads(pickle.dumps(runtime["_runtime_context"]))
+        self.assertEqual(len(audited["windows"]), 2)
+        self.assertEqual(
+            sorted(
+                {
+                    frame_id
+                    for window in audited["windows"]
+                    for frame_id in window["frame_ids"]
+                }
+            ),
+            list(range(8)),
+        )
+        submaps = root / "submaps"
+        results = []
+        for window in audited["windows"]:
+            prepared = prepare_geodetic_assembly_window(
+                assembly_plan,
+                window["window_id"],
+                submaps / window["window_id"],
+            )
+            local_plan = json.loads(
+                (Path(prepared["plan"]) / "geodetic_submap_plan.json").read_text()
+            )
+            runner = _Runner(list(local_plan["selected_image_names"]))
+            result = run_geodetic_submap_plan(
+                prepared["plan"], prepared["result"], colmap, runner=runner
+            )
+            self.assertTrue(result["passed"])
+            results.append(Path(prepared["result"]))
+        return segment, assembly_plan, audited, submaps, results
+
+    def test_sealed_export_overlap_and_full_pose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment, plan, audited, submaps, results = self._completed_assembly(
+                root
+            )
+            export = export_geodetic_submap_poses(
+                results[0], root / "accepted-submap-export"
+            )
+            export_record = audited_geodetic_submap_pose_export(export)
+            self.assertTrue(export_record["publication_eligible"])
+            self.assertTrue((export / "trajectory.svg").is_file())
+            overlap = publish_geodetic_overlap_report(
+                results,
+                root / "overlap",
+                policy=audited["config_object"].overlap_policy,
+            )
+            self.assertTrue(audited_geodetic_overlap_report(overlap)["passed"])
+            pose = publish_geodetic_full_pose_artifact(
+                plan, submaps, root / "poses", "assembled"
+            )
+            final = audited_geodetic_full_pose_artifact(pose)
+            self.assertEqual(final["manifest"]["n_frames"], 8)
+            self.assertTrue(
+                final["georeferencing"][
+                    "metric_georeferencing_claim_eligible"
+                ]
+            )
+            viewmats = np.load(pose / "viewmats.npy")
+            centers = np.load(pose / "cam_centers.npy")
+            self.assertTrue(
+                np.allclose(np.linalg.inv(viewmats)[:, :3, 3], centers)
+            )
+            self.assertEqual(len(viewmats), 8)
+            self.assertEqual(
+                len(audited["global_holdout"]["holdout_names"]), 2
+            )
+            with self.assertRaises(FileExistsError):
+                publish_geodetic_full_pose_artifact(
+                    plan, submaps, root / "poses", "assembled"
+                )
+            # The standard consumer validates the exact full segment count.
+            cfg = SimpleNamespace(
+                pose=SimpleNamespace(
+                    artifact="assembled", artifact_root=root / "poses"
+                )
+            )
+            from rtk_splat.core.pose_artifacts import load_pose_artifact
+
+            loaded, loaded_centers = load_pose_artifact(segment, cfg)
+            self.assertEqual(loaded.shape, (8, 4, 4))
+            self.assertEqual(loaded_centers.shape, (8, 3))
+
+    def test_global_holdouts_are_absent_from_every_covering_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, audited, submaps, _ = self._completed_assembly(root)
+            global_holdout = set(audited["global_holdout"]["holdout_names"])
+            self.assertTrue(global_holdout)
+            for window in audited["windows"]:
+                database = submaps / window["window_id"] / "result" / "database.db"
+                with sqlite3.connect(database) as connection:
+                    remaining = {
+                        str(name)
+                        for (name,) in connection.execute(
+                            "SELECT i.name FROM pose_priors p "
+                            "JOIN images i ON i.image_id=p.corr_data_id"
+                        )
+                    }
+                local_global = global_holdout & set(
+                    window["calibration_names"] + window["holdout_names"]
+                )
+                self.assertFalse(local_global & remaining)
+
+    def test_overlap_disagreement_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, audited, _, results = self._completed_assembly(root)
+            candidates = [_aligned_submap_candidate(path) for path in results]
+            candidates[1] = dict(candidates[1])
+            candidates[1]["centers"] = candidates[1]["centers"] + np.asarray(
+                [1.0, 0.0, 0.0]
+            )
+            report = _evaluate_overlap_candidates(
+                candidates, audited["config_object"].overlap_policy
+            )
+            self.assertFalse(report["passed"])
+            self.assertFalse(
+                report["pairs"][0]["checks"][
+                    "maximum_center_disagreement_m"
+                ]["passed"]
+            )
+
+    def test_assembly_code_and_launcher_are_generic(self):
+        repository = Path(__file__).resolve().parents[1]
+        paths = [
+            repository
+            / "src"
+            / "rtk_splat"
+            / "backends"
+            / "geodetic_assembly.py",
+            repository
+            / "scripts"
+            / "experiments"
+            / "geodetic_submap_assembly_v1.py",
+        ]
+        for path in paths:
+            contents = path.read_text(encoding="utf-8").lower()
+            for token in ("field1", "/data/jkobo", "10227", "1100", "1800"):
+                self.assertNotIn(token, contents, f"{token!r} in {path.name}")
+        completed = subprocess.run(
+            [sys.executable, str(paths[1]), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("prepare-all", completed.stdout)
+        self.assertIn("assemble", completed.stdout)
+        launcher = paths[1].read_text(encoding="utf-8")
+        self.assertIn("ProcessPoolExecutor", launcher)
+        self.assertIn('get_context("spawn")', launcher)
+        self.assertNotIn("ThreadPoolExecutor", launcher)
 
 
 if __name__ == "__main__":

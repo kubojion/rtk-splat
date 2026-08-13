@@ -1867,8 +1867,17 @@ def prepare_geodetic_submap_plan(
     destination: str | Path,
     *,
     config: GeodeticSubmapConfig = GeodeticSubmapConfig(),
+    _verified_input_context: tuple[Any, ...] | None = None,
+    _defer_full_reaudit_until_execution: bool = False,
 ) -> Path:
     """Atomically publish one immutable private-database execution plan."""
+    input_context = (
+        tuple(_verified_input_context)
+        if _verified_input_context is not None
+        else _input_context(frontend_artifact, completed_backend, segment)
+    )
+    if len(input_context) != 9:
+        raise ArtifactError("invalid cached geodetic input context")
     (
         frontend,
         manifest,
@@ -1879,7 +1888,15 @@ def prepare_geodetic_submap_plan(
         segment_path,
         reader,
         source_evidence,
-    ) = _input_context(frontend_artifact, completed_backend, segment)
+    ) = input_context
+    if (
+        Path(frontend_artifact).expanduser().resolve() != frontend
+        or Path(completed_backend).expanduser().resolve() != source
+        or Path(segment).expanduser().resolve() != segment_path
+    ):
+        raise ArtifactError("cached geodetic input context path changed")
+    if _defer_full_reaudit_until_execution and _verified_input_context is None:
+        raise ArtifactError("deferred re-audit requires a verified input context")
     selection_path, selection = _load_frame_selection(
         frame_selection, frontend, segment_path, manifest
     )
@@ -2040,7 +2057,8 @@ def prepare_geodetic_submap_plan(
         _atomic_json(staging / "geodetic_submap_plan.json", plan)
         _atomic_json(staging / "plan_seal.json", _seal_files(staging, _PLAN_FILES))
         # Close the copy/verification race before publishing the immutable plan.
-        _input_context(frontend, source, segment_path)
+        if not _defer_full_reaudit_until_execution:
+            _input_context(frontend, source, segment_path)
         _load_frame_selection(selection_path, frontend, segment_path, manifest)
         if output.exists():
             raise FileExistsError(f"refusing to overwrite geodetic plan: {output}")
@@ -2048,7 +2066,10 @@ def prepare_geodetic_submap_plan(
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    _plan_context(output)
+    if _defer_full_reaudit_until_execution:
+        _verify_file_seal(output, "plan_seal.json", _PLAN_FILES)
+    else:
+        _plan_context(output)
     return output
 
 
@@ -2056,6 +2077,7 @@ def _plan_context(
     artifact: str | Path,
     *,
     require_hardened: bool = False,
+    _verified_input_context: tuple[Any, ...] | None = None,
 ) -> tuple[
     Path,
     dict[str, Any],
@@ -2086,6 +2108,17 @@ def _plan_context(
     config = _config_from_record(
         plan.get("config"), legacy_schema=legacy_schema
     )
+    input_context = (
+        _input_context(
+            plan.get("frontend_artifact", ""),
+            plan.get("completed_backend", ""),
+            plan.get("segment", ""),
+        )
+        if _verified_input_context is None
+        else _verified_input_context
+    )
+    if len(input_context) != 9:
+        raise ArtifactError("invalid cached geodetic input context")
     (
         frontend,
         manifest,
@@ -2096,11 +2129,13 @@ def _plan_context(
         segment,
         reader,
         evidence,
-    ) = _input_context(
-        plan.get("frontend_artifact", ""),
-        plan.get("completed_backend", ""),
-        plan.get("segment", ""),
-    )
+    ) = input_context
+    if (
+        Path(str(plan.get("frontend_artifact", ""))).resolve() != frontend
+        or Path(str(plan.get("completed_backend", ""))).resolve() != source
+        or Path(str(plan.get("segment", ""))).resolve() != segment
+    ):
+        raise ArtifactError("cached input context refers to another plan")
     selection_path, selection = _load_frame_selection(
         plan.get("frame_selection", ""), frontend, segment, manifest
     )
@@ -2304,15 +2339,13 @@ def _verify_mapper_command(
         raise ArtifactError("mapper command unexpectedly consumes IMU/lever data")
 
 
-def build_geodetic_submap_command(
-    plan_artifact: str | Path,
+def _build_geodetic_submap_command_from_context(
+    plan_root: Path,
+    plan: Mapping[str, Any],
+    config: GeodeticSubmapConfig,
     execution_workspace: str | Path,
     executable: str | Path,
 ) -> tuple[str, ...]:
-    """Build and audit the existing fresh pose-prior-mapper command."""
-    plan_root, plan, config, _, _ = _plan_context(
-        plan_artifact, require_hardened=True
-    )
     colmap = _verify_pinned_colmap(executable, plan["colmap"])
     execution = Path(execution_workspace).expanduser().resolve()
     immutable = (
@@ -2335,6 +2368,20 @@ def build_geodetic_submap_command(
     )
     _verify_mapper_command(command, config, plan["initial_pair"])
     return command
+
+
+def build_geodetic_submap_command(
+    plan_artifact: str | Path,
+    execution_workspace: str | Path,
+    executable: str | Path,
+) -> tuple[str, ...]:
+    """Build and audit the existing fresh pose-prior-mapper command."""
+    plan_root, plan, config, _, _ = _plan_context(
+        plan_artifact, require_hardened=True
+    )
+    return _build_geodetic_submap_command_from_context(
+        plan_root, plan, config, execution_workspace, executable
+    )
 
 
 def _copy_execution_input(source: Path, destination: Path) -> None:
@@ -2860,10 +2907,13 @@ def run_geodetic_submap_plan(
     executable: str | Path,
     *,
     runner: Runner = subprocess.run,
+    _verified_input_context: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
     """Run one plan in staging and atomically publish an experimental result."""
     plan_root, plan, config, mapper_config, context = _plan_context(
-        plan_artifact, require_hardened=True
+        plan_artifact,
+        require_hardened=True,
+        _verified_input_context=_verified_input_context,
     )
     output = Path(result_destination).expanduser().resolve()
     if output.exists():
@@ -2898,8 +2948,11 @@ def run_geodetic_submap_plan(
             "private_database_committed_view"
         ]:
             raise ArtifactError("execution database copy differs from the plan")
-        command = build_geodetic_submap_command(
-            plan_root, staging, executable
+        # Reuse the fully audited context above. Calling the public builder here
+        # would repeat the immutable source-database snapshot while the first
+        # snapshot remains live for result evaluation.
+        command = _build_geodetic_submap_command_from_context(
+            plan_root, plan, config, staging, executable
         )
         incomplete = staging / "refined_model.incomplete"
         incomplete.mkdir()
@@ -2974,7 +3027,10 @@ def run_geodetic_submap_plan(
             staging / "database.db",
             plan["private_database_sqlite_metadata"],
         )
-        _plan_context(plan_root)
+        # Re-audit the immutable sources after COLMAP completes. This closes
+        # the input-mutation race even when an assembly launcher supplied its
+        # immediately preceding verified context for the preflight.
+        post_solve_plan_context = _plan_context(plan_root)
         quality = _quality_report(
             staging,
             plan_root,
@@ -3037,11 +3093,16 @@ def run_geodetic_submap_plan(
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    return audited_geodetic_submap_result(output)
+    return audited_geodetic_submap_result(
+        output, _verified_plan_context=post_solve_plan_context
+    )
 
 
 def audited_geodetic_submap_result(
     result_artifact: str | Path,
+    *,
+    _include_internal_plan_context: bool = False,
+    _verified_plan_context: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
     """Verify and load an atomically published experimental result."""
     root = Path(result_artifact).expanduser().resolve()
@@ -3062,7 +3123,15 @@ def audited_geodetic_submap_result(
     result = _json(root / "geodetic_submap_result.json")
     if result.get("kind") != _RESULT_KIND:
         raise ArtifactError("invalid geodetic submap result")
-    plan_root, _, _, _, _ = _plan_context(result.get("plan_artifact", ""))
+    plan_artifact = Path(str(result.get("plan_artifact", ""))).resolve()
+    plan_context = (
+        _plan_context(plan_artifact)
+        if _verified_plan_context is None
+        else _verified_plan_context
+    )
+    if len(plan_context) != 5 or Path(plan_context[0]).resolve() != plan_artifact:
+        raise ArtifactError("cached result plan context refers to another plan")
+    plan_root, _, _, _, _ = plan_context
     if (
         result.get("plan_seal_sha256")
         != sha256_file(plan_root / "plan_seal.json")
@@ -3088,13 +3157,16 @@ def audited_geodetic_submap_result(
         or result.get("production_poses_published") is not False
     ):
         raise ArtifactError("geodetic result publication state changed")
-    return {
+    audited = {
         **result,
         "artifact": str(root),
         "quality": quality,
         "solve": _json(root / "reports" / "solve.json"),
         "result_seal_sha256": sha256_file(root / "result_seal.json"),
     }
+    if _include_internal_plan_context:
+        audited["_internal_plan_context"] = plan_context
+    return audited
 
 
 def geodetic_submap_export_context(
