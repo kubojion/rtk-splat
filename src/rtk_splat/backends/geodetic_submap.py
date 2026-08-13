@@ -1519,6 +1519,68 @@ def _select_initial_pair_v3(
     }
 
 
+def _select_initial_pair_v4(
+    candidates: Sequence[PairCandidate],
+    config: GeodeticSubmapConfig,
+) -> dict[str, Any]:
+    """Seal deterministic COLMAP auto-initialization over the filtered DB."""
+    required_verified_matches = max(
+        100,
+        config.initial_pair_policy.minimum_verified_matches,
+        config.pair_policy.strong_verified_matches,
+    )
+    candidate_records = []
+    for candidate in candidates:
+        decision = decide_pair(candidate, config.pair_policy)
+        if (
+            not decision.retained
+            or candidate.first_frame_id == candidate.second_frame_id
+            or (candidate.verified_matches or 0) < required_verified_matches
+        ):
+            continue
+        candidate_records.append(
+            {
+                "pair_id": candidate.pair_id,
+                "image_ids": [
+                    candidate.first_image_id,
+                    candidate.second_image_id,
+                ],
+                "frame_ids": [
+                    candidate.first_frame_id,
+                    candidate.second_frame_id,
+                ],
+                "verified_matches": int(candidate.verified_matches or 0),
+                "retention_reason": decision.reason,
+            }
+        )
+    candidate_records.sort(key=lambda item: int(item["pair_id"]))
+    if not candidate_records:
+        raise ArtifactError(
+            "filtered private database has no strong distinct-frame "
+            "initialization candidates"
+        )
+    return {
+        "schema_version": 4,
+        "method": "deterministic_colmap_auto_filtered_database_v4",
+        "selection_owner": "pinned_colmap_pose_prior_mapper",
+        "explicit_image_ids": False,
+        "random_seed": config.refinement.random_seed,
+        "required_verified_matches": required_verified_matches,
+        "candidate_pair_count": len(candidate_records),
+        "candidate_pair_records_sha256": canonical_hash(candidate_records),
+        "candidate_pool": (
+            "distinct-frame pair evidence physically retained by the sealed "
+            "raw-GNSS consistency policy"
+        ),
+        "heldout_position_priors_available_to_selector": False,
+        "decision_inputs_exclude": [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+
+
 def _select_initial_pair_for_method(
     method: str,
     candidates: Sequence[PairCandidate],
@@ -1547,6 +1609,8 @@ def _select_initial_pair_for_method(
             config,
             pair_sources,
         )
+    if method == "v4":
+        return _select_initial_pair_v4(candidates, config)
     raise ArtifactError(f"unsupported initial-pair method: {method}")
 
 
@@ -2487,7 +2551,7 @@ def prepare_geodetic_submap_plan(
         raise ArtifactError("cached geodetic input context path changed")
     if _defer_full_reaudit_until_execution and _verified_input_context is None:
         raise ArtifactError("deferred re-audit requires a verified input context")
-    if _initial_pair_method not in {"v1", "v2", "v3"}:
+    if _initial_pair_method not in {"v1", "v2", "v3", "v4"}:
         raise ArtifactError("unsupported initial-pair method")
     selection_path, selection = _load_frame_selection(
         frame_selection, frontend, segment_path, manifest
@@ -2566,7 +2630,10 @@ def prepare_geodetic_submap_plan(
             pair_sources,
             prior_split["calibration_names"],
         )
-        if initial_pair["pair_id"] not in inventory["geometry_pair_ids"]:
+        if (
+            _initial_pair_method != "v4"
+            and initial_pair["pair_id"] not in inventory["geometry_pair_ids"]
+        ):
             raise ArtifactError(
                 "sealed initial pair lacks private verified geometry evidence"
             )
@@ -2632,7 +2699,9 @@ def prepare_geodetic_submap_plan(
             "optimizer_contract": {
                 "implementation": "existing_rtk_refinement_pose_prior_mapper",
                 "initialization_mode": "fresh",
-                "sealed_initial_pair": True,
+                "sealed_initial_pair": _initial_pair_method != "v4",
+                "sealed_initialization_policy": True,
+                "colmap_auto_initial_pair": _initial_pair_method == "v4",
                 "position_priors": "raw_gnss_covariance_status_weighted",
                 "heldout_priors_physically_absent": True,
                 "fixed_stereo_rig": True,
@@ -2809,6 +2878,7 @@ def _plan_context(
             "deterministic_interior_raw_gnss_seed_v1": "v1",
             "deterministic_interior_raw_gnss_two_view_seed_v2": "v2",
             "deterministic_interior_raw_gnss_two_view_parallax_seed_v3": "v3",
+            "deterministic_colmap_auto_filtered_database_v4": "v4",
         }.get(str(plan.get("initial_pair", {}).get("method", "")))
         if initial_pair_method is None:
             raise ArtifactError("optimizer initial-pair method changed")
@@ -2822,8 +2892,10 @@ def _plan_context(
         )
         if plan.get("initial_pair") != expected_initial_pair:
             raise ArtifactError("sealed mapper initial-pair contract changed")
-        if expected_initial_pair["pair_id"] not in inventory.get(
-            "geometry_pair_ids", ()
+        if (
+            initial_pair_method != "v4"
+            and expected_initial_pair["pair_id"]
+            not in inventory.get("geometry_pair_ids", ())
         ):
             raise ArtifactError("sealed mapper initial pair has no geometry")
     calibration = plan.get("calibration_contract")
@@ -2864,8 +2936,20 @@ def _plan_context(
         )
     ):
         raise ArtifactError("optimizer contract changed")
-    if not legacy_schema and optimizer.get("sealed_initial_pair") is not True:
-        raise ArtifactError("optimizer initial-pair contract changed")
+    if not legacy_schema:
+        auto_initialization = initial_pair_method == "v4"
+        if auto_initialization and (
+            optimizer.get("sealed_initialization_policy") is not True
+            or optimizer.get("sealed_initial_pair") is not False
+            or optimizer.get("colmap_auto_initial_pair") is not True
+        ):
+            raise ArtifactError("optimizer initial-pair contract changed")
+        if not auto_initialization and (
+            optimizer.get("sealed_initial_pair") is not True
+            or optimizer.get("colmap_auto_initial_pair") not in {None, False}
+            or optimizer.get("sealed_initialization_policy") not in {None, True}
+        ):
+            raise ArtifactError("optimizer initial-pair contract changed")
     # The seal is returned so result artifacts can bind the exact plan seal.
     return root, plan, config, mapper_config, {
         "source_quality": source_quality,
@@ -2921,9 +3005,29 @@ def _verify_mapper_command(
         "--Mapper.ba_refine_extra_params": "0",
         "--Mapper.ba_refine_sensor_from_rig": "0",
         "--Mapper.ba_use_gpu": "0",
-        "--Mapper.init_image_id1": str(initial_pair["image_ids"][0]),
-        "--Mapper.init_image_id2": str(initial_pair["image_ids"][1]),
     }
+    auto_initialization = (
+        initial_pair.get("method")
+        == "deterministic_colmap_auto_filtered_database_v4"
+    )
+    if auto_initialization:
+        if any(
+            option in command
+            for option in (
+                "--Mapper.init_image_id1",
+                "--Mapper.init_image_id2",
+            )
+        ):
+            raise ArtifactError(
+                "COLMAP auto-initialization command pins an image pair"
+            )
+    else:
+        expected.update(
+            {
+                "--Mapper.init_image_id1": str(initial_pair["image_ids"][0]),
+                "--Mapper.init_image_id2": str(initial_pair["image_ids"][1]),
+            }
+        )
     for name, value in expected.items():
         if _option(command, name) != value:
             raise ArtifactError(f"fixed mapper contract violated by {name}")
@@ -2963,12 +3067,17 @@ def _build_geodetic_submap_command_from_context(
         raise ArtifactError("execution workspace must be outside immutable inputs")
     command = _rtk_refinement_command(
         execution, plan, config.refinement, colmap
-    ) + (
-        "--Mapper.init_image_id1",
-        str(plan["initial_pair"]["image_ids"][0]),
-        "--Mapper.init_image_id2",
-        str(plan["initial_pair"]["image_ids"][1]),
     )
+    if (
+        plan["initial_pair"].get("method")
+        != "deterministic_colmap_auto_filtered_database_v4"
+    ):
+        command += (
+            "--Mapper.init_image_id1",
+            str(plan["initial_pair"]["image_ids"][0]),
+            "--Mapper.init_image_id2",
+            str(plan["initial_pair"]["image_ids"][1]),
+        )
     _verify_mapper_command(command, config, plan["initial_pair"])
     return command
 

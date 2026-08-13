@@ -1351,6 +1351,7 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
         # run-all uses spawned worker processes because the mapper's resource
         # monitor owns process-level signal handlers.
         pickle.loads(pickle.dumps(runtime["_runtime_context"]))
+        self.assertEqual(audited["schema_version"], 4)
         self.assertEqual(len(audited["windows"]), 2)
         self.assertEqual(
             sorted(
@@ -1372,6 +1373,18 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             )
             local_plan = json.loads(
                 (Path(prepared["plan"]) / "geodetic_submap_plan.json").read_text()
+            )
+            command = build_geodetic_submap_command(
+                prepared["plan"], root / "command-audit", colmap
+            )
+            self.assertNotIn("--Mapper.init_image_id1", command)
+            self.assertNotIn("--Mapper.init_image_id2", command)
+            self.assertEqual(
+                local_plan["initial_pair"]["method"],
+                "deterministic_colmap_auto_filtered_database_v4",
+            )
+            self.assertFalse(
+                local_plan["initial_pair"]["explicit_image_ids"]
             )
             runner = _Runner(list(local_plan["selected_image_names"]))
             result = run_geodetic_submap_plan(
