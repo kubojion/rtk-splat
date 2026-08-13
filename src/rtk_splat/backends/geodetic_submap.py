@@ -700,12 +700,20 @@ def _pair_candidates(
                     "SELECT pair_id, rows FROM matches"
                 )
             }
-            verified = {
-                int(pair_id): int(rows)
-                for pair_id, rows in connection.execute(
-                    "SELECT pair_id, rows FROM two_view_geometries"
-                )
-            }
+            verified: dict[int, int] = {}
+            initial_geometry: dict[int, dict[str, Any]] = {}
+            for pair_id, rows, configuration, qvec, tvec in connection.execute(
+                "SELECT pair_id, rows, config, qvec, tvec "
+                "FROM two_view_geometries"
+            ):
+                pair_id = int(pair_id)
+                verified[pair_id] = int(rows)
+                if qvec is not None and tvec is not None:
+                    initial_geometry[pair_id] = {
+                        "configuration": int(configuration),
+                        "qvec": bytes(qvec),
+                        "tvec": bytes(tvec),
+                    }
     except sqlite3.Error as exc:
         raise ArtifactError(f"cannot enumerate COLMAP pair evidence: {exc}") from exc
     candidates: list[PairCandidate] = []
@@ -740,12 +748,17 @@ def _pair_candidates(
         raise ArtifactError("selected frames have no existing pair evidence")
     selected_pair_ids = {candidate.pair_id for candidate in candidates}
     return candidates, {
+        "_database_path": str(database.resolve()),
         "source_match_pair_ids": sorted(
             pair_id for pair_id in matches if pair_id in selected_pair_ids
         ),
         "source_geometry_pair_ids": sorted(
             pair_id for pair_id in verified if pair_id in selected_pair_ids
         ),
+        "initial_geometry_by_pair_id": {
+            pair_id: initial_geometry[pair_id]
+            for pair_id in sorted(selected_pair_ids & set(initial_geometry))
+        },
     }
 
 
@@ -959,6 +972,582 @@ def _select_initial_pair(
             "heldout_evaluation_result",
         ],
     }
+
+
+def _initial_geometry_evidence(
+    candidate: PairCandidate,
+    geometry_by_pair_id: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    record = geometry_by_pair_id.get(candidate.pair_id)
+    if not isinstance(record, Mapping):
+        return None
+    try:
+        configuration = int(record["configuration"])
+        qvec = np.frombuffer(record["qvec"], dtype="<f8")
+        tvec = np.frombuffer(record["tvec"], dtype="<f8")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactError(
+            "invalid stored two-view initialization geometry"
+        ) from exc
+    if (
+        configuration not in {2, 9}
+        or qvec.shape != (4,)
+        or tvec.shape != (3,)
+        or not np.isfinite(qvec).all()
+        or not np.isfinite(tvec).all()
+    ):
+        return None
+    qvec_norm = float(np.linalg.norm(qvec))
+    translation_norm = float(np.linalg.norm(tvec))
+    if qvec_norm <= 1.0e-12 or translation_norm <= 1.0e-12:
+        return None
+    absolute_forward_motion = float(abs(tvec[2]) / translation_norm)
+    if absolute_forward_motion >= 0.95:
+        return None
+    return {
+        "source": "sealed_two_view_geometries_relative_pose",
+        "configuration": configuration,
+        "qvec": qvec.tolist(),
+        "tvec": tvec.tolist(),
+        "qvec_norm": qvec_norm,
+        "translation_norm": translation_norm,
+        "absolute_forward_motion": absolute_forward_motion,
+        "maximum_absolute_forward_motion": 0.95,
+    }
+
+
+def _eligible_initial_pair_geometry_candidates(
+    candidates: Sequence[PairCandidate],
+    selected_frame_ids: Sequence[int],
+    calibration_names: Sequence[str],
+    config: GeodeticSubmapConfig,
+    geometry_by_pair_id: Mapping[int, Mapping[str, Any]],
+) -> tuple[
+    list[tuple[PairCandidate, dict[str, Any], dict[str, Any], str, int]],
+    dict[int, int],
+    int,
+    int,
+]:
+    frame_order = {
+        int(frame_id): index
+        for index, frame_id in enumerate(selected_frame_ids)
+    }
+    calibration = set(calibration_names)
+    required_margin = max(
+        config.initial_pair_policy.minimum_boundary_frames,
+        int(
+            math.ceil(
+                (len(selected_frame_ids) - 1)
+                * config.initial_pair_policy.boundary_fraction
+            )
+        ),
+    )
+    required_verified_matches = max(
+        config.initial_pair_policy.minimum_verified_matches,
+        config.pair_policy.strong_verified_matches,
+    )
+    eligible: list[
+        tuple[PairCandidate, dict[str, Any], dict[str, Any], str, int]
+    ] = []
+    for candidate in candidates:
+        if (
+            candidate.first_image_name not in calibration
+            or candidate.second_image_name not in calibration
+            or candidate.first_frame_id == candidate.second_frame_id
+            or candidate.first_camera != candidate.second_camera
+            or (candidate.verified_matches or 0)
+            < required_verified_matches
+        ):
+            continue
+        decision = decide_pair(candidate, config.pair_policy)
+        if not decision.retained:
+            continue
+        selection_indices = (
+            frame_order[candidate.first_frame_id],
+            frame_order[candidate.second_frame_id],
+        )
+        boundary_margin = min(
+            *selection_indices,
+            *(
+                len(selected_frame_ids) - 1 - value
+                for value in selection_indices
+            ),
+        )
+        if boundary_margin < required_margin:
+            continue
+        gnss_evidence = _initial_pair_gnss_evidence(candidate, config)
+        geometry_evidence = _initial_geometry_evidence(
+            candidate, geometry_by_pair_id
+        )
+        if gnss_evidence is None or geometry_evidence is None:
+            continue
+        eligible.append(
+            (
+                candidate,
+                gnss_evidence,
+                geometry_evidence,
+                decision.reason,
+                boundary_margin,
+            )
+        )
+    if not eligible:
+        raise ArtifactError(
+            "no interior calibration-prior image pair satisfies the sealed "
+            "raw-GNSS and two-view initialization policy"
+        )
+    return eligible, frame_order, required_margin, required_verified_matches
+
+
+def _select_initial_pair_v2(
+    candidates: Sequence[PairCandidate],
+    selected_frame_ids: Sequence[int],
+    calibration_names: Sequence[str],
+    config: GeodeticSubmapConfig,
+    geometry_by_pair_id: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Choose a strong interior seed using only sealed raw pair geometry."""
+    (
+        eligible,
+        frame_order,
+        required_margin,
+        required_verified_matches,
+    ) = _eligible_initial_pair_geometry_candidates(
+        candidates,
+        selected_frame_ids,
+        calibration_names,
+        config,
+        geometry_by_pair_id,
+    )
+    maximum_verified_matches = max(
+        int(item[0].verified_matches or 0) for item in eligible
+    )
+    robust_match_floor = max(
+        required_verified_matches,
+        int(math.ceil(0.25 * maximum_verified_matches)),
+    )
+    robust = [
+        item
+        for item in eligible
+        if int(item[0].verified_matches or 0) >= robust_match_floor
+    ]
+
+    def score(item: tuple[Any, ...]) -> tuple[Any, ...]:
+        candidate, gnss, geometry, _reason, boundary_margin = item
+        # COLMAP explicitly rejects forward-motion seeds. Among candidates
+        # with a robust fraction of the best verified-match support, prefer
+        # the sealed two-view pose with the largest lateral component.
+        return (
+            -float(geometry["absolute_forward_motion"]),
+            float(gnss["raw_gnss_displacement_m"]),
+            int(candidate.verified_matches or 0),
+            int(candidate.raw_matches or 0),
+            int(boundary_margin),
+            -candidate.pair_id,
+        )
+
+    (
+        selected,
+        gnss_evidence,
+        geometry_evidence,
+        retention_reason,
+        boundary_margin,
+    ) = max(robust, key=score)
+    selected_score = score(
+        (
+            selected,
+            gnss_evidence,
+            geometry_evidence,
+            retention_reason,
+            boundary_margin,
+        )
+    )
+    selection_indices = [
+        frame_order[selected.first_frame_id],
+        frame_order[selected.second_frame_id],
+    ]
+    return {
+        "schema_version": 2,
+        "method": "deterministic_interior_raw_gnss_two_view_seed_v2",
+        "pair_id": selected.pair_id,
+        "image_ids": [selected.first_image_id, selected.second_image_id],
+        "image_names": [
+            selected.first_image_name,
+            selected.second_image_name,
+        ],
+        "frame_ids": [selected.first_frame_id, selected.second_frame_id],
+        "frame_indices": [
+            selected.first_frame_index,
+            selected.second_frame_index,
+        ],
+        "selection_indices": selection_indices,
+        "cameras": [selected.first_camera, selected.second_camera],
+        "timestamps_ns": [
+            selected.first_timestamp_ns,
+            selected.second_timestamp_ns,
+        ],
+        "raw_matches": selected.raw_matches,
+        "verified_matches": selected.verified_matches,
+        "required_verified_matches": required_verified_matches,
+        "robust_verified_match_floor": robust_match_floor,
+        "maximum_eligible_verified_matches": maximum_verified_matches,
+        "pair_retention_reason": retention_reason,
+        "required_boundary_margin_frames": required_margin,
+        "actual_boundary_margin_frames": boundary_margin,
+        "eligible_candidate_count": len(eligible),
+        "robust_candidate_count": len(robust),
+        "score": {
+            "negative_absolute_forward_motion": selected_score[0],
+            "raw_gnss_displacement_m": selected_score[1],
+            "verified_matches": selected_score[2],
+            "raw_matches": selected_score[3],
+            "boundary_margin_frames": selected_score[4],
+            "pair_id_tiebreak": -selected_score[5],
+        },
+        "raw_gnss_evidence": gnss_evidence,
+        "sealed_two_view_geometry": geometry_evidence,
+        "decision_inputs_exclude": [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+
+
+def _rotation_matrix_from_qvec(qvec: np.ndarray) -> np.ndarray:
+    normalized = qvec / np.linalg.norm(qvec)
+    w, x, y, z = normalized.tolist()
+    return np.asarray(
+        [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _pinhole_keypoint_rays(
+    connection: sqlite3.Connection,
+    image_id: int,
+    ray_cache: dict[int, np.ndarray],
+    camera_cache: dict[int, tuple[float, float, float, float]],
+) -> np.ndarray:
+    cached = ray_cache.get(image_id)
+    if cached is not None:
+        return cached
+    image = connection.execute(
+        "SELECT camera_id FROM images WHERE image_id = ?", (image_id,)
+    ).fetchone()
+    if image is None:
+        raise ArtifactError("initial-pair image is absent from source database")
+    camera_id = int(image[0])
+    calibration = camera_cache.get(camera_id)
+    if calibration is None:
+        camera = connection.execute(
+            "SELECT model, params FROM cameras WHERE camera_id = ?",
+            (camera_id,),
+        ).fetchone()
+        if camera is None or camera[1] is None:
+            raise ArtifactError("initial-pair camera calibration is missing")
+        model = int(camera[0])
+        parameters = np.frombuffer(camera[1], dtype="<f8")
+        if model == 0 and parameters.shape == (3,):
+            focal, cx, cy = parameters.tolist()
+            calibration = (focal, focal, cx, cy)
+        elif model == 1 and parameters.shape == (4,):
+            calibration = tuple(float(value) for value in parameters)
+        else:
+            raise ArtifactError(
+                "parallax-ranked initialization requires a sealed "
+                "zero-distortion SIMPLE_PINHOLE or PINHOLE camera"
+            )
+        if (
+            not np.isfinite(calibration).all()
+            or calibration[0] <= 0.0
+            or calibration[1] <= 0.0
+        ):
+            raise ArtifactError("initial-pair camera calibration is invalid")
+        camera_cache[camera_id] = calibration
+    keypoints = connection.execute(
+        "SELECT rows, cols, data FROM keypoints WHERE image_id = ?",
+        (image_id,),
+    ).fetchone()
+    if keypoints is None or keypoints[2] is None:
+        raise ArtifactError("initial-pair keypoints are missing")
+    rows, columns = int(keypoints[0]), int(keypoints[1])
+    values = np.frombuffer(keypoints[2], dtype="<f4")
+    if rows < 1 or columns < 2 or values.size != rows * columns:
+        raise ArtifactError("initial-pair keypoint storage is invalid")
+    points = values.reshape(rows, columns)[:, :2].astype(np.float64)
+    fx, fy, cx, cy = calibration
+    rays = np.column_stack(
+        (
+            (points[:, 0] - cx) / fx,
+            (points[:, 1] - cy) / fy,
+            np.ones(rows, dtype=np.float64),
+        )
+    )
+    norms = np.linalg.norm(rays, axis=1)
+    if (
+        not np.isfinite(rays).all()
+        or not np.isfinite(norms).all()
+        or bool((norms <= 1.0e-12).any())
+    ):
+        raise ArtifactError("initial-pair keypoint rays are invalid")
+    rays /= norms[:, None]
+    ray_cache[image_id] = rays
+    return rays
+
+
+def _sealed_pair_parallax_evidence(
+    connection: sqlite3.Connection,
+    candidate: PairCandidate,
+    geometry: Mapping[str, Any],
+    ray_cache: dict[int, np.ndarray],
+    camera_cache: dict[int, tuple[float, float, float, float]],
+) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT rows, cols, data, config, qvec, tvec "
+        "FROM two_view_geometries WHERE pair_id = ?",
+        (candidate.pair_id,),
+    ).fetchone()
+    if row is None or row[2] is None or row[4] is None or row[5] is None:
+        raise ArtifactError("sealed initial-pair geometry is missing")
+    rows, columns = int(row[0]), int(row[1])
+    matches = np.frombuffer(row[2], dtype="<u4")
+    qvec = np.frombuffer(row[4], dtype="<f8")
+    tvec = np.frombuffer(row[5], dtype="<f8")
+    if (
+        rows != int(candidate.verified_matches or -1)
+        or rows < 1
+        or columns != 2
+        or matches.size != rows * columns
+        or int(row[3]) != int(geometry["configuration"])
+        or qvec.shape != (4,)
+        or tvec.shape != (3,)
+        or not np.allclose(qvec, geometry["qvec"], atol=0.0, rtol=0.0)
+        or not np.allclose(tvec, geometry["tvec"], atol=0.0, rtol=0.0)
+    ):
+        raise ArtifactError("sealed initial-pair geometry storage changed")
+    pairs = matches.reshape(rows, columns).astype(np.int64)
+    first_rays = _pinhole_keypoint_rays(
+        connection, candidate.first_image_id, ray_cache, camera_cache
+    )
+    second_rays = _pinhole_keypoint_rays(
+        connection, candidate.second_image_id, ray_cache, camera_cache
+    )
+    if (
+        bool((pairs < 0).any())
+        or bool((pairs[:, 0] >= len(first_rays)).any())
+        or bool((pairs[:, 1] >= len(second_rays)).any())
+    ):
+        raise ArtifactError("initial-pair match index is out of range")
+    rotation_second_from_first = _rotation_matrix_from_qvec(qvec)
+    second_rays_in_first = (
+        second_rays[pairs[:, 1]] @ rotation_second_from_first
+    )
+    cosines = np.einsum(
+        "ij,ij->i", first_rays[pairs[:, 0]], second_rays_in_first
+    )
+    angles_deg = np.rad2deg(np.arccos(np.clip(cosines, -1.0, 1.0)))
+    if not np.isfinite(angles_deg).all():
+        raise ArtifactError("initial-pair parallax evidence is non-finite")
+    return {
+        "source": "sealed_two_view_inlier_keypoint_rays",
+        "correspondence_count": rows,
+        "minimum_angle_deg": float(np.min(angles_deg)),
+        "median_angle_deg": float(np.median(angles_deg)),
+        "maximum_angle_deg": float(np.max(angles_deg)),
+        "camera_models": "zero_distortion_pinhole",
+        "rotation_convention": "cam2_from_cam1",
+    }
+
+
+def _select_initial_pair_v3(
+    candidates: Sequence[PairCandidate],
+    selected_frame_ids: Sequence[int],
+    calibration_names: Sequence[str],
+    config: GeodeticSubmapConfig,
+    pair_sources: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Choose the strongest sealed raw-GNSS-consistent parallax seed."""
+    geometry_by_pair_id = pair_sources.get(
+        "initial_geometry_by_pair_id", {}
+    )
+    (
+        eligible,
+        frame_order,
+        required_margin,
+        required_verified_matches,
+    ) = _eligible_initial_pair_geometry_candidates(
+        candidates,
+        selected_frame_ids,
+        calibration_names,
+        config,
+        geometry_by_pair_id,
+    )
+    maximum_verified_matches = max(
+        int(item[0].verified_matches or 0) for item in eligible
+    )
+    robust_match_floor = max(
+        required_verified_matches,
+        int(math.ceil(0.10 * maximum_verified_matches)),
+    )
+    robust = [
+        item
+        for item in eligible
+        if int(item[0].verified_matches or 0) >= robust_match_floor
+    ]
+    database_value = pair_sources.get("_database_path")
+    if not isinstance(database_value, str):
+        raise ArtifactError("source database is missing for parallax audit")
+    database = Path(database_value).expanduser().resolve()
+    parallax_by_pair_id: dict[int, dict[str, Any]] = {}
+    ray_cache: dict[int, np.ndarray] = {}
+    camera_cache: dict[int, tuple[float, float, float, float]] = {}
+    try:
+        with _readonly_database(database) as connection:
+            for candidate, _gnss, geometry, _reason, _margin in robust:
+                parallax_by_pair_id[candidate.pair_id] = (
+                    _sealed_pair_parallax_evidence(
+                        connection,
+                        candidate,
+                        geometry,
+                        ray_cache,
+                        camera_cache,
+                    )
+                )
+    except sqlite3.Error as exc:
+        raise ArtifactError(
+            f"cannot audit sealed initial-pair parallax: {exc}"
+        ) from exc
+
+    def score(item: tuple[Any, ...]) -> tuple[Any, ...]:
+        candidate, gnss, geometry, _reason, boundary_margin = item
+        parallax = parallax_by_pair_id[candidate.pair_id]
+        return (
+            float(parallax["median_angle_deg"]),
+            -float(geometry["absolute_forward_motion"]),
+            float(gnss["raw_gnss_displacement_m"]),
+            int(candidate.verified_matches or 0),
+            int(candidate.raw_matches or 0),
+            int(boundary_margin),
+            -candidate.pair_id,
+        )
+
+    (
+        selected,
+        gnss_evidence,
+        geometry_evidence,
+        retention_reason,
+        boundary_margin,
+    ) = max(robust, key=score)
+    selected_score = score(
+        (
+            selected,
+            gnss_evidence,
+            geometry_evidence,
+            retention_reason,
+            boundary_margin,
+        )
+    )
+    selection_indices = [
+        frame_order[selected.first_frame_id],
+        frame_order[selected.second_frame_id],
+    ]
+    return {
+        "schema_version": 3,
+        "method": (
+            "deterministic_interior_raw_gnss_two_view_parallax_seed_v3"
+        ),
+        "pair_id": selected.pair_id,
+        "image_ids": [selected.first_image_id, selected.second_image_id],
+        "image_names": [
+            selected.first_image_name,
+            selected.second_image_name,
+        ],
+        "frame_ids": [selected.first_frame_id, selected.second_frame_id],
+        "frame_indices": [
+            selected.first_frame_index,
+            selected.second_frame_index,
+        ],
+        "selection_indices": selection_indices,
+        "cameras": [selected.first_camera, selected.second_camera],
+        "timestamps_ns": [
+            selected.first_timestamp_ns,
+            selected.second_timestamp_ns,
+        ],
+        "raw_matches": selected.raw_matches,
+        "verified_matches": selected.verified_matches,
+        "required_verified_matches": required_verified_matches,
+        "robust_verified_match_floor": robust_match_floor,
+        "maximum_eligible_verified_matches": maximum_verified_matches,
+        "pair_retention_reason": retention_reason,
+        "required_boundary_margin_frames": required_margin,
+        "actual_boundary_margin_frames": boundary_margin,
+        "eligible_candidate_count": len(eligible),
+        "robust_candidate_count": len(robust),
+        "score": {
+            "median_parallax_angle_deg": selected_score[0],
+            "negative_absolute_forward_motion": selected_score[1],
+            "raw_gnss_displacement_m": selected_score[2],
+            "verified_matches": selected_score[3],
+            "raw_matches": selected_score[4],
+            "boundary_margin_frames": selected_score[5],
+            "pair_id_tiebreak": -selected_score[6],
+        },
+        "raw_gnss_evidence": gnss_evidence,
+        "sealed_two_view_geometry": geometry_evidence,
+        "sealed_parallax_evidence": parallax_by_pair_id[selected.pair_id],
+        "decision_inputs_exclude": [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+
+
+def _select_initial_pair_for_method(
+    method: str,
+    candidates: Sequence[PairCandidate],
+    selected_frame_ids: Sequence[int],
+    calibration_names: Sequence[str],
+    config: GeodeticSubmapConfig,
+    pair_sources: Mapping[str, Any],
+) -> dict[str, Any]:
+    if method == "v1":
+        return _select_initial_pair(
+            candidates, selected_frame_ids, calibration_names, config
+        )
+    if method == "v2":
+        return _select_initial_pair_v2(
+            candidates,
+            selected_frame_ids,
+            calibration_names,
+            config,
+            pair_sources.get("initial_geometry_by_pair_id", {}),
+        )
+    if method == "v3":
+        return _select_initial_pair_v3(
+            candidates,
+            selected_frame_ids,
+            calibration_names,
+            config,
+            pair_sources,
+        )
+    raise ArtifactError(f"unsupported initial-pair method: {method}")
 
 
 def _quoted(identifier: str) -> str:
@@ -1869,6 +2458,7 @@ def prepare_geodetic_submap_plan(
     config: GeodeticSubmapConfig = GeodeticSubmapConfig(),
     _verified_input_context: tuple[Any, ...] | None = None,
     _defer_full_reaudit_until_execution: bool = False,
+    _initial_pair_method: str = "v1",
 ) -> Path:
     """Atomically publish one immutable private-database execution plan."""
     input_context = (
@@ -1897,6 +2487,8 @@ def prepare_geodetic_submap_plan(
         raise ArtifactError("cached geodetic input context path changed")
     if _defer_full_reaudit_until_execution and _verified_input_context is None:
         raise ArtifactError("deferred re-audit requires a verified input context")
+    if _initial_pair_method not in {"v1", "v2", "v3"}:
+        raise ArtifactError("unsupported initial-pair method")
     selection_path, selection = _load_frame_selection(
         frame_selection, frontend, segment_path, manifest
     )
@@ -1950,11 +2542,13 @@ def prepare_geodetic_submap_plan(
             config,
             mapper_config.alignment_temporal_blocks,
         )
-        initial_pair = _select_initial_pair(
+        initial_pair = _select_initial_pair_for_method(
+            _initial_pair_method,
             candidates,
             selection["frame_ids"],
             prior_split["calibration_names"],
             config,
+            pair_sources,
         )
         private_sqlite_metadata = _normalize_private_database_metadata(
             staging / "database.db",
@@ -2204,18 +2798,27 @@ def _plan_context(
     ):
         raise ArtifactError("geodetic plan optimizer inventory changed")
     gnss = _raw_gnss_endpoints(reader)
-    candidates, _ = _pair_candidates(
+    candidates, pair_sources = _pair_candidates(
         frontend / "database.db", metadata, gnss
     )
     expected_pair_audit, _ = _pair_audit(candidates, config.pair_policy)
     if pair_audit != expected_pair_audit:
         raise ArtifactError("sealed raw-GNSS pair audit changed")
     if not legacy_schema:
-        expected_initial_pair = _select_initial_pair(
+        initial_pair_method = {
+            "deterministic_interior_raw_gnss_seed_v1": "v1",
+            "deterministic_interior_raw_gnss_two_view_seed_v2": "v2",
+            "deterministic_interior_raw_gnss_two_view_parallax_seed_v3": "v3",
+        }.get(str(plan.get("initial_pair", {}).get("method", "")))
+        if initial_pair_method is None:
+            raise ArtifactError("optimizer initial-pair method changed")
+        expected_initial_pair = _select_initial_pair_for_method(
+            initial_pair_method,
             candidates,
             selection["frame_ids"],
             calibration_names,
             config,
+            pair_sources,
         )
         if plan.get("initial_pair") != expected_initial_pair:
             raise ArtifactError("sealed mapper initial-pair contract changed")

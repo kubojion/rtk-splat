@@ -26,6 +26,8 @@ from rtk_splat.backends.geodetic_submap import (
     _authoritative_checks_pass,
     _full_trajectory_quality,
     _plan_context,
+    _select_initial_pair_v2,
+    _select_initial_pair_v3,
     _similarity_scale,
     build_geodetic_submap_command,
     create_geodetic_frame_selection,
@@ -293,10 +295,19 @@ def _create_database(artifact: Path) -> list[str]:
               ON rigs(ref_sensor_id, ref_sensor_type);
             CREATE UNIQUE INDEX rig_sensor_assignment
               ON rig_sensors(sensor_id, sensor_type);
-            INSERT INTO cameras VALUES(1, 1, 16, 12, X'00', 1);
-            INSERT INTO cameras VALUES(2, 1, 16, 12, X'00', 1);
             INSERT INTO rigs VALUES(1, 1, 0);
             """
+        )
+        camera_parameters = np.asarray(
+            [10.0, 10.0, 8.0, 6.0], dtype="<f8"
+        ).tobytes()
+        connection.execute(
+            "INSERT INTO cameras VALUES(1, 1, 16, 12, ?, 1)",
+            (camera_parameters,),
+        )
+        connection.execute(
+            "INSERT INTO cameras VALUES(2, 1, 16, 12, ?, 1)",
+            (camera_parameters,),
         )
         sensor_pose = np.asarray(
             [1.0, 0.0, 0.0, 0.0, 0.12, 0.0, 0.0], dtype="<f8"
@@ -324,7 +335,17 @@ def _create_database(artifact: Path) -> list[str]:
                 )
                 connection.execute(
                     "INSERT INTO keypoints VALUES(?, 64, 2, ?)",
-                    (image_id, bytes([image_id % 255]) * 512),
+                    (
+                        image_id,
+                        np.column_stack(
+                            (
+                                np.linspace(1.0, 14.0, 64),
+                                np.linspace(1.0, 10.0, 64),
+                            )
+                        )
+                        .astype("<f4")
+                        .tobytes(),
+                    ),
                 )
                 connection.execute(
                     "INSERT INTO descriptors VALUES(?, 0, 64, 128, ?)",
@@ -356,6 +377,8 @@ def _create_database(artifact: Path) -> list[str]:
                 pairs.add((str(previous["right_image"]["name"]), right))
         pairs.add((names[0], names[12]))  # nearby nonlocal revisit
         pairs.add((names[0], names[14]))  # false repetitive nonlocal pair
+        qvec = np.asarray([1.0, 0.0, 0.0, 0.0], dtype="<f8").tobytes()
+        tvec = np.asarray([1.0, 0.0, 0.1], dtype="<f8").tobytes()
         for first, second in sorted(pairs):
             pair_id = _pair_id(by_name[first], by_name[second])
             count = 100
@@ -366,8 +389,8 @@ def _create_database(artifact: Path) -> list[str]:
             )
             connection.execute(
                 "INSERT INTO two_view_geometries VALUES"
-                "(?, ?, 2, ?, 2, NULL, NULL, NULL, NULL, NULL)",
-                (pair_id, count, data),
+                "(?, ?, 2, ?, 2, NULL, NULL, NULL, ?, ?)",
+                (pair_id, count, data, qvec, tvec),
             )
     return names
 
@@ -627,6 +650,198 @@ class GeodeticPairPolicyTests(unittest.TestCase):
                 self._candidate(kind=kind, distance=50.0), policy
             )
             self.assertTrue(decision.retained)
+
+    def test_v2_seed_prefers_stable_two_view_geometry(self):
+        high_matches = self._candidate(kind="adjacent", distance=0.25)
+        high_matches = replace(
+            high_matches,
+            raw_matches=1200,
+            verified_matches=1000,
+        )
+        stable = replace(
+            high_matches,
+            pair_id=6_442_450_945,
+            first_image_id=3,
+            second_image_id=4,
+            first_image_name="stable_first.jpg",
+            second_image_name="stable_second.jpg",
+            first_frame_id=6,
+            second_frame_id=7,
+            first_frame_index=6,
+            second_frame_index=7,
+            first_timestamp_ns=7_000_000_000,
+            second_timestamp_ns=8_000_000_000,
+            raw_matches=400,
+            verified_matches=300,
+        )
+        qvec = np.asarray([1.0, 0.0, 0.0, 0.0], dtype="<f8").tobytes()
+        geometry = {
+            high_matches.pair_id: {
+                "configuration": 2,
+                "qvec": qvec,
+                "tvec": np.asarray([0.4, 0.0, 0.9], dtype="<f8").tobytes(),
+            },
+            stable.pair_id: {
+                "configuration": 2,
+                "qvec": qvec,
+                "tvec": np.asarray([1.0, 0.0, 0.1], dtype="<f8").tobytes(),
+            },
+        }
+        selected = _select_initial_pair_v2(
+            [high_matches, stable],
+            list(range(12)),
+            [
+                high_matches.first_image_name,
+                high_matches.second_image_name,
+                stable.first_image_name,
+                stable.second_image_name,
+            ],
+            GeodeticSubmapConfig(),
+            geometry,
+        )
+        self.assertEqual(selected["pair_id"], stable.pair_id)
+        self.assertLess(
+            selected["sealed_two_view_geometry"]["absolute_forward_motion"],
+            0.2,
+        )
+        self.assertNotIn("finished_visual_model_pose", selected["score"])
+
+    def test_v3_seed_prefers_sealed_correspondence_parallax(self):
+        high_matches = replace(
+            self._candidate(kind="adjacent", distance=0.25),
+            raw_matches=1200,
+            verified_matches=1000,
+        )
+        stable = replace(
+            high_matches,
+            pair_id=6_442_450_945,
+            first_image_id=3,
+            second_image_id=4,
+            first_image_name="stable_first.jpg",
+            second_image_name="stable_second.jpg",
+            first_frame_id=6,
+            second_frame_id=7,
+            first_frame_index=6,
+            second_frame_index=7,
+            first_timestamp_ns=7_000_000_000,
+            second_timestamp_ns=8_000_000_000,
+            raw_matches=400,
+            verified_matches=300,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "database.db"
+            qvec = np.asarray(
+                [1.0, 0.0, 0.0, 0.0], dtype="<f8"
+            ).tobytes()
+            geometry = {
+                high_matches.pair_id: {
+                    "configuration": 2,
+                    "qvec": qvec,
+                    "tvec": np.asarray(
+                        [1.0, 0.0, 0.1], dtype="<f8"
+                    ).tobytes(),
+                },
+                stable.pair_id: {
+                    "configuration": 2,
+                    "qvec": qvec,
+                    "tvec": np.asarray(
+                        [0.4, 0.0, 0.9], dtype="<f8"
+                    ).tobytes(),
+                },
+            }
+            with sqlite3.connect(database) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE cameras(
+                      camera_id INTEGER PRIMARY KEY, model INTEGER,
+                      width INTEGER, height INTEGER, params BLOB,
+                      prior_focal_length INTEGER);
+                    CREATE TABLE images(
+                      image_id INTEGER PRIMARY KEY, name TEXT,
+                      camera_id INTEGER);
+                    CREATE TABLE keypoints(
+                      image_id INTEGER PRIMARY KEY, rows INTEGER,
+                      cols INTEGER, data BLOB);
+                    CREATE TABLE two_view_geometries(
+                      pair_id INTEGER PRIMARY KEY, rows INTEGER,
+                      cols INTEGER, data BLOB, config INTEGER,
+                      F BLOB, E BLOB, H BLOB, qvec BLOB, tvec BLOB);
+                    """
+                )
+                parameters = np.asarray(
+                    [10.0, 10.0, 8.0, 6.0], dtype="<f8"
+                ).tobytes()
+                connection.execute(
+                    "INSERT INTO cameras VALUES(1, 1, 16, 12, ?, 1)",
+                    (parameters,),
+                )
+                for candidate, second_x in (
+                    (high_matches, 4.0),
+                    (stable, 10.0),
+                ):
+                    count = int(candidate.verified_matches or 0)
+                    for image_id, name, x in (
+                        (
+                            candidate.first_image_id,
+                            candidate.first_image_name,
+                            4.0,
+                        ),
+                        (
+                            candidate.second_image_id,
+                            candidate.second_image_name,
+                            second_x,
+                        ),
+                    ):
+                        points = np.tile(
+                            np.asarray([[x, 6.0]], dtype="<f4"),
+                            (count, 1),
+                        )
+                        connection.execute(
+                            "INSERT INTO images VALUES(?, ?, 1)",
+                            (image_id, name),
+                        )
+                        connection.execute(
+                            "INSERT INTO keypoints VALUES(?, ?, 2, ?)",
+                            (image_id, count, points.tobytes()),
+                        )
+                    matches = np.column_stack(
+                        (
+                            np.arange(count, dtype="<u4"),
+                            np.arange(count, dtype="<u4"),
+                        )
+                    ).tobytes()
+                    record = geometry[candidate.pair_id]
+                    connection.execute(
+                        "INSERT INTO two_view_geometries VALUES"
+                        "(?, ?, 2, ?, 2, NULL, NULL, NULL, ?, ?)",
+                        (
+                            candidate.pair_id,
+                            count,
+                            matches,
+                            record["qvec"],
+                            record["tvec"],
+                        ),
+                    )
+            selected = _select_initial_pair_v3(
+                [high_matches, stable],
+                list(range(12)),
+                [
+                    high_matches.first_image_name,
+                    high_matches.second_image_name,
+                    stable.first_image_name,
+                    stable.second_image_name,
+                ],
+                GeodeticSubmapConfig(),
+                {
+                    "_database_path": str(database),
+                    "initial_geometry_by_pair_id": geometry,
+                },
+            )
+        self.assertEqual(selected["pair_id"], stable.pair_id)
+        self.assertGreater(
+            selected["sealed_parallax_evidence"]["median_angle_deg"], 20.0
+        )
+        self.assertNotIn("finished_visual_model_pose", selected["score"])
 
 
 class GeodeticTrajectoryGateTests(unittest.TestCase):

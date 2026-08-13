@@ -43,7 +43,7 @@ from rtk_splat.backends.geodetic_submap import (
     _plan_context,
     _raw_gnss_endpoints,
     _selection_payload,
-    _select_initial_pair,
+    _select_initial_pair_for_method,
     _selected_rows,
     audited_geodetic_submap_result,
     create_geodetic_frame_selection,
@@ -267,6 +267,8 @@ def _build_window_records(
     reader: SegmentReader,
     mapper_config: Any,
     config: GeodeticAssemblyConfig,
+    *,
+    initial_pair_method: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     left_names = [str(row["left_image"]["name"]) for row in rows]
     source_priors = _cartesian_camera_priors(source_database, set(left_names))
@@ -288,7 +290,7 @@ def _build_window_records(
                 "camera": camera,
                 "timestamp_ns": int(row["timestamp_ns"]),
             }
-    all_candidates, _pair_sources = _pair_candidates(
+    all_candidates, pair_sources = _pair_candidates(
         source_database, metadata, endpoints
     )
     starts = _window_starts(
@@ -313,11 +315,13 @@ def _build_window_records(
             if candidate.first_frame_id in frame_id_set
             and candidate.second_frame_id in frame_id_set
         ]
-        initial_pair = _select_initial_pair(
+        initial_pair = _select_initial_pair_for_method(
+            initial_pair_method,
             window_candidates,
             [int(row["frame_id"]) for row in selected],
             calibration,
             config.submap_config,
+            pair_sources,
         )
         for name in calibration:
             roles_by_name[name].append("calibration")
@@ -448,6 +452,7 @@ def prepare_geodetic_assembly_plan(
         reader,
         mapper_config,
         config,
+        initial_pair_method="v3",
     )
     if config.probe_submaps > len(windows):
         raise ArtifactError("probe_submaps exceeds the planned window count")
@@ -468,7 +473,7 @@ def prepare_geodetic_assembly_plan(
         )
         _atomic_json(staging / "global_holdout.json", global_holdout)
         plan_body = {
-            "schema_version": 1,
+            "schema_version": 3,
             "kind": _PLAN_KIND,
             "experimental": True,
             "frontend_artifact": str(frontend),
@@ -523,7 +528,8 @@ def audited_geodetic_assembly_plan(
         raise ArtifactError("geodetic assembly plan inventory changed")
     seal = _verify_file_evidence(root, "plan_seal.json", _PLAN_FILES)
     plan = _json(root / "geodetic_assembly_plan.json")
-    if plan.get("kind") != _PLAN_KIND or plan.get("schema_version") != 1:
+    schema_version = plan.get("schema_version")
+    if plan.get("kind") != _PLAN_KIND or schema_version not in {1, 2, 3}:
         raise ArtifactError("invalid geodetic assembly plan")
     config = _config_from_record_v1(plan.get("config"))
     (
@@ -546,7 +552,12 @@ def audited_geodetic_assembly_plan(
     )
     rows = _selected_rows(manifest, selection["frame_ids"])
     windows, global_holdout = _build_window_records(
-        rows, frontend / "database.db", reader, mapper_config, config
+        rows,
+        frontend / "database.db",
+        reader,
+        mapper_config,
+        config,
+        initial_pair_method={1: "v1", 2: "v2", 3: "v3"}[schema_version],
     )
     recorded_windows = _json(root / "windows.json")
     recorded_holdout = _json(root / "global_holdout.json")
@@ -669,6 +680,13 @@ def prepare_geodetic_assembly_window(
             config=assembly["config_object"].submap_config,
             _verified_input_context=runtime_context,
             _defer_full_reaudit_until_execution=runtime_context is not None,
+            _initial_pair_method=(
+                {
+                    1: "v1",
+                    2: "v2",
+                    3: "v3",
+                }[assembly.get("schema_version")]
+            ),
         )
     split = _json(plan_path / "prior_split.json")
     local_plan = _json(plan_path / "geodetic_submap_plan.json")
