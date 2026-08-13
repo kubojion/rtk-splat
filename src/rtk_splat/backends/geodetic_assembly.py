@@ -452,7 +452,7 @@ def prepare_geodetic_assembly_plan(
         reader,
         mapper_config,
         config,
-        initial_pair_method="v4",
+        initial_pair_method="v5",
     )
     if config.probe_submaps > len(windows):
         raise ArtifactError("probe_submaps exceeds the planned window count")
@@ -473,7 +473,7 @@ def prepare_geodetic_assembly_plan(
         )
         _atomic_json(staging / "global_holdout.json", global_holdout)
         plan_body = {
-            "schema_version": 4,
+            "schema_version": 5,
             "kind": _PLAN_KIND,
             "experimental": True,
             "frontend_artifact": str(frontend),
@@ -529,7 +529,10 @@ def audited_geodetic_assembly_plan(
     seal = _verify_file_evidence(root, "plan_seal.json", _PLAN_FILES)
     plan = _json(root / "geodetic_assembly_plan.json")
     schema_version = plan.get("schema_version")
-    if plan.get("kind") != _PLAN_KIND or schema_version not in {1, 2, 3, 4}:
+    if (
+        plan.get("kind") != _PLAN_KIND
+        or schema_version not in {1, 2, 3, 4, 5}
+    ):
         raise ArtifactError("invalid geodetic assembly plan")
     config = _config_from_record_v1(plan.get("config"))
     (
@@ -562,6 +565,7 @@ def audited_geodetic_assembly_plan(
             2: "v2",
             3: "v3",
             4: "v4",
+            5: "v5",
         }[schema_version],
     )
     recorded_windows = _json(root / "windows.json")
@@ -691,6 +695,7 @@ def prepare_geodetic_assembly_window(
                     2: "v2",
                     3: "v3",
                     4: "v4",
+                    5: "v5",
                 }[assembly.get("schema_version")]
             ),
         )

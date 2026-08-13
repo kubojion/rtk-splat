@@ -1581,6 +1581,108 @@ def _select_initial_pair_v4(
     }
 
 
+def _select_initial_pair_v5(
+    candidates: Sequence[PairCandidate],
+    selected_frame_ids: Sequence[int],
+    calibration_names: Sequence[str],
+    config: GeodeticSubmapConfig,
+    pair_sources: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal one trusted anchor and delegate only its partner to COLMAP.
+
+    Fully automatic initialization can begin inside a held-out temporal block,
+    where the optimizer intentionally has no position priors.  A fully pinned
+    pair is also brittle because COLMAP recomputes its initialization geometry.
+    This policy therefore seals the earlier endpoint of the deterministic v3
+    calibration pair as ``init_image_id1`` and lets the pinned mapper select a
+    compatible second image from the already filtered private database.
+    """
+    source_pair = _select_initial_pair_v3(
+        candidates,
+        selected_frame_ids,
+        calibration_names,
+        config,
+        pair_sources,
+    )
+    partner_pool = _select_initial_pair_v4(candidates, config)
+    anchor_index = min(
+        range(len(source_pair["image_ids"])),
+        key=lambda index: (
+            int(source_pair["selection_indices"][index]),
+            int(source_pair["image_ids"][index]),
+        ),
+    )
+    anchor_name = str(source_pair["image_names"][anchor_index])
+    if anchor_name not in set(calibration_names):
+        raise ArtifactError("sealed initialization anchor is not calibration")
+    return {
+        "schema_version": 5,
+        "method": "deterministic_calibration_anchor_colmap_partner_v5",
+        "selection_owner": {
+            "anchor": "sealed_raw_gnss_two_view_parallax_policy",
+            "second_image": "pinned_colmap_pose_prior_mapper",
+        },
+        "explicit_anchor_image_id": True,
+        "explicit_second_image_id": False,
+        "image_ids": [int(source_pair["image_ids"][anchor_index])],
+        "image_names": [anchor_name],
+        "frame_ids": [int(source_pair["frame_ids"][anchor_index])],
+        "frame_indices": [int(source_pair["frame_indices"][anchor_index])],
+        "selection_indices": [
+            int(source_pair["selection_indices"][anchor_index])
+        ],
+        "cameras": [str(source_pair["cameras"][anchor_index])],
+        "timestamps_ns": [
+            int(source_pair["timestamps_ns"][anchor_index])
+        ],
+        "anchor_position_prior_role": "calibration",
+        "anchor_position_prior_physically_present": True,
+        "pair_id": int(source_pair["pair_id"]),
+        "source_pair_image_ids": list(source_pair["image_ids"]),
+        "source_pair_image_names": list(source_pair["image_names"]),
+        "source_pair_frame_ids": list(source_pair["frame_ids"]),
+        "source_pair_verified_matches": int(source_pair["verified_matches"]),
+        "source_pair_retention_reason": str(
+            source_pair["pair_retention_reason"]
+        ),
+        "source_pair_raw_gnss_evidence": source_pair["raw_gnss_evidence"],
+        "source_pair_two_view_geometry": source_pair[
+            "sealed_two_view_geometry"
+        ],
+        "source_pair_parallax_evidence": source_pair[
+            "sealed_parallax_evidence"
+        ],
+        "source_pair_score": source_pair["score"],
+        "required_boundary_margin_frames": int(
+            source_pair["required_boundary_margin_frames"]
+        ),
+        "actual_boundary_margin_frames": int(
+            source_pair["actual_boundary_margin_frames"]
+        ),
+        "eligible_anchor_source_pair_count": int(
+            source_pair["eligible_candidate_count"]
+        ),
+        "robust_anchor_source_pair_count": int(
+            source_pair["robust_candidate_count"]
+        ),
+        "required_verified_matches": int(
+            partner_pool["required_verified_matches"]
+        ),
+        "candidate_pair_count": int(partner_pool["candidate_pair_count"]),
+        "candidate_pair_records_sha256": str(
+            partner_pool["candidate_pair_records_sha256"]
+        ),
+        "candidate_pool": partner_pool["candidate_pool"],
+        "random_seed": config.refinement.random_seed,
+        "heldout_position_priors_available_to_selector": False,
+        "decision_inputs_exclude": [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+
+
 def _select_initial_pair_for_method(
     method: str,
     candidates: Sequence[PairCandidate],
@@ -1611,6 +1713,14 @@ def _select_initial_pair_for_method(
         )
     if method == "v4":
         return _select_initial_pair_v4(candidates, config)
+    if method == "v5":
+        return _select_initial_pair_v5(
+            candidates,
+            selected_frame_ids,
+            calibration_names,
+            config,
+            pair_sources,
+        )
     raise ArtifactError(f"unsupported initial-pair method: {method}")
 
 
@@ -2551,7 +2661,7 @@ def prepare_geodetic_submap_plan(
         raise ArtifactError("cached geodetic input context path changed")
     if _defer_full_reaudit_until_execution and _verified_input_context is None:
         raise ArtifactError("deferred re-audit requires a verified input context")
-    if _initial_pair_method not in {"v1", "v2", "v3", "v4"}:
+    if _initial_pair_method not in {"v1", "v2", "v3", "v4", "v5"}:
         raise ArtifactError("unsupported initial-pair method")
     selection_path, selection = _load_frame_selection(
         frame_selection, frontend, segment_path, manifest
@@ -2637,6 +2747,14 @@ def prepare_geodetic_submap_plan(
             raise ArtifactError(
                 "sealed initial pair lacks private verified geometry evidence"
             )
+        if (
+            _initial_pair_method == "v5"
+            and initial_pair["image_names"][0]
+            not in inventory["calibration_prior_names"]
+        ):
+            raise ArtifactError(
+                "sealed initialization anchor lacks a private position prior"
+            )
         calibration = _calibration_contract(
             staging / "database.db",
             source,
@@ -2699,9 +2817,12 @@ def prepare_geodetic_submap_plan(
             "optimizer_contract": {
                 "implementation": "existing_rtk_refinement_pose_prior_mapper",
                 "initialization_mode": "fresh",
-                "sealed_initial_pair": _initial_pair_method != "v4",
+                "sealed_initial_pair": _initial_pair_method
+                in {"v1", "v2", "v3"},
+                "sealed_initial_anchor": _initial_pair_method == "v5",
                 "sealed_initialization_policy": True,
                 "colmap_auto_initial_pair": _initial_pair_method == "v4",
+                "colmap_auto_second_image": _initial_pair_method == "v5",
                 "position_priors": "raw_gnss_covariance_status_weighted",
                 "heldout_priors_physically_absent": True,
                 "fixed_stereo_rig": True,
@@ -2879,6 +3000,7 @@ def _plan_context(
             "deterministic_interior_raw_gnss_two_view_seed_v2": "v2",
             "deterministic_interior_raw_gnss_two_view_parallax_seed_v3": "v3",
             "deterministic_colmap_auto_filtered_database_v4": "v4",
+            "deterministic_calibration_anchor_colmap_partner_v5": "v5",
         }.get(str(plan.get("initial_pair", {}).get("method", "")))
         if initial_pair_method is None:
             raise ArtifactError("optimizer initial-pair method changed")
@@ -2898,6 +3020,14 @@ def _plan_context(
             not in inventory.get("geometry_pair_ids", ())
         ):
             raise ArtifactError("sealed mapper initial pair has no geometry")
+        if (
+            initial_pair_method == "v5"
+            and expected_initial_pair["image_names"][0]
+            not in inventory.get("calibration_prior_names", ())
+        ):
+            raise ArtifactError(
+                "sealed initialization anchor has no private position prior"
+            )
     calibration = plan.get("calibration_contract")
     if not isinstance(calibration, Mapping):
         raise ArtifactError("geodetic plan has no calibration contract")
@@ -2938,15 +3068,28 @@ def _plan_context(
         raise ArtifactError("optimizer contract changed")
     if not legacy_schema:
         auto_initialization = initial_pair_method == "v4"
+        anchored_initialization = initial_pair_method == "v5"
         if auto_initialization and (
             optimizer.get("sealed_initialization_policy") is not True
             or optimizer.get("sealed_initial_pair") is not False
             or optimizer.get("colmap_auto_initial_pair") is not True
+            or optimizer.get("sealed_initial_anchor") not in {None, False}
+            or optimizer.get("colmap_auto_second_image") not in {None, False}
         ):
             raise ArtifactError("optimizer initial-pair contract changed")
-        if not auto_initialization and (
+        if anchored_initialization and (
+            optimizer.get("sealed_initial_pair") is not False
+            or optimizer.get("sealed_initial_anchor") is not True
+            or optimizer.get("colmap_auto_initial_pair") is not False
+            or optimizer.get("colmap_auto_second_image") is not True
+            or optimizer.get("sealed_initialization_policy") is not True
+        ):
+            raise ArtifactError("optimizer initial-pair contract changed")
+        if not auto_initialization and not anchored_initialization and (
             optimizer.get("sealed_initial_pair") is not True
             or optimizer.get("colmap_auto_initial_pair") not in {None, False}
+            or optimizer.get("sealed_initial_anchor") not in {None, False}
+            or optimizer.get("colmap_auto_second_image") not in {None, False}
             or optimizer.get("sealed_initialization_policy") not in {None, True}
         ):
             raise ArtifactError("optimizer initial-pair contract changed")
@@ -3006,9 +3149,12 @@ def _verify_mapper_command(
         "--Mapper.ba_refine_sensor_from_rig": "0",
         "--Mapper.ba_use_gpu": "0",
     }
+    method = initial_pair.get("method")
     auto_initialization = (
-        initial_pair.get("method")
-        == "deterministic_colmap_auto_filtered_database_v4"
+        method == "deterministic_colmap_auto_filtered_database_v4"
+    )
+    anchored_initialization = (
+        method == "deterministic_calibration_anchor_colmap_partner_v5"
     )
     if auto_initialization:
         if any(
@@ -3021,6 +3167,14 @@ def _verify_mapper_command(
             raise ArtifactError(
                 "COLMAP auto-initialization command pins an image pair"
             )
+    elif anchored_initialization:
+        if "--Mapper.init_image_id2" in command:
+            raise ArtifactError(
+                "calibration-anchored command pins COLMAP's second image"
+            )
+        expected["--Mapper.init_image_id1"] = str(
+            initial_pair["image_ids"][0]
+        )
     else:
         expected.update(
             {
@@ -3068,10 +3222,13 @@ def _build_geodetic_submap_command_from_context(
     command = _rtk_refinement_command(
         execution, plan, config.refinement, colmap
     )
-    if (
-        plan["initial_pair"].get("method")
-        != "deterministic_colmap_auto_filtered_database_v4"
-    ):
+    initial_method = plan["initial_pair"].get("method")
+    if initial_method == "deterministic_calibration_anchor_colmap_partner_v5":
+        command += (
+            "--Mapper.init_image_id1",
+            str(plan["initial_pair"]["image_ids"][0]),
+        )
+    elif initial_method != "deterministic_colmap_auto_filtered_database_v4":
         command += (
             "--Mapper.init_image_id1",
             str(plan["initial_pair"]["image_ids"][0]),

@@ -28,6 +28,7 @@ from rtk_splat.backends.geodetic_submap import (
     _plan_context,
     _select_initial_pair_v2,
     _select_initial_pair_v3,
+    _select_initial_pair_v5,
     _similarity_scale,
     build_geodetic_submap_command,
     create_geodetic_frame_selection,
@@ -822,6 +823,10 @@ class GeodeticPairPolicyTests(unittest.TestCase):
                             record["tvec"],
                         ),
                     )
+            pair_sources = {
+                "_database_path": str(database),
+                "initial_geometry_by_pair_id": geometry,
+            }
             selected = _select_initial_pair_v3(
                 [high_matches, stable],
                 list(range(12)),
@@ -832,16 +837,35 @@ class GeodeticPairPolicyTests(unittest.TestCase):
                     stable.second_image_name,
                 ],
                 GeodeticSubmapConfig(),
-                {
-                    "_database_path": str(database),
-                    "initial_geometry_by_pair_id": geometry,
-                },
+                pair_sources,
+            )
+            anchored = _select_initial_pair_v5(
+                [high_matches, stable],
+                list(range(12)),
+                [
+                    high_matches.first_image_name,
+                    high_matches.second_image_name,
+                    stable.first_image_name,
+                    stable.second_image_name,
+                ],
+                GeodeticSubmapConfig(),
+                pair_sources,
             )
         self.assertEqual(selected["pair_id"], stable.pair_id)
         self.assertGreater(
             selected["sealed_parallax_evidence"]["median_angle_deg"], 20.0
         )
         self.assertNotIn("finished_visual_model_pose", selected["score"])
+        self.assertEqual(anchored["image_ids"], [stable.first_image_id])
+        self.assertEqual(
+            anchored["anchor_position_prior_role"], "calibration"
+        )
+        self.assertTrue(anchored["anchor_position_prior_physically_present"])
+        self.assertFalse(anchored["explicit_second_image_id"])
+        self.assertEqual(
+            anchored["source_pair_image_ids"],
+            [stable.first_image_id, stable.second_image_id],
+        )
 
 
 class GeodeticTrajectoryGateTests(unittest.TestCase):
@@ -1351,7 +1375,7 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
         # run-all uses spawned worker processes because the mapper's resource
         # monitor owns process-level signal handlers.
         pickle.loads(pickle.dumps(runtime["_runtime_context"]))
-        self.assertEqual(audited["schema_version"], 4)
+        self.assertEqual(audited["schema_version"], 5)
         self.assertEqual(len(audited["windows"]), 2)
         self.assertEqual(
             sorted(
@@ -1377,15 +1401,36 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             command = build_geodetic_submap_command(
                 prepared["plan"], root / "command-audit", colmap
             )
-            self.assertNotIn("--Mapper.init_image_id1", command)
+            self.assertEqual(
+                _option(command, "--Mapper.init_image_id1"),
+                str(local_plan["initial_pair"]["image_ids"][0]),
+            )
             self.assertNotIn("--Mapper.init_image_id2", command)
             self.assertEqual(
                 local_plan["initial_pair"]["method"],
-                "deterministic_colmap_auto_filtered_database_v4",
+                "deterministic_calibration_anchor_colmap_partner_v5",
             )
-            self.assertFalse(
-                local_plan["initial_pair"]["explicit_image_ids"]
+            self.assertTrue(
+                local_plan["initial_pair"][
+                    "anchor_position_prior_physically_present"
+                ]
             )
+            self.assertIn(
+                local_plan["initial_pair"]["image_names"][0],
+                window["calibration_names"],
+            )
+            database_uri = (
+                f"file:{Path(prepared['plan']) / 'database.db'}"
+                "?mode=ro&immutable=1"
+            )
+            with sqlite3.connect(database_uri, uri=True) as db:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT COUNT(*) FROM pose_priors WHERE corr_data_id=?",
+                        (local_plan["initial_pair"]["image_ids"][0],),
+                    ).fetchone()[0],
+                    1,
+                )
             runner = _Runner(list(local_plan["selected_image_names"]))
             result = run_geodetic_submap_plan(
                 prepared["plan"], prepared["result"], colmap, runner=runner
