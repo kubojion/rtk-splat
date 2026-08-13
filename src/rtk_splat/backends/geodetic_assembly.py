@@ -736,10 +736,16 @@ def _atomic_save_npy(path: Path, value: np.ndarray) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _aligned_submap_candidate(result_artifact: str | Path) -> dict[str, Any]:
+def _aligned_submap_candidate(
+    result_artifact: str | Path,
+    *,
+    _verified_input_context: tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
     """Load one accepted result and reproduce its calibration-only SE(3)."""
     result = audited_geodetic_submap_result(
-        result_artifact, _include_internal_plan_context=True
+        result_artifact,
+        _include_internal_plan_context=True,
+        _verified_input_context=_verified_input_context,
     )
     if not result.get("passed") or not result.get("publication_eligible"):
         raise ArtifactError("submap result did not pass its acceptance gates")
@@ -1300,7 +1306,23 @@ def publish_geodetic_overlap_report(
     *,
     policy: GeodeticOverlapPolicy = GeodeticOverlapPolicy(),
 ) -> Path:
-    candidates = [_aligned_submap_candidate(path) for path in result_artifacts]
+    if not result_artifacts:
+        raise ArtifactError("overlap report requires submap results")
+    first_result = Path(result_artifacts[0]).expanduser().resolve()
+    first_record = _json(first_result / "geodetic_submap_result.json")
+    first_plan = Path(str(first_record.get("plan_artifact", ""))).resolve()
+    first_plan_record = _json(first_plan / "geodetic_submap_plan.json")
+    shared_input_context = _input_context(
+        first_plan_record.get("frontend_artifact", ""),
+        first_plan_record.get("completed_backend", ""),
+        first_plan_record.get("segment", ""),
+    )
+    candidates = [
+        _aligned_submap_candidate(
+            path, _verified_input_context=shared_input_context
+        )
+        for path in result_artifacts
+    ]
     report = _evaluate_overlap_candidates(candidates, policy)
     output = Path(destination).expanduser().resolve()
     for candidate in candidates:
@@ -1430,14 +1452,20 @@ def _blend_candidates(
 
 
 def _load_assembly_candidates(
-    assembly: Mapping[str, Any], submaps_root: Path
+    assembly: Mapping[str, Any],
+    submaps_root: Path,
+    *,
+    _verified_input_context: tuple[Any, ...] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     global_holdout = set(assembly["global_holdout"]["holdout_names"])
     for window in assembly["windows"]:
         workspace = submaps_root / window["window_id"]
         result_path = workspace / "result"
-        candidate = _aligned_submap_candidate(result_path)
+        candidate = _aligned_submap_candidate(
+            result_path,
+            _verified_input_context=_verified_input_context,
+        )
         if candidate["frame_ids"].astype(int).tolist() != window["frame_ids"]:
             raise ArtifactError(
                 f"{window['window_id']} result has the wrong frame inventory"
@@ -1525,9 +1553,15 @@ def publish_geodetic_full_pose_artifact(
     """Blend every accepted window and publish one modern production pose."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         raise ValueError(f"invalid pose artifact name: {name!r}")
-    assembly = audited_geodetic_assembly_plan(assembly_plan)
+    assembly = audited_geodetic_assembly_plan(
+        assembly_plan, _include_runtime_context=True
+    )
     root = Path(submaps_root).expanduser().resolve()
-    candidates = _load_assembly_candidates(assembly, root)
+    candidates = _load_assembly_candidates(
+        assembly,
+        root,
+        _verified_input_context=assembly["_runtime_context"],
+    )
     overlap = _evaluate_overlap_candidates(
         candidates, assembly["config_object"].overlap_policy
     )
@@ -1541,11 +1575,7 @@ def publish_geodetic_full_pose_artifact(
         segment,
         reader,
         source_evidence,
-    ) = _input_context(
-        assembly["frontend_artifact"],
-        assembly["completed_backend"],
-        assembly["segment"],
-    )
+    ) = assembly["_runtime_context"]
     _, selection = _load_frame_selection(
         Path(assembly["artifact"]) / "frame_selection.json",
         frontend,
@@ -1825,7 +1855,9 @@ def audited_geodetic_full_pose_artifact(
         root, expected_name=root.name
     )
     provenance = _json(root / "provenance.json")
-    assembly = audited_geodetic_assembly_plan(provenance["assembly_plan"])
+    assembly = audited_geodetic_assembly_plan(
+        provenance["assembly_plan"], _include_runtime_context=True
+    )
     if (
         assembly["plan_seal_sha256"]
         != provenance.get("assembly_plan_seal_sha256")
@@ -1841,11 +1873,7 @@ def audited_geodetic_full_pose_artifact(
         segment,
         _reader,
         _source_evidence,
-    ) = _input_context(
-        assembly["frontend_artifact"],
-        assembly["completed_backend"],
-        assembly["segment"],
-    )
+    ) = assembly["_runtime_context"]
     _, selection = _load_frame_selection(
         Path(assembly["artifact"]) / "frame_selection.json",
         frontend,
@@ -1856,7 +1884,11 @@ def audited_geodetic_full_pose_artifact(
     if not provenance.get("submap_results"):
         raise ArtifactError("full pose provenance has no submap results")
     submaps_root = Path(provenance["submap_results"][0]["artifact"]).parent.parent
-    candidates = _load_assembly_candidates(assembly, submaps_root)
+    candidates = _load_assembly_candidates(
+        assembly,
+        submaps_root,
+        _verified_input_context=assembly["_runtime_context"],
+    )
     recorded_results = {
         str(item["artifact"]): item
         for item in provenance.get("submap_results", [])

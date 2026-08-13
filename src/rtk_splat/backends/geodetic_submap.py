@@ -3706,6 +3706,7 @@ def audited_geodetic_submap_result(
     *,
     _include_internal_plan_context: bool = False,
     _verified_plan_context: tuple[Any, ...] | None = None,
+    _verified_input_context: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
     """Verify and load an atomically published experimental result."""
     root = Path(result_artifact).expanduser().resolve()
@@ -3727,8 +3728,16 @@ def audited_geodetic_submap_result(
     if result.get("kind") != _RESULT_KIND:
         raise ArtifactError("invalid geodetic submap result")
     plan_artifact = Path(str(result.get("plan_artifact", ""))).resolve()
+    if (
+        _verified_plan_context is not None
+        and _verified_input_context is not None
+    ):
+        raise ArtifactError("result audit received conflicting cached contexts")
     plan_context = (
-        _plan_context(plan_artifact)
+        _plan_context(
+            plan_artifact,
+            _verified_input_context=_verified_input_context,
+        )
         if _verified_plan_context is None
         else _verified_plan_context
     )
