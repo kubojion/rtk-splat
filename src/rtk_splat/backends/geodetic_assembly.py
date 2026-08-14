@@ -45,6 +45,7 @@ from rtk_splat.backends.geodetic_submap import (
     _selection_payload,
     _select_initial_pair_for_method,
     _selected_rows,
+    _temporally_filtered_gnss,
     audited_geodetic_submap_result,
     create_geodetic_frame_selection,
     prepare_geodetic_submap_plan,
@@ -173,7 +174,9 @@ def _config_record_v1(config: GeodeticAssemblyConfig) -> dict[str, Any]:
     return asdict(config)
 
 
-def _config_from_record_v1(value: Any) -> GeodeticAssemblyConfig:
+def _config_from_record_v1(
+    value: Any, *, legacy_temporal_policy: bool = False
+) -> GeodeticAssemblyConfig:
     if not isinstance(value, Mapping):
         raise ArtifactError("geodetic assembly config must be an object")
     try:
@@ -188,7 +191,10 @@ def _config_from_record_v1(value: Any) -> GeodeticAssemblyConfig:
             trajectory_policy=GeodeticTrajectoryPolicy(
                 **dict(value["trajectory_policy"])
             ),
-            submap_config=_config_from_record(value["submap_config"]),
+            submap_config=_config_from_record(
+                value["submap_config"],
+                legacy_temporal_policy=legacy_temporal_policy,
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ArtifactError("invalid geodetic assembly config") from exc
@@ -196,6 +202,8 @@ def _config_from_record_v1(value: Any) -> GeodeticAssemblyConfig:
     normalized["submap_config"]["position_quality_weights"] = [
         list(item) for item in config.submap_config.position_quality_weights
     ]
+    if legacy_temporal_policy:
+        normalized["submap_config"].pop("gnss_temporal_policy")
     if normalized != dict(value):
         raise ArtifactError("geodetic assembly config schema changed")
     return config
@@ -269,10 +277,22 @@ def _build_window_records(
     config: GeodeticAssemblyConfig,
     *,
     initial_pair_method: str,
+    apply_temporal_filter: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     left_names = [str(row["left_image"]["name"]) for row in rows]
     source_priors = _cartesian_camera_priors(source_database, set(left_names))
-    endpoints = _raw_gnss_endpoints(reader)
+    if apply_temporal_filter:
+        endpoints, gnss_records, gnss_temporal_audit = (
+            _temporally_filtered_gnss(
+                reader,
+                config.submap_config.gnss_temporal_policy,
+                [int(row["frame_id"]) for row in rows],
+            )
+        )
+    else:
+        endpoints = _raw_gnss_endpoints(reader)
+        gnss_records = {}
+        gnss_temporal_audit = None
     frame_index = {
         int(frame_id): index
         for index, frame_id in enumerate(reader.frames["frame_id"].astype(int))
@@ -329,26 +349,35 @@ def _build_window_records(
             roles_by_name[name].append("holdout")
         frame_ids = [int(row["frame_id"]) for row in selected]
         names = [str(row["left_image"]["name"]) for row in selected]
-        windows.append(
-            {
-                "schema_version": 1,
-                "window_id": f"submap-{ordinal:04d}",
-                "ordinal": ordinal,
-                "selection_start": start,
-                "selection_stop_exclusive": stop,
-                "frame_ids": frame_ids,
-                "frame_ids_sha256": canonical_hash(frame_ids),
-                "left_image_names_sha256": canonical_hash(names),
-                "first_timestamp_ns": int(selected[0]["timestamp_ns"]),
-                "last_timestamp_ns": int(selected[-1]["timestamp_ns"]),
-                "calibration_names": calibration,
-                "holdout_names": holdout,
-                "block_id_by_eligible_name": block_by_name,
-                "n_calibration": len(calibration),
-                "n_holdout": len(holdout),
-                "initial_pair": initial_pair,
-            }
-        )
+        window_record = {
+            "schema_version": 1,
+            "window_id": f"submap-{ordinal:04d}",
+            "ordinal": ordinal,
+            "selection_start": start,
+            "selection_stop_exclusive": stop,
+            "frame_ids": frame_ids,
+            "frame_ids_sha256": canonical_hash(frame_ids),
+            "left_image_names_sha256": canonical_hash(names),
+            "first_timestamp_ns": int(selected[0]["timestamp_ns"]),
+            "last_timestamp_ns": int(selected[-1]["timestamp_ns"]),
+            "calibration_names": calibration,
+            "holdout_names": holdout,
+            "block_id_by_eligible_name": block_by_name,
+            "n_calibration": len(calibration),
+            "n_holdout": len(holdout),
+            "initial_pair": initial_pair,
+        }
+        if apply_temporal_filter:
+            eligible_names = set(calibration) | set(holdout)
+            window_record["excluded_names"] = [
+                str(row["left_image"]["name"])
+                for row in selected
+                if str(row["left_image"]["name"]) not in eligible_names
+            ]
+            window_record["n_excluded"] = len(
+                window_record["excluded_names"]
+            )
+        windows.append(window_record)
     global_holdout = [
         name
         for name in left_names
@@ -365,7 +394,7 @@ def _build_window_records(
         for name in left_names
         if name not in global_holdout and name not in global_calibration
     ]
-    if excluded:
+    if excluded and not apply_temporal_filter:
         raise ArtifactError(
             "full assembly requires a trusted raw-GNSS position prior for "
             f"every selected frame; missing {len(excluded)}"
@@ -392,6 +421,52 @@ def _build_window_records(
             {name: roles_by_name.get(name, []) for name in left_names}
         ),
     }
+    if apply_temporal_filter:
+        row_by_name = {
+            str(row["left_image"]["name"]): row for row in rows
+        }
+        exclusion_records = []
+        weights = dict(config.submap_config.position_quality_weights)
+        for name in excluded:
+            row = row_by_name[name]
+            frame_id = int(row["frame_id"])
+            endpoint = endpoints[frame_id]
+            temporal = gnss_records[frame_id]
+            if not temporal["retained_by_temporal_filter"]:
+                reason = temporal["reason"]
+            elif endpoint.trusted_std_m() is None:
+                reason = "raw_gnss_status_or_covariance_untrusted"
+            elif float(weights.get(endpoint.position_quality, 0.0)) <= 0.0:
+                reason = "raw_gnss_quality_weight_zero"
+            elif name not in source_priors:
+                raise ArtifactError(
+                    "full assembly requires a source position-prior row for "
+                    f"every selected left image: {name}"
+                )
+            else:
+                raise ArtifactError(
+                    "selected GNSS observation has no auditable assembly role: "
+                    f"{name}"
+                )
+            exclusion_records.append(
+                {
+                    "name": name,
+                    "frame_id": frame_id,
+                    "reason": reason,
+                    "gnss_temporal_filter": temporal,
+                }
+            )
+        global_record.update(
+            {
+                "schema_version": 2,
+                "method": (
+                    "raw_temporal_filter_then_intersection_of_local_"
+                    "temporal_holdouts_v2"
+                ),
+                "gnss_temporal_audit": gnss_temporal_audit,
+                "excluded_observation_records": exclusion_records,
+            }
+        )
     if len(global_holdout) < 1 or len(global_calibration) < 3:
         raise ArtifactError("assembly split lacks calibration or holdout support")
     return windows, global_record
@@ -453,6 +528,7 @@ def prepare_geodetic_assembly_plan(
         mapper_config,
         config,
         initial_pair_method="v5",
+        apply_temporal_filter=True,
     )
     if config.probe_submaps > len(windows):
         raise ArtifactError("probe_submaps exceeds the planned window count")
@@ -473,7 +549,7 @@ def prepare_geodetic_assembly_plan(
         )
         _atomic_json(staging / "global_holdout.json", global_holdout)
         plan_body = {
-            "schema_version": 5,
+            "schema_version": 6,
             "kind": _PLAN_KIND,
             "experimental": True,
             "frontend_artifact": str(frontend),
@@ -490,6 +566,9 @@ def prepare_geodetic_assembly_plan(
             "windows_sha256": sha256_file(staging / "windows.json"),
             "global_holdout_sha256": sha256_file(
                 staging / "global_holdout.json"
+            ),
+            "gnss_temporal_audit_sha256": canonical_hash(
+                global_holdout["gnss_temporal_audit"]
             ),
             "selected_frame_count": len(rows),
             "selected_frame_ids_sha256": canonical_hash(
@@ -531,10 +610,12 @@ def audited_geodetic_assembly_plan(
     schema_version = plan.get("schema_version")
     if (
         plan.get("kind") != _PLAN_KIND
-        or schema_version not in {1, 2, 3, 4, 5}
+        or schema_version not in {1, 2, 3, 4, 5, 6}
     ):
         raise ArtifactError("invalid geodetic assembly plan")
-    config = _config_from_record_v1(plan.get("config"))
+    config = _config_from_record_v1(
+        plan.get("config"), legacy_temporal_policy=schema_version < 6
+    )
     (
         frontend,
         manifest,
@@ -566,7 +647,9 @@ def audited_geodetic_assembly_plan(
             3: "v3",
             4: "v4",
             5: "v5",
+            6: "v5",
         }[schema_version],
+        apply_temporal_filter=schema_version >= 6,
     )
     recorded_windows = _json(root / "windows.json")
     recorded_holdout = _json(root / "global_holdout.json")
@@ -585,6 +668,9 @@ def audited_geodetic_assembly_plan(
         plan.get("window_count") == len(windows),
         recorded_windows == {"schema_version": 1, "windows": windows},
         recorded_holdout == global_holdout,
+        schema_version < 6
+        or plan.get("gnss_temporal_audit_sha256")
+        == canonical_hash(global_holdout["gnss_temporal_audit"]),
         digest == canonical_hash(body),
     )
     if not all(checks):
@@ -696,6 +782,7 @@ def prepare_geodetic_assembly_window(
                     3: "v3",
                     4: "v4",
                     5: "v5",
+                    6: "v5",
                 }[assembly.get("schema_version")]
             ),
         )
@@ -704,6 +791,17 @@ def prepare_geodetic_assembly_window(
     if (
         split.get("calibration_names") != window["calibration_names"]
         or split.get("holdout_names") != window["holdout_names"]
+        or (
+            assembly.get("schema_version", 1) >= 6
+            and [
+                str(name)
+                for name in local_plan.get("selected_left_image_names", [])
+                if name
+                not in set(split.get("calibration_names", []))
+                | set(split.get("holdout_names", []))
+            ]
+            != window["excluded_names"]
+        )
         or local_plan.get("initial_pair") != window["initial_pair"]
     ):
         raise ArtifactError(
@@ -1470,6 +1568,7 @@ def _load_assembly_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     global_holdout = set(assembly["global_holdout"]["holdout_names"])
+    globally_excluded = set(assembly["global_holdout"]["excluded_names"])
     for window in assembly["windows"]:
         workspace = submaps_root / window["window_id"]
         result_path = workspace / "result"
@@ -1490,12 +1589,20 @@ def _load_assembly_candidates(
             )
         names = set(candidate["left_image_names"])
         required_absent = global_holdout & names
+        rejected_absent = globally_excluded & names
         if (
             not required_absent <= set(candidate["holdout_names"])
             or required_absent & set(candidate["calibration_names"])
         ):
             raise ArtifactError(
                 f"{window['window_id']} consumed a global held-out prior"
+            )
+        if rejected_absent & (
+            set(candidate["calibration_names"])
+            | set(candidate["holdout_names"])
+        ):
+            raise ArtifactError(
+                f"{window['window_id']} consumed a rejected GNSS observation"
             )
         binding = _json(workspace / "window_binding.json")
         if (
@@ -1608,6 +1715,13 @@ def publish_geodetic_full_pose_artifact(
     names = [str(row["left_image"]["name"]) for row in rows]
     priors = _cartesian_camera_priors(frontend / "database.db", set(names))
     holdout_names = list(assembly["global_holdout"]["holdout_names"])
+    excluded_set = set(assembly["global_holdout"]["excluded_names"])
+    missing_eligible_priors = sorted(set(names) - set(priors) - excluded_set)
+    if missing_eligible_priors:
+        raise ArtifactError(
+            "assembled eligible frames lack source position priors: "
+            f"{missing_eligible_priors[:8]}"
+        )
     holdout_quality, holdout_detail = _direct_rtk_evaluation(
         centers, names, priors, holdout_names, mapper_config
     )
@@ -1621,7 +1735,12 @@ def publish_geodetic_full_pose_artifact(
         for index, frame_id in enumerate(reader.frames["frame_id"].astype(int))
     }
     prior_centers = np.stack(
-        [np.asarray(priors[name][0], dtype=np.float64) for name in names]
+        [
+            np.asarray(priors[name][0], dtype=np.float64)
+            if name in priors
+            else np.full(3, np.nan, dtype=np.float64)
+            for name in names
+        ]
     )
     raw_centers = np.stack(
         [
@@ -1634,7 +1753,14 @@ def publish_geodetic_full_pose_artifact(
             for row in rows
         ]
     )
-    all_covariance = np.stack([priors[name][1] for name in names])
+    all_covariance = np.stack(
+        [
+            priors[name][1]
+            if name in priors
+            else np.eye(3, dtype=np.float64)
+            for name in names
+        ]
+    )
     all_sigma = np.sqrt(
         np.maximum(np.linalg.eigvalsh(all_covariance)[:, -1], 1.0e-8)
     )
@@ -1643,11 +1769,26 @@ def publish_geodetic_full_pose_artifact(
     )
     all_inliers = np.linalg.norm(centers - prior_centers, axis=1) <= all_thresholds
     holdout_set = set(holdout_names)
-    roles = ["holdout" if name in holdout_set else "calibration" for name in names]
+    roles = [
+        "excluded"
+        if name in excluded_set
+        else "holdout"
+        if name in holdout_set
+        else "calibration"
+        for name in names
+    ]
+    trajectory_prior_centers = prior_centers.copy()
+    trajectory_raw_centers = raw_centers.copy()
+    excluded_mask = np.asarray(
+        [name in excluded_set for name in names], dtype=bool
+    )
+    trajectory_prior_centers[excluded_mask] = np.nan
+    trajectory_raw_centers[excluded_mask] = np.nan
+    all_inliers[excluded_mask] = False
     trajectory = _full_trajectory_quality(
         centers,
-        prior_centers,
-        raw_centers,
+        trajectory_prior_centers,
+        trajectory_raw_centers,
         roles,
         all_inliers,
         names,
@@ -1683,6 +1824,16 @@ def publish_geodetic_full_pose_artifact(
         <= set(candidate["holdout_names"])
         for candidate in candidates
     )
+    temporal_nonleakage = all(
+        not (
+            excluded_set
+            & (
+                set(candidate["calibration_names"])
+                | set(candidate["holdout_names"])
+            )
+        )
+        for candidate in candidates
+    )
     checks = {
         "all_submaps_passed": {
             "value": all(candidate["result"]["passed"] for candidate in candidates),
@@ -1703,6 +1854,11 @@ def publish_geodetic_full_pose_artifact(
             "value": global_nonleakage,
             "expected": True,
             "passed": global_nonleakage,
+        },
+        "temporally_rejected_gnss_absent_from_every_optimizer": {
+            "value": temporal_nonleakage,
+            "expected": True,
+            "passed": temporal_nonleakage,
         },
         "submap_fixed_calibration_and_baseline": {
             "value": submap_calibration_passed,

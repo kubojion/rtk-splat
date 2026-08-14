@@ -14,6 +14,7 @@ from unittest import mock
 
 import numpy as np
 
+from rtk_splat.backends.geodetic_gnss import GeodeticGnssTemporalPolicy
 from rtk_splat.backends.geodetic_pairs import (
     GeodeticPairPolicy,
     PairCandidate,
@@ -21,10 +22,12 @@ from rtk_splat.backends.geodetic_pairs import (
     decide_pair,
 )
 from rtk_splat.backends.geodetic_submap import (
+    GeodeticInitialPairPolicy,
     GeodeticSubmapConfig,
     GeodeticTrajectoryPolicy,
     _authoritative_checks_pass,
     _full_trajectory_quality,
+    _metric_specific_source_repairs,
     _plan_context,
     _select_initial_pair_v2,
     _select_initial_pair_v3,
@@ -93,10 +96,11 @@ def _positions() -> np.ndarray:
     )
 
 
-def _segment(path: Path) -> Path:
+def _segment(path: Path, positions: np.ndarray | None = None) -> Path:
     writer = SegmentWriter(path)
     images = writer.directory("images")
-    n = len(_positions())
+    centers = _positions() if positions is None else np.asarray(positions)
+    n = len(centers)
     left_paths, right_paths = [], []
     for index in range(n):
         for side, paths in (("left", left_paths), ("right", right_paths)):
@@ -108,7 +112,6 @@ def _segment(path: Path) -> Path:
     timestamps = (
         np.arange(n, dtype=np.int64) * 1_000_000_000 + 1_000_000_000
     )
-    centers = _positions()
     viewmats = np.repeat(np.eye(4)[None], n, axis=0)
     viewmats[:, :3, 3] = -centers
     writer.write_frames(
@@ -215,6 +218,13 @@ def _segment(path: Path) -> Path:
             "carrier_status": np.full(n, 2, dtype=np.int16),
             "position_valid": np.ones(n, dtype=bool),
             "position_quality": np.full(n, "rtk_fixed", dtype="<U16"),
+            "raw_timestamp_ns": timestamps,
+            "raw_enu_m": centers,
+            "raw_effective_covariance_enu_m2": np.repeat(
+                (np.eye(3) * 0.0004)[None], n, axis=0
+            ),
+            "raw_fix_status": np.ones(n, dtype=np.int16),
+            "raw_carrier_status": np.full(n, 2, dtype=np.int16),
         },
     )
     return writer.finalize().root
@@ -225,7 +235,9 @@ def _pair_id(first: int, second: int) -> int:
     return low * 2_147_483_647 + high
 
 
-def _create_database(artifact: Path) -> list[str]:
+def _create_database(
+    artifact: Path, positions: np.ndarray | None = None
+) -> list[str]:
     manifest = json.loads((artifact / "frame_manifest.json").read_text())
     names = [
         str(row[field]["name"])
@@ -316,7 +328,7 @@ def _create_database(artifact: Path) -> list[str]:
         connection.execute(
             "INSERT INTO rig_sensors VALUES(1, 2, 0, ?)", (sensor_pose,)
         )
-        positions = _positions()
+        positions = _positions() if positions is None else np.asarray(positions)
         covariance = np.eye(3, dtype="<f8") * 0.0004
         for frame_index, row in enumerate(manifest["frames"]):
             database_frame_id = frame_index + 1
@@ -429,10 +441,12 @@ class _Runner:
         *,
         fail_pose_mapper: bool = False,
         mutate_pose_mapper_database: bool = False,
+        positions: np.ndarray | None = None,
     ):
         self.names = names
         self.fail_pose_mapper = fail_pose_mapper
         self.mutate_pose_mapper_database = mutate_pose_mapper_database
+        self.positions = _positions() if positions is None else np.asarray(positions)
         self.commands: list[tuple[str, ...]] = []
 
     def __call__(self, command, **_kwargs):
@@ -469,7 +483,7 @@ class _Runner:
             output = Path(_option(command, "--output_path"))
             output.mkdir(exist_ok=True)
             lines = ["# Image list"]
-            positions = _positions()
+            positions = self.positions
             for image_id, name in enumerate(self.names, start=1):
                 frame_id = int(name.split("_")[1].split(".")[0])
                 center = positions[frame_id].copy()
@@ -504,8 +518,14 @@ class _Runner:
         raise AssertionError(f"unexpected command: {command}")
 
 
-def _fixture(root: Path):
-    segment = _segment(root / "segment")
+def _fixture(
+    root: Path,
+    *,
+    positions: np.ndarray | None = None,
+    config: GeodeticSubmapConfig | None = None,
+    initial_pair_method: str = "v1",
+):
+    segment = _segment(root / "segment", positions)
     colmap = root / "pinned-colmap"
     colmap.write_bytes(b"test pinned COLMAP 4.1.1")
     colmap.chmod(0o755)
@@ -529,7 +549,7 @@ def _fixture(root: Path):
         provenance=provenance,
         quality={"n_frames": 8},
     )
-    names = _create_database(frontend)
+    names = _create_database(frontend, positions)
     create_frontend_seal(frontend)
     _write_json(
         frontend / "stages" / "matching.json",
@@ -553,7 +573,7 @@ def _fixture(root: Path):
             minimum_runtime_free_space_gb=0.005,
         ),
     )
-    runner = _Runner(names)
+    runner = _Runner(names, positions=positions)
     run_mapper_solve(backend, colmap, runner=runner)
     run_image_registration(backend, colmap, runner=runner)
     run_quality_summary(backend, colmap, runner=runner)
@@ -567,7 +587,11 @@ def _fixture(root: Path):
         minimum_runtime_free_space_gb=0.005,
         fresh_min_mean_observations_per_image=60.0,
     )
-    config = GeodeticSubmapConfig(refinement=refinement)
+    config = (
+        GeodeticSubmapConfig(refinement=refinement)
+        if config is None
+        else replace(config, refinement=refinement)
+    )
     plan = prepare_geodetic_submap_plan(
         frontend,
         backend,
@@ -575,6 +599,7 @@ def _fixture(root: Path):
         selection,
         root / "plan",
         config=config,
+        _initial_pair_method=initial_pair_method,
     )
     selected_names = [
         name
@@ -651,6 +676,29 @@ class GeodeticPairPolicyTests(unittest.TestCase):
                 self._candidate(kind=kind, distance=50.0), policy
             )
             self.assertTrue(decision.retained)
+
+    def test_temporally_rejected_endpoint_is_untrusted_only_for_nonlocal_pair(self):
+        rejected_endpoint = RawGnssEndpoint(
+            (0.0, 0.0, 0.0),
+            tuple(tuple(row) for row in (np.eye(3) * 0.0004)),
+            False,
+            "rtk_fixed",
+            1,
+            2,
+        )
+        nonlocal_candidate = replace(
+            self._candidate(kind="nonlocal", distance=0.25),
+            first_gnss=rejected_endpoint,
+        )
+        decision = decide_pair(nonlocal_candidate)
+        self.assertFalse(decision.retained)
+        self.assertEqual(decision.reason, "nonlocal_gnss_untrusted")
+        for kind in ("stereo", "adjacent"):
+            local = replace(
+                self._candidate(kind=kind, distance=50.0),
+                first_gnss=rejected_endpoint,
+            )
+            self.assertTrue(decide_pair(local).retained)
 
     def test_v2_seed_prefers_stable_two_view_geometry(self):
         high_matches = self._candidate(kind="adjacent", distance=0.25)
@@ -954,8 +1002,182 @@ class GeodeticTrajectoryGateTests(unittest.TestCase):
         }
         self.assertTrue(_authoritative_checks_pass(checks))
 
+    def test_temporally_rejected_observation_is_not_a_trajectory_gate_input(self):
+        prior, names, frame_ids, roles, inliers, policy = self._inputs(80)
+        rejected = 40
+        roles[rejected] = "excluded"
+        camera = prior.copy()
+        raw = prior.copy()
+        camera[rejected] = np.nan
+        raw[rejected] = np.nan
+
+        report = _full_trajectory_quality(
+            prior,
+            camera,
+            raw,
+            roles,
+            inliers,
+            names,
+            frame_ids,
+            policy,
+        )
+
+        self.assertTrue(_authoritative_checks_pass(report["checks"]))
+        self.assertEqual(report["excluded_observation_count"], 1)
+        self.assertEqual(
+            report["checks"]["full_trajectory_raw_gnss_coverage"]["expected"],
+            len(prior) - 1,
+        )
+
+
+class GeodeticConditionalRtkGateTests(unittest.TestCase):
+    @staticmethod
+    def _quality(
+        *, inlier_fraction: float, inlier_passed: bool, median: float = 0.06
+    ):
+        return {
+            "checks": {
+                "median_holdout_rtk_residual_m": {
+                    "authoritative": True,
+                    "value": median,
+                    "maximum": 0.10,
+                    "passed": median <= 0.10,
+                },
+                "holdout_rtk_inlier_fraction": {
+                    "authoritative": True,
+                    "value": inlier_fraction,
+                    "minimum": 0.80,
+                    "passed": inlier_passed,
+                },
+                "diagnostic": {
+                    "authoritative": False,
+                    "value": 5.0,
+                    "maximum": 1.0,
+                    "passed": False,
+                },
+            }
+        }
+
+    def test_failed_inlier_fraction_is_repaired_by_same_metric(self):
+        self.assertEqual(
+            GeodeticSubmapConfig().refinement.max_holdout_median_regression_m,
+            0.01,
+        )
+        source = self._quality(inlier_fraction=0.7375, inlier_passed=False)
+        refined = self._quality(
+            inlier_fraction=1.0, inlier_passed=True, median=0.065
+        )
+
+        repair = _metric_specific_source_repairs(source, refined)
+
+        self.assertTrue(repair["passed"])
+        self.assertEqual(
+            repair["source_failed_metrics"], ["holdout_rtk_inlier_fraction"]
+        )
+        self.assertEqual(repair["repairs"][0]["direction"], "increase")
+
+    def test_median_improvement_cannot_hide_unrepaired_source_metric(self):
+        source = self._quality(
+            inlier_fraction=0.7375, inlier_passed=False, median=0.09
+        )
+        refined = self._quality(
+            inlier_fraction=0.75, inlier_passed=False, median=0.01
+        )
+
+        repair = _metric_specific_source_repairs(source, refined)
+
+        self.assertFalse(repair["passed"])
+        self.assertFalse(repair["repairs"][0]["refined_same_metric_passed"])
+
 
 class GeodeticSubmapArtifactTests(unittest.TestCase):
+    def test_temporal_rejection_is_physically_absent_and_resealed_tamper_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            positions = np.column_stack(
+                (
+                    np.arange(8, dtype=np.float64) * 0.05,
+                    np.zeros(8),
+                    np.zeros(8),
+                )
+            )
+            positions[3, 0] += 0.18
+            policy = GeodeticGnssTemporalPolicy(
+                support_epochs=2,
+                maximum_acceleration_m_s2=0.01,
+                maximum_raw_interval_s=2.0,
+                maximum_rejected_raw_fraction=0.20,
+            )
+            _, _, _, _, plan, colmap, _ = _fixture(
+                root,
+                positions=positions,
+                config=GeodeticSubmapConfig(
+                    gnss_temporal_policy=policy,
+                    initial_pair_policy=GeodeticInitialPairPolicy(
+                        minimum_raw_gnss_displacement_m=0.04
+                    ),
+                ),
+                initial_pair_method="v4",
+            )
+            split_path = plan / "prior_split.json"
+            split = json.loads(split_path.read_text())
+            audit = split["gnss_temporal_audit"]
+            rejected = [
+                item
+                for item in audit["observation_records"]
+                if not item["retained_by_temporal_filter"]
+            ]
+            self.assertEqual([item["frame_id"] for item in rejected], [3])
+            record = next(
+                item for item in split["records"] if item["frame_id"] == 3
+            )
+            self.assertEqual(record["role"], "excluded")
+            self.assertEqual(
+                record["reason"],
+                "raw_gnss_paired_discontinuity_excursion",
+            )
+            with sqlite3.connect(
+                f"file:{plan / 'database.db'}?mode=ro&immutable=1", uri=True
+            ) as connection:
+                prior_names = {
+                    str(name)
+                    for (name,) in connection.execute(
+                        """
+                        SELECT i.name FROM pose_priors AS p
+                        JOIN images AS i ON i.image_id=p.corr_data_id
+                        """
+                    )
+                }
+            self.assertNotIn("left_000003.jpg", prior_names)
+            self.assertIn("left_000003.jpg", (plan / "all_images.txt").read_text())
+
+            rejected[0]["retained_by_temporal_filter"] = True
+            rejected[0]["reason"] = "raw_gnss_temporally_consistent"
+            _write_json(split_path, split)
+            plan_path = plan / "geodetic_submap_plan.json"
+            plan_record = json.loads(plan_path.read_text())
+            plan_record["prior_split_sha256"] = sha256_file(split_path)
+            plan_record["gnss_temporal_audit_sha256"] = canonical_hash(audit)
+            _write_json(plan_path, plan_record)
+            seal_path = plan / "plan_seal.json"
+            seal = json.loads(seal_path.read_text())
+            for path in (split_path, plan_path):
+                seal["files"][path.name] = {
+                    "sha256": sha256_file(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            seal_body = {
+                "schema_version": seal["schema_version"],
+                "files": seal["files"],
+            }
+            seal["seal_sha256"] = canonical_hash(seal_body)
+            _write_json(seal_path, seal)
+
+            with self.assertRaisesRegex(
+                ArtifactError, "raw-GNSS temporal audit changed"
+            ):
+                build_geodetic_submap_command(plan, root / "execution", colmap)
+
     def test_private_inventory_pair_audit_holdout_and_source_immutability(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1159,6 +1381,11 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
             self.assertEqual(audited_plan_context.call_count, 2)
             self.assertTrue(result["passed"])
             self.assertTrue(result["publication_eligible"])
+            self.assertTrue(
+                result["quality"]["checks"]["heldout_rtk_absolute_gates"][
+                    "passed"
+                ]
+            )
             self.assertFalse(
                 result["quality"]["checks"]["trajectory_similarity_scale"][
                     "authoritative"
@@ -1280,8 +1507,10 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
     def test_reusable_code_has_no_pilot_dataset_or_frame_literals(self):
         package = Path(__file__).resolve().parents[1] / "src" / "rtk_splat"
         paths = [
+            package / "backends" / "geodetic_gnss.py",
             package / "backends" / "geodetic_pairs.py",
             package / "backends" / "geodetic_submap.py",
+            package / "backends" / "geodetic_assembly.py",
         ]
         forbidden = ("field1", "/data/jkobo", "1100", "1800")
         for path in paths:
@@ -1375,7 +1604,7 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
         # run-all uses spawned worker processes because the mapper's resource
         # monitor owns process-level signal handlers.
         pickle.loads(pickle.dumps(runtime["_runtime_context"]))
-        self.assertEqual(audited["schema_version"], 5)
+        self.assertEqual(audited["schema_version"], 6)
         self.assertEqual(len(audited["windows"]), 2)
         self.assertEqual(
             sorted(

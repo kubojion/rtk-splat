@@ -44,6 +44,10 @@ from rtk_splat.backends.execution import (
     _run_injected_mapper,
     _run_monitored_mapper,
 )
+from rtk_splat.backends.geodetic_gnss import (
+    GeodeticGnssTemporalPolicy,
+    raw_gnss_temporal_filter,
+)
 from rtk_splat.backends.geodetic_pairs import (
     GeodeticPairPolicy,
     PairCandidate,
@@ -80,7 +84,7 @@ _PAIR_ID_BASE = 2_147_483_647
 _SELECTION_KIND = "rtk_splat_geodetic_submap_frame_selection"
 _PLAN_KIND = "rtk_splat_geodetic_submap_plan"
 _RESULT_KIND = "rtk_splat_geodetic_submap_result"
-_HARDENED_PLAN_SCHEMA_VERSION = 2
+_HARDENED_PLAN_SCHEMA_VERSION = 3
 _PLAN_FILES = (
     "all_images.txt",
     "calibration_prior_names.txt",
@@ -205,6 +209,9 @@ class GeodeticSubmapConfig:
     trajectory_policy: GeodeticTrajectoryPolicy = field(
         default_factory=GeodeticTrajectoryPolicy
     )
+    gnss_temporal_policy: GeodeticGnssTemporalPolicy = field(
+        default_factory=GeodeticGnssTemporalPolicy
+    )
     refinement: RtkRefinementConfig = field(
         default_factory=_fresh_refinement_config
     )
@@ -245,7 +252,10 @@ def _config_record(config: GeodeticSubmapConfig) -> dict[str, Any]:
 
 
 def _config_from_record(
-    value: Any, *, legacy_schema: bool = False
+    value: Any,
+    *,
+    legacy_schema: bool = False,
+    legacy_temporal_policy: bool = False,
 ) -> GeodeticSubmapConfig:
     if not isinstance(value, Mapping):
         raise ArtifactError("geodetic submap config must be an object")
@@ -263,6 +273,13 @@ def _config_from_record(
             if legacy_schema
             else GeodeticTrajectoryPolicy(**dict(value["trajectory_policy"]))
         )
+        temporal = (
+            GeodeticGnssTemporalPolicy()
+            if legacy_temporal_policy
+            else GeodeticGnssTemporalPolicy(
+                **dict(value["gnss_temporal_policy"])
+            )
+        )
         refinement = RtkRefinementConfig(**dict(value["refinement"]))
         raw_weights = value["position_quality_weights"]
         if not isinstance(raw_weights, (list, tuple)):
@@ -272,6 +289,7 @@ def _config_from_record(
             pair_policy=pair,
             initial_pair_policy=initial_pair,
             trajectory_policy=trajectory,
+            gnss_temporal_policy=temporal,
             refinement=refinement,
             position_quality_weights=weights,
         )
@@ -282,6 +300,8 @@ def _config_from_record(
     if legacy_schema:
         normalized.pop("initial_pair_policy")
         normalized.pop("trajectory_policy")
+    if legacy_temporal_policy:
+        normalized.pop("gnss_temporal_policy")
     normalized["position_quality_weights"] = [
         list(item) for item in config.position_quality_weights
     ]
@@ -500,6 +520,172 @@ def _raw_gnss_endpoints(reader: SegmentReader) -> dict[int, RawGnssEndpoint]:
             carrier_status=int(gnss["carrier_status"][index]),
         )
     return result
+
+
+def _temporally_filtered_gnss(
+    reader: SegmentReader,
+    policy: GeodeticGnssTemporalPolicy,
+    frame_ids: Sequence[int],
+) -> tuple[
+    dict[int, RawGnssEndpoint],
+    dict[int, dict[str, Any]],
+    dict[str, Any],
+]:
+    """Bind raw-only temporal decisions to acquisition-frame observations."""
+    gnss = reader.observations("gnss")
+    assert gnss is not None
+    required = (
+        "raw_timestamp_ns",
+        "raw_enu_m",
+        "raw_effective_covariance_enu_m2",
+        "raw_fix_status",
+        "raw_carrier_status",
+        "source_index",
+    )
+    missing = [name for name in required if name not in gnss]
+    if missing:
+        raise ArtifactError(
+            "timestamp-aware GNSS filtering requires immutable raw fields: "
+            + ", ".join(missing)
+        )
+    raw_retained, raw_reasons, raw_audit = raw_gnss_temporal_filter(
+        gnss["raw_timestamp_ns"],
+        gnss["raw_enu_m"],
+        gnss["raw_effective_covariance_enu_m2"],
+        gnss["raw_fix_status"],
+        gnss["raw_carrier_status"],
+        policy=policy,
+    )
+    if not raw_audit["passed"]:
+        failed = [
+            name
+            for name, check in raw_audit["checks"].items()
+            if not check["passed"]
+        ]
+        raise ArtifactError(
+            "raw GNSS temporal filter failed closed: " + ", ".join(failed)
+        )
+
+    endpoints = _raw_gnss_endpoints(reader)
+    frames = reader.frames
+    all_frame_ids = frames["frame_id"].astype(int)
+    index_by_frame = {
+        int(frame_id): index for index, frame_id in enumerate(all_frame_ids)
+    }
+    if not set(int(value) for value in frame_ids) <= set(index_by_frame):
+        raise ArtifactError("GNSS temporal audit references an unknown frame")
+    association_valid = np.asarray(
+        gnss.get("association_valid", np.ones(len(all_frame_ids), dtype=bool)),
+        dtype=bool,
+    )
+    source_indices = np.asarray(gnss["source_index"])
+    if (
+        association_valid.shape != (len(all_frame_ids),)
+        or source_indices.shape != (len(all_frame_ids),)
+        or not np.issubdtype(source_indices.dtype, np.integer)
+    ):
+        raise ArtifactError("GNSS raw association arrays are invalid")
+
+    raw_timestamps = np.asarray(gnss["raw_timestamp_ns"], dtype=np.int64)
+    raw_positions = np.asarray(gnss["raw_enu_m"], dtype=np.float64)
+    raw_covariance = np.asarray(
+        gnss["raw_effective_covariance_enu_m2"], dtype=np.float64
+    )
+    raw_fix = np.asarray(gnss["raw_fix_status"])
+    raw_carrier = np.asarray(gnss["raw_carrier_status"])
+    filtered: dict[int, RawGnssEndpoint] = {}
+    records_by_frame: dict[int, dict[str, Any]] = {}
+    for frame_id in all_frame_ids:
+        frame_id = int(frame_id)
+        index = index_by_frame[frame_id]
+        raw_index = int(source_indices[index])
+        raw_index_valid = 0 <= raw_index < len(raw_retained)
+        associated = bool(association_valid[index]) and raw_index_valid
+        temporal_retained = bool(associated and raw_retained[raw_index])
+        endpoint = endpoints[frame_id]
+        filtered_endpoint = RawGnssEndpoint(
+            position_m=endpoint.position_m,
+            covariance_m2=endpoint.covariance_m2,
+            position_valid=bool(endpoint.position_valid and temporal_retained),
+            position_quality=endpoint.position_quality,
+            fix_status=endpoint.fix_status,
+            carrier_status=endpoint.carrier_status,
+        )
+        filtered[frame_id] = filtered_endpoint
+        if not association_valid[index]:
+            reason = "raw_gnss_association_invalid"
+        elif not raw_index_valid:
+            reason = "raw_gnss_source_index_invalid"
+        elif not raw_retained[raw_index]:
+            reason = raw_reasons[raw_index]
+        elif not endpoint.position_valid:
+            reason = "associated_gnss_status_invalid"
+        else:
+            reason = "raw_gnss_temporally_consistent"
+        raw_covariance_record = (
+            raw_covariance[raw_index].tolist() if raw_index_valid else None
+        )
+        raw_position_record = (
+            raw_positions[raw_index].tolist() if raw_index_valid else None
+        )
+        records_by_frame[frame_id] = {
+            "frame_id": frame_id,
+            "frame_timestamp_ns": int(frames["timestamp_ns"][index]),
+            "association_valid": bool(association_valid[index]),
+            "source_timestamp_ns": (
+                int(gnss["source_timestamp_ns"][index])
+                if "source_timestamp_ns" in gnss
+                else None
+            ),
+            "source_residual_ns": (
+                int(gnss["source_residual_ns"][index])
+                if "source_residual_ns" in gnss
+                else None
+            ),
+            "raw_source_index": raw_index if raw_index_valid else None,
+            "raw_timestamp_ns": (
+                int(raw_timestamps[raw_index]) if raw_index_valid else None
+            ),
+            "raw_position_m": raw_position_record,
+            "raw_effective_covariance_m2": raw_covariance_record,
+            "raw_fix_status": (
+                int(raw_fix[raw_index]) if raw_index_valid else None
+            ),
+            "raw_carrier_status": (
+                int(raw_carrier[raw_index]) if raw_index_valid else None
+            ),
+            "associated_endpoint": endpoint.record(),
+            "retained_by_temporal_filter": temporal_retained,
+            "trusted_for_nonlocal_pair_decisions": (
+                filtered_endpoint.trusted_std_m() is not None
+            ),
+            "reason": str(reason),
+        }
+
+    selected_records = [
+        records_by_frame[int(frame_id)] for frame_id in frame_ids
+    ]
+    selected_rejected = [
+        item for item in selected_records if not item["retained_by_temporal_filter"]
+    ]
+    audit = {
+        "schema_version": 1,
+        "method": "selected_frame_raw_gnss_temporal_audit_v1",
+        "policy": asdict(policy),
+        "raw_stream_audit": raw_audit,
+        "selected_frame_count": len(selected_records),
+        "selected_retained_count": len(selected_records) - len(selected_rejected),
+        "selected_rejected_count": len(selected_rejected),
+        "decision_inputs_exclude": [
+            "visual_poses",
+            "finished_visual_model_residual",
+            "optimizer_output",
+            "heldout_evaluation_result",
+        ],
+        "observation_records": selected_records,
+        "passed": True,
+    }
+    return filtered, records_by_frame, audit
 
 
 def _selected_rows(
@@ -2053,10 +2239,12 @@ def _weight_and_split_priors(
     database: Path,
     rows: Sequence[Mapping[str, Any]],
     reader: SegmentReader,
+    gnss: Mapping[int, RawGnssEndpoint],
+    gnss_records: Mapping[int, Mapping[str, Any]],
+    gnss_temporal_audit: Mapping[str, Any],
     config: GeodeticSubmapConfig,
     temporal_blocks: int,
 ) -> dict[str, Any]:
-    gnss = _raw_gnss_endpoints(reader)
     weights = dict(config.position_quality_weights)
     frames = reader.frames
     centers = (
@@ -2122,11 +2310,22 @@ def _weight_and_split_priors(
                     "fix_status": endpoint.fix_status,
                     "carrier_status": endpoint.carrier_status,
                     "status_weight": weight,
+                    "gnss_temporal_filter": dict(gnss_records[frame_id]),
                 }
-                if not endpoint.position_valid or weight <= 0.0:
+                if endpoint.trusted_std_m() is None or weight <= 0.0:
                     remove_ids.append(int(prior_id))
+                    temporal_reason = str(
+                        gnss_records[frame_id].get("reason", "")
+                    )
+                    reason = (
+                        temporal_reason
+                        if not gnss_records[frame_id].get(
+                            "retained_by_temporal_filter", False
+                        )
+                        else "raw_gnss_status_or_covariance"
+                    )
                     records.append(
-                        {**base, "role": "excluded", "reason": "raw_gnss_status"}
+                        {**base, "role": "excluded", "reason": reason}
                     )
                     continue
                 if (
@@ -2224,8 +2423,11 @@ def _weight_and_split_priors(
     ):
         raise ArtifactError("held-out position priors remain in the optimizer DB")
     return {
-        "schema_version": 1,
-        "method": "alternating_temporal_blocks_status_covariance_weighted_v1",
+        "schema_version": 2,
+        "method": (
+            "raw_temporal_filter_then_alternating_blocks_status_"
+            "covariance_weighted_v2"
+        ),
         "calibration_block_ids": list(split.calibration_block_ids),
         "holdout_block_ids": list(split.holdout_block_ids),
         "calibration_names": calibration_names,
@@ -2233,6 +2435,11 @@ def _weight_and_split_priors(
         "n_calibration": len(calibration_names),
         "n_holdout": len(holdout_names),
         "n_excluded": sum(item["role"] == "excluded" for item in records),
+        "n_temporally_rejected": sum(
+            not item["retained_by_temporal_filter"]
+            for item in gnss_temporal_audit["observation_records"]
+        ),
+        "gnss_temporal_audit": dict(gnss_temporal_audit),
         "position_quality_weights": [
             list(item) for item in config.position_quality_weights
         ],
@@ -2690,7 +2897,11 @@ def prepare_geodetic_submap_plan(
             name: image_id
             for image_id, name, _ in assignments["image_rows"]
         }
-        gnss = _raw_gnss_endpoints(reader)
+        gnss, gnss_records, gnss_temporal_audit = _temporally_filtered_gnss(
+            reader,
+            config.gnss_temporal_policy,
+            selection["frame_ids"],
+        )
         candidates, pair_sources = _pair_candidates(
             source_database, metadata, gnss
         )
@@ -2713,6 +2924,9 @@ def prepare_geodetic_submap_plan(
             staging / "database.db",
             rows,
             reader,
+            gnss,
+            gnss_records,
+            gnss_temporal_audit,
             config,
             mapper_config.alignment_temporal_blocks,
         )
@@ -2808,6 +3022,9 @@ def prepare_geodetic_submap_plan(
             "private_database_sqlite_metadata": private_sqlite_metadata,
             "pair_audit_sha256": sha256_file(staging / "pair_audit.json"),
             "prior_split_sha256": sha256_file(staging / "prior_split.json"),
+            "gnss_temporal_audit_sha256": canonical_hash(
+                gnss_temporal_audit
+            ),
             "database_inventory_sha256": sha256_file(
                 staging / "database_inventory.json"
             ),
@@ -2825,6 +3042,7 @@ def prepare_geodetic_submap_plan(
                 "colmap_auto_second_image": _initial_pair_method == "v5",
                 "position_priors": "raw_gnss_covariance_status_weighted",
                 "heldout_priors_physically_absent": True,
+                "temporally_rejected_priors_physically_absent": True,
                 "fixed_stereo_rig": True,
                 "fixed_intrinsics": True,
                 "fixed_extrinsics": True,
@@ -2880,7 +3098,7 @@ def _plan_context(
     schema_version = plan.get("schema_version")
     if (
         plan.get("kind") != _PLAN_KIND
-        or schema_version not in {1, _HARDENED_PLAN_SCHEMA_VERSION}
+        or schema_version not in {1, 2, _HARDENED_PLAN_SCHEMA_VERSION}
     ):
         raise ArtifactError("invalid geodetic submap plan")
     legacy_schema = schema_version == 1
@@ -2890,7 +3108,9 @@ def _plan_context(
             "acceptance policy; prepare a new immutable plan"
         )
     config = _config_from_record(
-        plan.get("config"), legacy_schema=legacy_schema
+        plan.get("config"),
+        legacy_schema=legacy_schema,
+        legacy_temporal_policy=schema_version < 3,
     )
     input_context = (
         _input_context(
@@ -2987,7 +3207,22 @@ def _plan_context(
         != inventory.get("rig_ids")
     ):
         raise ArtifactError("geodetic plan optimizer inventory changed")
-    gnss = _raw_gnss_endpoints(reader)
+    if schema_version >= 3:
+        gnss, _gnss_records, expected_gnss_audit = (
+            _temporally_filtered_gnss(
+                reader,
+                config.gnss_temporal_policy,
+                selection["frame_ids"],
+            )
+        )
+        if (
+            prior_split.get("gnss_temporal_audit") != expected_gnss_audit
+            or plan.get("gnss_temporal_audit_sha256")
+            != canonical_hash(expected_gnss_audit)
+        ):
+            raise ArtifactError("sealed raw-GNSS temporal audit changed")
+    else:
+        gnss = _raw_gnss_endpoints(reader)
     candidates, pair_sources = _pair_candidates(
         frontend / "database.db", metadata, gnss
     )
@@ -3066,6 +3301,10 @@ def _plan_context(
         )
     ):
         raise ArtifactError("optimizer contract changed")
+    if schema_version >= 3 and optimizer.get(
+        "temporally_rejected_priors_physically_absent"
+    ) is not True:
+        raise ArtifactError("temporal GNSS exclusion contract changed")
     if not legacy_schema:
         auto_initialization = initial_pair_method == "v4"
         anchored_initialization = initial_pair_method == "v5"
@@ -3278,6 +3517,75 @@ def _authoritative_checks_pass(checks: Mapping[str, Mapping[str, Any]]) -> bool:
     )
 
 
+def _metric_specific_source_repairs(
+    source_rtk: Mapping[str, Any], refined_rtk: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Require each failed source RTK metric to pass in the refined result."""
+    source_checks = source_rtk.get("checks")
+    refined_checks = refined_rtk.get("checks")
+    if not isinstance(source_checks, Mapping) or not isinstance(
+        refined_checks, Mapping
+    ):
+        raise ArtifactError("RTK quality records have no checks")
+    failed_names = [
+        str(name)
+        for name, check in source_checks.items()
+        if isinstance(check, Mapping)
+        and check.get("authoritative", True)
+        and not check.get("passed")
+    ]
+    repairs: list[dict[str, Any]] = []
+    for name in failed_names:
+        source = source_checks[name]
+        refined = refined_checks.get(name)
+        if not isinstance(refined, Mapping):
+            raise ArtifactError(
+                f"refined RTK quality lacks source metric: {name}"
+            )
+        source_value = source.get("value")
+        refined_value = refined.get("value")
+        if "maximum" in source:
+            direction = "decrease"
+            improved = bool(
+                refined_value is not None
+                and (
+                    source_value is None
+                    or float(refined_value) < float(source_value)
+                )
+            )
+            limit = {"maximum": source.get("maximum")}
+        elif "minimum" in source:
+            direction = "increase"
+            improved = bool(
+                refined_value is not None
+                and source_value is not None
+                and float(refined_value) > float(source_value)
+            )
+            limit = {"minimum": source.get("minimum")}
+        else:
+            direction = "pass_same_metric"
+            improved = bool(refined.get("passed"))
+            limit = {}
+        repaired = bool(refined.get("passed") and improved)
+        repairs.append(
+            {
+                "metric": name,
+                "direction": direction,
+                "source_value": source_value,
+                "refined_value": refined_value,
+                **limit,
+                "refined_same_metric_passed": bool(refined.get("passed")),
+                "improved_in_required_direction": improved,
+                "repaired": repaired,
+            }
+        )
+    return {
+        "source_failed_metrics": failed_names,
+        "repairs": repairs,
+        "passed": all(item["repaired"] for item in repairs),
+    }
+
+
 def _full_trajectory_quality(
     aligned_refined_centers: np.ndarray,
     camera_prior_centers: np.ndarray,
@@ -3307,9 +3615,16 @@ def _full_trajectory_quality(
     ):
         raise ArtifactError("full-trajectory gate inputs are inconsistent")
 
-    camera_valid = np.isfinite(camera).all(axis=1)
-    raw_valid = np.isfinite(raw).all(axis=1)
-    full_coverage = bool(camera_valid.all() and raw_valid.all())
+    eligible = np.asarray(
+        [role in {"calibration", "holdout"} for role in roles], dtype=bool
+    )
+    camera_valid = np.isfinite(camera).all(axis=1) & eligible
+    raw_valid = np.isfinite(raw).all(axis=1) & eligible
+    eligible_coverage = bool(
+        eligible.any()
+        and camera_valid[eligible].all()
+        and raw_valid[eligible].all()
+    )
     calibration_outliers = np.asarray(
         [role == "calibration" for role in roles], dtype=bool
     ) & ~inliers
@@ -3318,7 +3633,9 @@ def _full_trajectory_quality(
     refined_steps = np.diff(refined, axis=0)
     refined_lengths = np.linalg.norm(refined_steps, axis=1)
     adjacent_valid = (
-        camera_valid[:-1]
+        eligible[:-1]
+        & eligible[1:]
+        & camera_valid[:-1]
         & camera_valid[1:]
         & raw_valid[:-1]
         & raw_valid[1:]
@@ -3408,7 +3725,7 @@ def _full_trajectory_quality(
         else None
     )
     window_passed = (
-        full_coverage
+        eligible_coverage
         and worst_window is not None
         and worst_window["normalized_error"] <= 1.0
     )
@@ -3416,8 +3733,9 @@ def _full_trajectory_quality(
         "full_trajectory_raw_gnss_coverage": {
             "authoritative": True,
             "value": int((camera_valid & raw_valid).sum()),
-            "expected": n,
-            "passed": full_coverage,
+            "expected": int(eligible.sum()),
+            "excluded_observation_count": int((~eligible).sum()),
+            "passed": eligible_coverage,
         },
         "consecutive_calibration_prior_outliers": {
             "authoritative": True,
@@ -3430,7 +3748,7 @@ def _full_trajectory_quality(
             "authoritative": True,
             "value": maximum_camera_error,
             "maximum": policy.max_adjacent_displacement_error_m,
-            "passed": full_coverage
+            "passed": eligible_coverage
             and maximum_camera_error is not None
             and maximum_camera_error
             <= policy.max_adjacent_displacement_error_m,
@@ -3439,7 +3757,7 @@ def _full_trajectory_quality(
             "authoritative": True,
             "value": maximum_raw_error,
             "maximum": policy.max_adjacent_displacement_error_m,
-            "passed": full_coverage
+            "passed": eligible_coverage
             and maximum_raw_error is not None
             and maximum_raw_error
             <= policy.max_adjacent_displacement_error_m,
@@ -3457,9 +3775,11 @@ def _full_trajectory_quality(
         },
     }
     return {
-        "schema_version": 1,
-        "method": "aligned_raw_gnss_full_path_gates_v1",
+        "schema_version": 2,
+        "method": "aligned_eligible_raw_gnss_path_gates_v2",
         "selected_frame_count": n,
+        "eligible_observation_count": int(eligible.sum()),
+        "excluded_observation_count": int((~eligible).sum()),
         "adjacent_step_count": n - 1,
         "evaluated_adjacent_step_count": int(adjacent_valid.sum()),
         "calibration_outlier_indices": np.flatnonzero(
@@ -3632,6 +3952,17 @@ def _quality_report(
     source_reprojection = float(
         source_quality["checks"]["mean_reprojection_error_px"]["value"]
     )
+    source_repairs = _metric_specific_source_repairs(
+        source_rtk, refined_rtk
+    )
+    temporal_audit = split.get("gnss_temporal_audit")
+    temporal_audit_passed = bool(
+        plan.get("schema_version", 1) < 3
+        or (
+            isinstance(temporal_audit, Mapping)
+            and temporal_audit.get("passed")
+        )
+    )
     inventory = _json(plan_root / "database_inventory.json")
     checks = {
         "source_visual_quality": {
@@ -3674,6 +4005,19 @@ def _quality_report(
             "minimum": 1.0,
             "passed": bool(inventory["pair_evidence_byte_exact"]),
         },
+        "raw_gnss_temporal_filter_audit": {
+            "authoritative": plan.get("schema_version", 1) >= 3,
+            "value": temporal_audit_passed,
+            "expected": True,
+            "passed": temporal_audit_passed,
+        },
+        "rejected_and_heldout_priors_physically_absent": {
+            "value": set(inventory["calibration_prior_names"])
+            == set(split["calibration_names"]),
+            "expected": True,
+            "passed": set(inventory["calibration_prior_names"])
+            == set(split["calibration_names"]),
+        },
         "trajectory_similarity_scale": {
             "authoritative": False,
             "kind": "diagnostic_only_source_comparison",
@@ -3712,17 +4056,14 @@ def _quality_report(
             <= source_median
             + config.refinement.max_holdout_median_regression_m,
         },
-        "heldout_improvement_when_source_failed_m": {
+        "heldout_source_failed_metrics_repaired": {
             "authoritative": not source_rtk_passed,
-            "value": source_median - refined_median,
-            "minimum": (
-                config.refinement.min_holdout_median_improvement_m
-                if not source_rtk_passed
-                else None
-            ),
-            "passed": source_rtk_passed
-            or source_median - refined_median
-            >= config.refinement.min_holdout_median_improvement_m,
+            "value": source_repairs["repairs"],
+            "source_failed_metrics": source_repairs[
+                "source_failed_metrics"
+            ],
+            "expected": "each failed source metric passes after refinement",
+            "passed": source_repairs["passed"],
         },
     }
     passed = _authoritative_checks_pass(checks)
