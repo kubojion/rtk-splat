@@ -55,6 +55,7 @@ from rtk_splat.backends.mapper import (
     _verify_pose_artifact,
 )
 from rtk_splat.backends.quality import (
+    estimate_rigid_alignment,
     rtk_residual_quality,
     temporal_block_split,
 )
@@ -962,6 +963,24 @@ def _aligned_submap_candidate(
         str(item["name"]): str(item["role"]) for item in split["records"]
     }
     roles = [roles_by_name.get(name, "excluded") for name in left_names]
+    nan_position = np.full(3, np.nan, dtype=np.float64)
+    nan_covariance = np.full((3, 3), np.nan, dtype=np.float64)
+    prior_centers = np.stack(
+        [
+            np.asarray(priors[name][0], dtype=np.float64)
+            if name in priors
+            else nan_position
+            for name in left_names
+        ]
+    )
+    prior_covariances = np.stack(
+        [
+            np.asarray(priors[name][1], dtype=np.float64)
+            if name in priors
+            else nan_covariance
+            for name in left_names
+        ]
+    )
     frame_ids = np.asarray(
         [int(row["frame_id"]) for row in rows], dtype=np.int64
     )
@@ -988,6 +1007,8 @@ def _aligned_submap_candidate(
         "source_viewmats": aligned_source_viewmats,
         "source_centers": aligned_source_centers,
         "raw_gnss_centers": raw_gnss_centers,
+        "prior_centers": prior_centers,
+        "prior_covariances": prior_covariances,
         "roles": roles,
         "calibration_names": list(split["calibration_names"]),
         "holdout_names": list(split["holdout_names"]),
@@ -1250,10 +1271,9 @@ def _summary(values: np.ndarray) -> dict[str, float]:
     }
 
 
-def _evaluate_overlap_candidates(
+def _ordered_overlap_candidates(
     candidates: Sequence[Mapping[str, Any]],
-    policy: GeodeticOverlapPolicy,
-) -> dict[str, Any]:
+) -> list[Mapping[str, Any]]:
     if len(candidates) < 2:
         raise ArtifactError("overlap evaluation needs at least two submaps")
     ordered = sorted(
@@ -1266,101 +1286,481 @@ def _evaluate_overlap_candidates(
     )
     if len({str(item["result"]["artifact"]) for item in ordered}) != len(ordered):
         raise ArtifactError("overlap evaluation contains a duplicate result")
-    pairs: list[dict[str, Any]] = []
-    for first, second in zip(ordered, ordered[1:]):
-        first_by_id = {
-            int(frame_id): index
-            for index, frame_id in enumerate(first["frame_ids"])
-        }
-        second_by_id = {
-            int(frame_id): index
-            for index, frame_id in enumerate(second["frame_ids"])
-        }
-        shared = sorted(set(first_by_id) & set(second_by_id))
-        if len(shared) < policy.minimum_overlap_frames:
-            raise ArtifactError(
-                "adjacent submaps do not satisfy the minimum overlap: "
-                f"{len(shared)} < {policy.minimum_overlap_frames}"
+    return ordered
+
+
+def _shared_candidate_indices(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+    *,
+    minimum: int,
+) -> tuple[list[int], np.ndarray, np.ndarray]:
+    first_by_id = {
+        int(frame_id): index
+        for index, frame_id in enumerate(first["frame_ids"])
+    }
+    second_by_id = {
+        int(frame_id): index
+        for index, frame_id in enumerate(second["frame_ids"])
+    }
+    shared = sorted(set(first_by_id) & set(second_by_id))
+    if len(shared) < minimum:
+        raise ArtifactError(
+            "adjacent submaps do not satisfy the minimum overlap: "
+            f"{len(shared)} < {minimum}"
+        )
+    first_indices = np.asarray([first_by_id[value] for value in shared])
+    second_indices = np.asarray([second_by_id[value] for value in shared])
+    first_names = [first["left_image_names"][index] for index in first_indices]
+    second_names = [second["left_image_names"][index] for index in second_indices]
+    if first_names != second_names or not np.array_equal(
+        first["timestamps_ns"][first_indices],
+        second["timestamps_ns"][second_indices],
+    ):
+        raise ArtifactError("overlap frame identity differs between submaps")
+    return shared, first_indices, second_indices
+
+
+def _fixed_scale_overlap_alignment(
+    source: np.ndarray,
+    target: np.ndarray,
+    source_world_to_camera: np.ndarray,
+    target_world_to_camera: np.ndarray,
+) -> dict[str, Any]:
+    """Return deterministic target-from-source SE(3), never Sim(3)."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    source_world_to_camera = np.asarray(
+        source_world_to_camera, dtype=np.float64
+    )
+    target_world_to_camera = np.asarray(
+        target_world_to_camera, dtype=np.float64
+    )
+    if (
+        source.ndim != 2
+        or source.shape[1:] != (3,)
+        or target.shape != source.shape
+        or len(source) < 2
+        or source_world_to_camera.shape != (len(source), 3, 3)
+        or target_world_to_camera.shape != source_world_to_camera.shape
+        or not np.isfinite(source).all()
+        or not np.isfinite(target).all()
+        or not np.isfinite(source_world_to_camera).all()
+        or not np.isfinite(target_world_to_camera).all()
+    ):
+        raise ArtifactError("overlap synchronization points are invalid")
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    source_centered = source - source_mean
+    target_centered = target - target_mean
+    rank = min(
+        int(np.linalg.matrix_rank(source_centered)),
+        int(np.linalg.matrix_rank(target_centered)),
+    )
+    if rank >= 2:
+        u, _singular, vt = np.linalg.svd(
+            target_centered.T @ source_centered
+        )
+        correction = np.eye(3)
+        correction[-1, -1] = -1.0 if np.linalg.det(u @ vt) < 0 else 1.0
+        rotation = u @ correction @ vt
+        rotation_source = "shared_camera_centers"
+    else:
+        # Two centres leave rotation about their baseline unobservable.  The
+        # accepted camera orientations close that remaining fixed-SE(3)
+        # degree of freedom without using GNSS or any evaluation residual.
+        relative_rotations = np.einsum(
+            "nji,njk->nik",
+            target_world_to_camera,
+            source_world_to_camera,
+        )
+        u, _singular, vt = np.linalg.svd(relative_rotations.sum(axis=0))
+        correction = np.eye(3)
+        correction[-1, -1] = -1.0 if np.linalg.det(u @ vt) < 0 else 1.0
+        rotation = u @ correction @ vt
+        rotation_source = "shared_camera_orientations"
+    translation = target_mean - rotation @ source_mean
+    denominator = float(np.einsum("ni,ni->", source_centered, source_centered))
+    if denominator <= 1.0e-12:
+        raise ArtifactError("overlap does not observe fixed metric scale")
+    rotated = source_centered @ rotation.T
+    scale = float(
+        np.einsum("ni,ni->", target_centered, rotated) / denominator
+    )
+    if (
+        not np.isfinite(rotation).all()
+        or not np.isfinite(translation).all()
+        or not math.isfinite(scale)
+        or scale <= 0.0
+        or not np.allclose(rotation @ rotation.T, np.eye(3), atol=1.0e-10)
+        or not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=1.0e-10)
+    ):
+        raise ArtifactError("overlap synchronization produced an invalid SE(3)")
+    residuals = np.linalg.norm(
+        source @ rotation.T + translation - target, axis=1
+    )
+    angle = float(
+        np.degrees(
+            np.arccos(
+                np.clip((np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0)
             )
-        first_indices = np.asarray([first_by_id[value] for value in shared])
-        second_indices = np.asarray([second_by_id[value] for value in shared])
-        first_names = [first["left_image_names"][index] for index in first_indices]
-        second_names = [second["left_image_names"][index] for index in second_indices]
-        if first_names != second_names or not np.array_equal(
-            first["timestamps_ns"][first_indices],
-            second["timestamps_ns"][second_indices],
-        ):
-            raise ArtifactError("overlap frame identity differs between submaps")
-        center_errors = np.linalg.norm(
-            first["centers"][first_indices] - second["centers"][second_indices],
+        )
+    )
+    return {
+        "rotation": rotation,
+        "translation": translation,
+        "source_rank": rank,
+        "rotation_source": rotation_source,
+        "sim3_scale_diagnostic": scale,
+        "rotation_deg": angle,
+        "residuals_m": residuals,
+    }
+
+
+def _transform_candidate(
+    candidate: Mapping[str, Any],
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> dict[str, Any]:
+    viewmats, centers = _apply_world_alignment(
+        np.asarray(candidate["viewmats"]),
+        np.asarray(candidate["centers"]),
+        rotation,
+        translation,
+    )
+    source_viewmats, source_centers = _apply_world_alignment(
+        np.asarray(candidate["source_viewmats"]),
+        np.asarray(candidate["source_centers"]),
+        rotation,
+        translation,
+    )
+    return {
+        **candidate,
+        "viewmats": viewmats,
+        "centers": centers,
+        "source_viewmats": source_viewmats,
+        "source_centers": source_centers,
+    }
+
+
+def _synchronized_holdout_quality(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    mask = np.asarray([role == "holdout" for role in candidate["roles"]])
+    centers = np.asarray(candidate["centers"])[mask]
+    targets = np.asarray(candidate["prior_centers"])[mask]
+    covariance = np.asarray(candidate["prior_covariances"])[mask]
+    if (
+        len(centers) < 1
+        or not np.isfinite(centers).all()
+        or not np.isfinite(targets).all()
+        or not np.isfinite(covariance).all()
+    ):
+        raise ArtifactError("synchronized submap has invalid held-out RTK data")
+    residual_vectors = centers - targets
+    residuals = np.linalg.norm(residual_vectors, axis=1)
+    sigma = np.sqrt(
+        np.maximum(np.linalg.eigvalsh(covariance)[:, -1], 1.0e-8)
+    )
+    mapper_config = candidate["mapper_config"]
+    thresholds = np.maximum(
+        float(mapper_config.alignment_ransac_threshold_m), 3.0 * sigma
+    )
+    quality = rtk_residual_quality(
+        residual_vectors,
+        covariance,
+        residuals <= thresholds,
+        config=mapper_config,
+    )
+    passed = all(
+        check["passed"]
+        for check in quality["checks"].values()
+        if check.get("authoritative", True)
+    )
+    return {
+        "result": str(candidate["result"]["artifact"]),
+        "n_holdout": int(mask.sum()),
+        "checks": quality["checks"],
+        "residual_m": quality["residual_m"],
+        "passed": passed,
+    }
+
+
+def _synchronize_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    minimum_overlap_frames: int = 2,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Synchronize arbitrary submap gauges, then fit one GNSS-only SE(3)."""
+    ordered = _ordered_overlap_candidates(candidates)
+    synchronized: list[dict[str, Any]] = [dict(ordered[0])]
+    edges: list[dict[str, Any]] = []
+    for source in ordered[1:]:
+        target = synchronized[-1]
+        shared, target_indices, source_indices = _shared_candidate_indices(
+            target, source, minimum=minimum_overlap_frames
+        )
+        alignment = _fixed_scale_overlap_alignment(
+            np.asarray(source["centers"])[source_indices],
+            np.asarray(target["centers"])[target_indices],
+            np.asarray(source["viewmats"])[source_indices, :3, :3],
+            np.asarray(target["viewmats"])[target_indices, :3, :3],
+        )
+        transformed = _transform_candidate(
+            source, alignment["rotation"], alignment["translation"]
+        )
+        post_center = np.linalg.norm(
+            np.asarray(target["centers"])[target_indices]
+            - np.asarray(transformed["centers"])[source_indices],
             axis=1,
         )
-        rotation_errors = _rotation_disagreement_deg(
-            first["viewmats"][first_indices, :3, :3],
-            second["viewmats"][second_indices, :3, :3],
+        post_rotation = _rotation_disagreement_deg(
+            np.asarray(target["viewmats"])[target_indices, :3, :3],
+            np.asarray(transformed["viewmats"])[source_indices, :3, :3],
         )
-        center = _summary(center_errors)
-        rotation = _summary(rotation_errors)
-        checks = {
-            "overlap_frame_count": {
-                "value": len(shared),
-                "minimum": policy.minimum_overlap_frames,
-                "passed": len(shared) >= policy.minimum_overlap_frames,
-            },
-            "median_center_disagreement_m": {
-                "value": center["median"],
-                "maximum": policy.max_median_center_disagreement_m,
-                "passed": center["median"]
-                <= policy.max_median_center_disagreement_m,
-            },
-            "p95_center_disagreement_m": {
-                "value": center["p95"],
-                "maximum": policy.max_p95_center_disagreement_m,
-                "passed": center["p95"] <= policy.max_p95_center_disagreement_m,
-            },
-            "maximum_center_disagreement_m": {
-                "value": center["maximum"],
-                "maximum": policy.max_center_disagreement_m,
-                "passed": center["maximum"] <= policy.max_center_disagreement_m,
-            },
-            "median_rotation_disagreement_deg": {
-                "value": rotation["median"],
-                "maximum": policy.max_median_rotation_disagreement_deg,
-                "passed": rotation["median"]
-                <= policy.max_median_rotation_disagreement_deg,
-            },
-            "p95_rotation_disagreement_deg": {
-                "value": rotation["p95"],
-                "maximum": policy.max_p95_rotation_disagreement_deg,
-                "passed": rotation["p95"]
-                <= policy.max_p95_rotation_disagreement_deg,
-            },
-            "maximum_rotation_disagreement_deg": {
-                "value": rotation["maximum"],
-                "maximum": policy.max_rotation_disagreement_deg,
-                "passed": rotation["maximum"]
-                <= policy.max_rotation_disagreement_deg,
-            },
-        }
-        pairs.append(
+        edges.append(
             {
-                "first_result": str(first["result"]["artifact"]),
-                "second_result": str(second["result"]["artifact"]),
-                "first_result_seal_sha256": first["result"][
-                    "result_seal_sha256"
+                "target_result": str(target["result"]["artifact"]),
+                "source_result": str(source["result"]["artifact"]),
+                "overlap_frame_count": len(shared),
+                "frame_ids_sha256": canonical_hash(shared),
+                "production_scale": 1.0,
+                "sim3_scale_applied": False,
+                "sim3_scale_diagnostic": alignment[
+                    "sim3_scale_diagnostic"
                 ],
-                "second_result_seal_sha256": second["result"][
-                    "result_seal_sha256"
-                ],
-                "frame_ids": shared,
-                "center_disagreement_m": center,
-                "rotation_disagreement_deg": rotation,
-                "per_frame_center_disagreement_m": center_errors.tolist(),
-                "per_frame_rotation_disagreement_deg": rotation_errors.tolist(),
-                "checks": checks,
-                "passed": _authoritative_checks_pass(checks),
+                "source_rank": alignment["source_rank"],
+                "rotation_source": alignment["rotation_source"],
+                "rotation_target_source": alignment["rotation"].tolist(),
+                "translation_target_source_m": alignment[
+                    "translation"
+                ].tolist(),
+                "rotation_correction_deg": alignment["rotation_deg"],
+                "fit_residual_m": _summary(alignment["residuals_m"]),
+                "post_transform_center_disagreement_m": _summary(post_center),
+                "post_transform_rotation_disagreement_deg": _summary(
+                    post_rotation
+                ),
             }
         )
+        synchronized.append(transformed)
+
+    occurrences: dict[str, list[tuple[Mapping[str, Any], int]]] = defaultdict(
+        list
+    )
+    for candidate in synchronized:
+        for index, name in enumerate(candidate["left_image_names"]):
+            occurrences[str(name)].append((candidate, index))
+    calibration_names: list[str] = []
+    calibration_source: list[np.ndarray] = []
+    calibration_target: list[np.ndarray] = []
+    calibration_covariance: list[np.ndarray] = []
+    for name in sorted(occurrences):
+        entries = occurrences[name]
+        if any(entry[0]["roles"][entry[1]] != "calibration" for entry in entries):
+            continue
+        sources = np.stack(
+            [np.asarray(entry[0]["centers"])[entry[1]] for entry in entries]
+        )
+        targets = np.stack(
+            [
+                np.asarray(entry[0]["prior_centers"])[entry[1]]
+                for entry in entries
+            ]
+        )
+        covariances = np.stack(
+            [
+                np.asarray(entry[0]["prior_covariances"])[entry[1]]
+                for entry in entries
+            ]
+        )
+        if (
+            not np.isfinite(sources).all()
+            or not np.isfinite(targets).all()
+            or not np.isfinite(covariances).all()
+            or not np.allclose(targets, targets[0], atol=1.0e-10, rtol=0.0)
+            or not np.allclose(
+                covariances, covariances[0], atol=1.0e-12, rtol=0.0
+            )
+        ):
+            raise ArtifactError("shared synchronization priors changed")
+        calibration_names.append(name)
+        calibration_source.append(sources.mean(axis=0))
+        calibration_target.append(targets[0])
+        calibration_covariance.append(covariances[0])
+    if len(calibration_names) < 3:
+        raise ArtifactError(
+            "submap synchronization has fewer than three shared-safe "
+            "calibration priors"
+        )
+    mapper_config = synchronized[0]["mapper_config"]
+    if any(
+        candidate["mapper_config"] != mapper_config
+        for candidate in synchronized[1:]
+    ):
+        raise ArtifactError("submap mapper/evaluation configurations differ")
+    global_alignment = estimate_rigid_alignment(
+        np.stack(calibration_source),
+        np.stack(calibration_target),
+        np.stack(calibration_covariance),
+        ransac_threshold_m=mapper_config.alignment_ransac_threshold_m,
+        ransac_iterations=mapper_config.alignment_ransac_iterations,
+        random_seed=mapper_config.random_seed,
+    )
+    synchronized = [
+        _transform_candidate(
+            candidate,
+            global_alignment.rotation,
+            global_alignment.translation,
+        )
+        for candidate in synchronized
+    ]
+    holdout = [
+        _synchronized_holdout_quality(candidate) for candidate in synchronized
+    ]
+    calibration_fraction = float(global_alignment.inlier_mask.mean())
+    checks = {
+        "shared_safe_calibration_inlier_fraction": {
+            "value": calibration_fraction,
+            "minimum": mapper_config.min_rtk_inlier_fraction,
+            "passed": calibration_fraction
+            >= mapper_config.min_rtk_inlier_fraction,
+        },
+        "all_synchronized_heldout_rtk_absolute_gates": {
+            "value": all(item["passed"] for item in holdout),
+            "expected": True,
+            "passed": all(item["passed"] for item in holdout),
+        },
+    }
+    record = {
+        "schema_version": 1,
+        "method": (
+            "adjacent_visual_overlap_fixed_se3_then_shared_safe_"
+            "calibration_gnss_fixed_se3_v1"
+        ),
+        "production_scale": 1.0,
+        "sim3_scale_applied": False,
+        "relative_alignment_inputs": [
+            "accepted_left_camera_centers_in_shared_frames"
+        ],
+        "relative_alignment_inputs_exclude": [
+            "raw_gnss_position",
+            "heldout_gnss_position",
+            "heldout_evaluation_result",
+        ],
+        "global_alignment_inputs": [
+            "calibration_position_priors",
+            "calibration_position_covariance",
+        ],
+        "global_alignment_inputs_exclude": [
+            "any_prior_held_out_in_any_covering_submap",
+            "temporally_rejected_gnss",
+            "heldout_evaluation_result",
+        ],
+        "edges": edges,
+        "shared_safe_calibration_count": len(calibration_names),
+        "shared_safe_calibration_names_sha256": canonical_hash(
+            calibration_names
+        ),
+        "global_alignment": {
+            "rotation_target_source": global_alignment.rotation.tolist(),
+            "translation_target_source_m": global_alignment.translation.tolist(),
+            "source_rank": global_alignment.source_rank,
+            "sim3_scale_diagnostic": global_alignment.sim3_scale_diagnostic,
+            "fit_residual_m": _summary(global_alignment.residuals_m),
+            "inlier_count": int(global_alignment.inlier_mask.sum()),
+        },
+        "synchronized_holdout": holdout,
+        "checks": checks,
+        "passed": _authoritative_checks_pass(checks),
+    }
+    return synchronized, record
+
+
+def _candidate_pair_report(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+    policy: GeodeticOverlapPolicy,
+) -> dict[str, Any]:
+    shared, first_indices, second_indices = _shared_candidate_indices(
+        first, second, minimum=policy.minimum_overlap_frames
+    )
+    center_errors = np.linalg.norm(
+        np.asarray(first["centers"])[first_indices]
+        - np.asarray(second["centers"])[second_indices],
+        axis=1,
+    )
+    rotation_errors = _rotation_disagreement_deg(
+        np.asarray(first["viewmats"])[first_indices, :3, :3],
+        np.asarray(second["viewmats"])[second_indices, :3, :3],
+    )
+    center = _summary(center_errors)
+    rotation = _summary(rotation_errors)
+    checks = {
+        "overlap_frame_count": {
+            "value": len(shared),
+            "minimum": policy.minimum_overlap_frames,
+            "passed": len(shared) >= policy.minimum_overlap_frames,
+        },
+        "median_center_disagreement_m": {
+            "value": center["median"],
+            "maximum": policy.max_median_center_disagreement_m,
+            "passed": center["median"]
+            <= policy.max_median_center_disagreement_m,
+        },
+        "p95_center_disagreement_m": {
+            "value": center["p95"],
+            "maximum": policy.max_p95_center_disagreement_m,
+            "passed": center["p95"] <= policy.max_p95_center_disagreement_m,
+        },
+        "maximum_center_disagreement_m": {
+            "value": center["maximum"],
+            "maximum": policy.max_center_disagreement_m,
+            "passed": center["maximum"] <= policy.max_center_disagreement_m,
+        },
+        "median_rotation_disagreement_deg": {
+            "value": rotation["median"],
+            "maximum": policy.max_median_rotation_disagreement_deg,
+            "passed": rotation["median"]
+            <= policy.max_median_rotation_disagreement_deg,
+        },
+        "p95_rotation_disagreement_deg": {
+            "value": rotation["p95"],
+            "maximum": policy.max_p95_rotation_disagreement_deg,
+            "passed": rotation["p95"]
+            <= policy.max_p95_rotation_disagreement_deg,
+        },
+        "maximum_rotation_disagreement_deg": {
+            "value": rotation["maximum"],
+            "maximum": policy.max_rotation_disagreement_deg,
+            "passed": rotation["maximum"]
+            <= policy.max_rotation_disagreement_deg,
+        },
+    }
+    return {
+        "first_result": str(first["result"]["artifact"]),
+        "second_result": str(second["result"]["artifact"]),
+        "first_result_seal_sha256": first["result"]["result_seal_sha256"],
+        "second_result_seal_sha256": second["result"]["result_seal_sha256"],
+        "frame_ids": shared,
+        "center_disagreement_m": center,
+        "rotation_disagreement_deg": rotation,
+        "per_frame_center_disagreement_m": center_errors.tolist(),
+        "per_frame_rotation_disagreement_deg": rotation_errors.tolist(),
+        "checks": checks,
+        "passed": _authoritative_checks_pass(checks),
+    }
+
+
+def _legacy_overlap_report(
+    candidates: Sequence[Mapping[str, Any]],
+    policy: GeodeticOverlapPolicy,
+) -> dict[str, Any]:
+    ordered = _ordered_overlap_candidates(candidates)
+    pairs = [
+        _candidate_pair_report(first, second, policy)
+        for first, second in zip(ordered, ordered[1:])
+    ]
     return {
         "schema_version": 1,
         "kind": _OVERLAP_KIND,
@@ -1370,6 +1770,57 @@ def _evaluate_overlap_candidates(
         "pairs": pairs,
         "passed": all(item["passed"] for item in pairs),
     }
+
+
+def _synchronized_overlap_report(
+    originals: Sequence[Mapping[str, Any]],
+    synchronized: Sequence[Mapping[str, Any]],
+    synchronization: Mapping[str, Any],
+    policy: GeodeticOverlapPolicy,
+) -> dict[str, Any]:
+    ordered_originals = _ordered_overlap_candidates(originals)
+    ordered_synchronized = _ordered_overlap_candidates(synchronized)
+    pairs: list[dict[str, Any]] = []
+    for first, second, synced_first, synced_second in zip(
+        ordered_originals[:-1],
+        ordered_originals[1:],
+        ordered_synchronized[:-1],
+        ordered_synchronized[1:],
+        strict=True,
+    ):
+        pre = _candidate_pair_report(first, second, policy)
+        post = _candidate_pair_report(synced_first, synced_second, policy)
+        post["pre_synchronization"] = {
+            "center_disagreement_m": pre["center_disagreement_m"],
+            "rotation_disagreement_deg": pre["rotation_disagreement_deg"],
+            "checks": pre["checks"],
+            "passed": pre["passed"],
+        }
+        pairs.append(post)
+    return {
+        "schema_version": 2,
+        "kind": _OVERLAP_KIND,
+        "policy": asdict(policy),
+        "result_count": len(ordered_synchronized),
+        "pair_count": len(pairs),
+        "synchronization": dict(synchronization),
+        "pairs": pairs,
+        "passed": bool(synchronization.get("passed"))
+        and all(item["passed"] for item in pairs),
+    }
+
+
+def _evaluate_overlap_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    policy: GeodeticOverlapPolicy,
+) -> dict[str, Any]:
+    synchronized, synchronization = _synchronize_candidates(
+        candidates,
+        minimum_overlap_frames=policy.minimum_overlap_frames,
+    )
+    return _synchronized_overlap_report(
+        candidates, synchronized, synchronization, policy
+    )
 
 
 def _overlap_csv(report: Mapping[str, Any]) -> bytes:
@@ -1488,7 +1939,13 @@ def audited_geodetic_overlap_report(artifact: str | Path) -> dict[str, Any]:
             if path not in paths:
                 paths.append(path)
     candidates = [_aligned_submap_candidate(path) for path in paths]
-    expected = _evaluate_overlap_candidates(candidates, policy)
+    schema_version = report.get("schema_version")
+    if schema_version == 1:
+        expected = _legacy_overlap_report(candidates, policy)
+    elif schema_version == 2:
+        expected = _evaluate_overlap_candidates(candidates, policy)
+    else:
+        raise ArtifactError("unsupported geodetic overlap report schema")
     return _verify_overlap_report_files(root, expected)
 
 
@@ -1680,8 +2137,17 @@ def publish_geodetic_full_pose_artifact(
         root,
         _verified_input_context=assembly["_runtime_context"],
     )
-    overlap = _evaluate_overlap_candidates(
-        candidates, assembly["config_object"].overlap_policy
+    synchronized_candidates, synchronization = _synchronize_candidates(
+        candidates,
+        minimum_overlap_frames=(
+            assembly["config_object"].overlap_policy.minimum_overlap_frames
+        ),
+    )
+    overlap = _synchronized_overlap_report(
+        candidates,
+        synchronized_candidates,
+        synchronization,
+        assembly["config_object"].overlap_policy,
     )
     (
         frontend,
@@ -1703,7 +2169,7 @@ def publish_geodetic_full_pose_artifact(
     rows = _selected_rows(manifest, selection["frame_ids"])
     viewmats, centers, contributors, contributor_counts = _blend_candidates(
         rows,
-        candidates,
+        synchronized_candidates,
         boundary_power=assembly["config_object"].blend_boundary_power,
     )
     frame_ids = np.asarray(
@@ -1933,20 +2399,24 @@ def publish_geodetic_full_pose_artifact(
             },
         }
         alignment = {
-            "schema_version": 1,
+            "schema_version": 2,
             **status,
-            "method": "calibration_only_fixed_se3_submaps_boundary_weighted_v1",
+            "method": (
+                "overlap_synchronized_then_calibration_only_fixed_se3_"
+                "submaps_boundary_weighted_v2"
+            ),
             "source_frame": "independent_colmap_submap_worlds",
             "target_frame": "local_enu_cartesian_pose_priors",
             "production_scale": 1.0,
             "sim3_scale_applied": False,
             "blend_boundary_power": assembly["config_object"].blend_boundary_power,
             "global_holdout_used_for_alignment_or_blending": False,
+            "synchronization": synchronization,
         }
         provenance = {
             "schema_version": 1,
             **status,
-            "method": "sealed_overlapping_geodetic_submap_assembly_v1",
+            "method": "sealed_overlapping_geodetic_submap_assembly_v2",
             "assembly_plan": assembly["artifact"],
             "assembly_plan_seal_sha256": assembly["plan_seal_sha256"],
             "frontend_artifact": str(frontend),
@@ -1970,7 +2440,10 @@ def publish_geodetic_full_pose_artifact(
                 "viewmats": "world_to_left_camera",
                 "viewmat_camera_axes": "OpenCV_x_right_y_down_z_forward",
                 "cam_centers": "left_camera_center_in_local_enu_m",
-                "world_alignment": "fixed_scale_SE3_per_submap_only",
+                "world_alignment": (
+                    "fixed_scale_SE3_overlap_synchronization_then_one_"
+                    "calibration_only_fixed_scale_SE3"
+                ),
             },
         }
         georeferencing = {
@@ -2073,24 +2546,51 @@ def audited_geodetic_full_pose_artifact(
             != recorded.get("plan_seal_sha256")
         ):
             raise ArtifactError("full pose submap-result binding changed")
+    method = provenance.get("method")
+    if method == "sealed_overlapping_geodetic_submap_assembly_v1":
+        blend_candidates = candidates
+        expected_overlap = _legacy_overlap_report(
+            candidates, assembly["config_object"].overlap_policy
+        )
+        expected_synchronization = None
+    elif method == "sealed_overlapping_geodetic_submap_assembly_v2":
+        blend_candidates, expected_synchronization = _synchronize_candidates(
+            candidates,
+            minimum_overlap_frames=(
+                assembly[
+                    "config_object"
+                ].overlap_policy.minimum_overlap_frames
+            ),
+        )
+        expected_overlap = _synchronized_overlap_report(
+            candidates,
+            blend_candidates,
+            expected_synchronization,
+            assembly["config_object"].overlap_policy,
+        )
+    else:
+        raise ArtifactError("unsupported full geodetic pose assembly method")
     expected_viewmats, expected_centers, _contributors, _counts = (
         _blend_candidates(
             rows,
-            candidates,
+            blend_candidates,
             boundary_power=assembly["config_object"].blend_boundary_power,
         )
     )
     viewmats = np.load(root / "viewmats.npy", allow_pickle=False)
     centers = np.load(root / "cam_centers.npy", allow_pickle=False)
     quality = _json(root / "quality.json")
-    expected_overlap = _evaluate_overlap_candidates(
-        candidates, assembly["config_object"].overlap_policy
-    )
+    alignment = _json(root / "alignment.json")
     if (
         not np.allclose(viewmats, expected_viewmats, atol=1.0e-12)
         or not np.allclose(centers, expected_centers, atol=1.0e-12)
         or quality.get("overlap") != expected_overlap
         or _json(root / "overlap.json") != expected_overlap
+        or (
+            expected_synchronization is not None
+            and alignment.get("synchronization")
+            != expected_synchronization
+        )
     ):
         raise ArtifactError("full pose no longer matches its sealed submaps")
     return {

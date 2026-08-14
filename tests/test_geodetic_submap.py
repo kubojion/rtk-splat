@@ -44,6 +44,10 @@ from rtk_splat.backends.geodetic_assembly import (
     GeodeticOverlapPolicy,
     _aligned_submap_candidate,
     _evaluate_overlap_candidates,
+    _file_evidence,
+    _legacy_overlap_report,
+    _overlap_csv,
+    _overlap_svg,
     audited_geodetic_assembly_plan,
     audited_geodetic_full_pose_artifact,
     audited_geodetic_overlap_report,
@@ -56,6 +60,7 @@ from rtk_splat.backends.geodetic_assembly import (
 )
 from rtk_splat.backends.mapper import (
     MapperConfig,
+    _apply_world_alignment,
     prepare_mapper_backend,
     run_image_registration,
     run_mapper_solve,
@@ -1742,15 +1747,62 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                 )
                 self.assertFalse(local_global & remaining)
 
-    def test_overlap_disagreement_fails_closed(self):
+    def test_overlap_fixed_se3_gauge_is_synchronized(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _, _, audited, _, results = self._completed_assembly(root)
             candidates = [_aligned_submap_candidate(path) for path in results]
             candidates[1] = dict(candidates[1])
-            candidates[1]["centers"] = candidates[1]["centers"] + np.asarray(
-                [1.0, 0.0, 0.0]
+            angle = np.deg2rad(5.0)
+            rotation = np.asarray(
+                [
+                    [np.cos(angle), -np.sin(angle), 0.0],
+                    [np.sin(angle), np.cos(angle), 0.0],
+                    [0.0, 0.0, 1.0],
+                ]
             )
+            viewmats, centers = _apply_world_alignment(
+                candidates[1]["viewmats"],
+                candidates[1]["centers"],
+                rotation,
+                np.asarray([1.0, -2.0, 0.5]),
+            )
+            candidates[1]["viewmats"] = viewmats
+            candidates[1]["centers"] = centers
+            report = _evaluate_overlap_candidates(
+                candidates, audited["config_object"].overlap_policy
+            )
+            self.assertTrue(report["passed"])
+            self.assertFalse(
+                report["pairs"][0]["pre_synchronization"]["passed"]
+            )
+            self.assertTrue(report["pairs"][0]["passed"])
+            self.assertEqual(
+                report["synchronization"]["production_scale"], 1.0
+            )
+            self.assertFalse(
+                report["synchronization"]["sim3_scale_applied"]
+            )
+            self.assertTrue(
+                report["synchronization"]["checks"][
+                    "all_synchronized_heldout_rtk_absolute_gates"
+                ]["passed"]
+            )
+
+    def test_overlap_nonrigid_scale_disagreement_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, audited, _, results = self._completed_assembly(root)
+            candidates = [_aligned_submap_candidate(path) for path in results]
+            candidates[1] = dict(candidates[1])
+            centers = np.asarray(candidates[1]["centers"]).copy()
+            centers = centers[0] + 1.5 * (centers - centers[0])
+            viewmats = np.asarray(candidates[1]["viewmats"]).copy()
+            viewmats[:, :3, 3] = -np.einsum(
+                "nij,nj->ni", viewmats[:, :3, :3], centers
+            )
+            candidates[1]["centers"] = centers
+            candidates[1]["viewmats"] = viewmats
             report = _evaluate_overlap_candidates(
                 candidates, audited["config_object"].overlap_policy
             )
@@ -1760,6 +1812,59 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                     "maximum_center_disagreement_m"
                 ]["passed"]
             )
+            self.assertEqual(
+                report["synchronization"]["production_scale"], 1.0
+            )
+            self.assertFalse(
+                report["synchronization"]["sim3_scale_applied"]
+            )
+
+    def test_legacy_overlap_audit_and_resealed_sync_tamper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, audited, _, results = self._completed_assembly(root)
+            candidates = [_aligned_submap_candidate(path) for path in results]
+            policy = audited["config_object"].overlap_policy
+            legacy = _legacy_overlap_report(candidates, policy)
+            legacy_root = root / "legacy-overlap"
+            legacy_root.mkdir()
+            _write_json(legacy_root / "overlap.json", legacy)
+            (legacy_root / "overlap.csv").write_bytes(_overlap_csv(legacy))
+            (legacy_root / "overlap.svg").write_bytes(_overlap_svg(legacy))
+            _write_json(
+                legacy_root / "manifest.json",
+                _file_evidence(
+                    legacy_root,
+                    ["overlap.json", "overlap.csv", "overlap.svg"],
+                ),
+            )
+            with mock.patch(
+                "rtk_splat.backends.geodetic_assembly."
+                "_aligned_submap_candidate",
+                side_effect=candidates,
+            ):
+                self.assertEqual(
+                    audited_geodetic_overlap_report(legacy_root)[
+                        "schema_version"
+                    ],
+                    1,
+                )
+
+            current_root = publish_geodetic_overlap_report(
+                results, root / "current-overlap", policy=policy
+            )
+            current = json.loads((current_root / "overlap.json").read_text())
+            current["synchronization"]["production_scale"] = 1.01
+            _write_json(current_root / "overlap.json", current)
+            _write_json(
+                current_root / "manifest.json",
+                _file_evidence(
+                    current_root,
+                    ["overlap.json", "overlap.csv", "overlap.svg"],
+                ),
+            )
+            with self.assertRaisesRegex(ArtifactError, "content changed"):
+                audited_geodetic_overlap_report(current_root)
 
     def test_assembly_code_and_launcher_are_generic(self):
         repository = Path(__file__).resolve().parents[1]
