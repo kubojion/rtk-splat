@@ -1788,6 +1788,68 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                     "all_synchronized_heldout_rtk_absolute_gates"
                 ]["passed"]
             )
+            scope = report["synchronization"][
+                "synchronized_holdout_scope"
+            ]
+            self.assertEqual(
+                scope["method"],
+                "heldout_in_every_covering_optimizer_v1",
+            )
+            self.assertEqual(scope["safe_holdout_count"], 2)
+            self.assertEqual(scope["excluded_local_holdout_count"], 1)
+            self.assertEqual(
+                [
+                    item["n_holdout"]
+                    for item in report["synchronization"][
+                        "synchronized_holdout"
+                    ]
+                ],
+                [1, 2],
+            )
+
+    def test_synchronized_holdout_excludes_cross_optimizer_role_leakage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, audited, _, results = self._completed_assembly(root)
+            candidates = [_aligned_submap_candidate(path) for path in results]
+            occurrences = {}
+            for candidate_index, candidate in enumerate(candidates):
+                for index, name in enumerate(candidate["left_image_names"]):
+                    occurrences.setdefault(str(name), []).append(
+                        (candidate_index, index, candidate["roles"][index])
+                    )
+            cross_role_name, entries = next(
+                (name, entries)
+                for name, entries in occurrences.items()
+                if {entry[2] for entry in entries}
+                == {"calibration", "holdout"}
+            )
+            baseline = _evaluate_overlap_candidates(
+                candidates, audited["config_object"].overlap_policy
+            )
+            changed = [dict(candidate) for candidate in candidates]
+            holdout_candidate, holdout_index, _ = next(
+                entry for entry in entries if entry[2] == "holdout"
+            )
+            changed[holdout_candidate]["prior_centers"] = np.asarray(
+                changed[holdout_candidate]["prior_centers"]
+            ).copy()
+            changed[holdout_candidate]["prior_centers"][holdout_index] += (
+                np.asarray([100.0, -50.0, 25.0])
+            )
+            repeated = _evaluate_overlap_candidates(
+                changed, audited["config_object"].overlap_policy
+            )
+
+            self.assertEqual(baseline, repeated)
+            scope = baseline["synchronization"][
+                "synchronized_holdout_scope"
+            ]
+            self.assertEqual(scope["excluded_local_holdout_count"], 1)
+            self.assertEqual(
+                scope["excluded_local_holdout_names_sha256"],
+                canonical_hash([cross_role_name]),
+            )
 
     def test_overlap_nonrigid_scale_disagreement_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1865,6 +1927,24 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ArtifactError, "content changed"):
                 audited_geodetic_overlap_report(current_root)
+
+            holdout_root = publish_geodetic_overlap_report(
+                results, root / "holdout-tamper", policy=policy
+            )
+            holdout = json.loads((holdout_root / "overlap.json").read_text())
+            holdout["synchronization"]["synchronized_holdout_scope"][
+                "safe_holdout_names_sha256"
+            ] = "0" * 64
+            _write_json(holdout_root / "overlap.json", holdout)
+            _write_json(
+                holdout_root / "manifest.json",
+                _file_evidence(
+                    holdout_root,
+                    ["overlap.json", "overlap.csv", "overlap.svg"],
+                ),
+            )
+            with self.assertRaisesRegex(ArtifactError, "content changed"):
+                audited_geodetic_overlap_report(holdout_root)
 
     def test_assembly_code_and_launcher_are_generic(self):
         repository = Path(__file__).resolve().parents[1]

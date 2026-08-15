@@ -1445,8 +1445,22 @@ def _transform_candidate(
 
 def _synchronized_holdout_quality(
     candidate: Mapping[str, Any],
+    safe_holdout_names: set[str],
 ) -> dict[str, Any]:
-    mask = np.asarray([role == "holdout" for role in candidate["roles"]])
+    """Evaluate only GNSS absent from every covering optimizer in scope."""
+    local_mask = np.asarray(
+        [role == "holdout" for role in candidate["roles"]]
+    )
+    mask = np.asarray(
+        [
+            role == "holdout" and str(name) in safe_holdout_names
+            for name, role in zip(
+                candidate["left_image_names"],
+                candidate["roles"],
+                strict=True,
+            )
+        ]
+    )
     centers = np.asarray(candidate["centers"])[mask]
     targets = np.asarray(candidate["prior_centers"])[mask]
     covariance = np.asarray(candidate["prior_covariances"])[mask]
@@ -1472,6 +1486,13 @@ def _synchronized_holdout_quality(
         residuals <= thresholds,
         config=mapper_config,
     )
+    names = [
+        str(name)
+        for name, selected in zip(
+            candidate["left_image_names"], mask, strict=True
+        )
+        if selected
+    ]
     passed = all(
         check["passed"]
         for check in quality["checks"].values()
@@ -1479,7 +1500,10 @@ def _synchronized_holdout_quality(
     )
     return {
         "result": str(candidate["result"]["artifact"]),
-        "n_holdout": int(mask.sum()),
+        "n_local_holdout": int(local_mask.sum()),
+        "n_holdout": len(names),
+        "excluded_local_holdout_count": int(local_mask.sum() - mask.sum()),
+        "holdout_names_sha256": canonical_hash(names),
         "checks": quality["checks"],
         "residual_m": quality["residual_m"],
         "passed": passed,
@@ -1491,7 +1515,7 @@ def _synchronize_candidates(
     *,
     minimum_overlap_frames: int = 2,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Synchronize arbitrary submap gauges, then fit one GNSS-only SE(3)."""
+    """Synchronize gauges and fit one leakage-free GNSS-only SE(3)."""
     ordered = _ordered_overlap_candidates(candidates)
     synchronized: list[dict[str, Any]] = [dict(ordered[0])]
     edges: list[dict[str, Any]] = []
@@ -1551,6 +1575,24 @@ def _synchronize_candidates(
     for candidate in synchronized:
         for index, name in enumerate(candidate["left_image_names"]):
             occurrences[str(name)].append((candidate, index))
+    roles_by_name = {
+        name: {
+            str(candidate["roles"][index])
+            for candidate, index in entries
+        }
+        for name, entries in occurrences.items()
+    }
+    safe_holdout_names = [
+        name
+        for name in sorted(occurrences)
+        if roles_by_name[name] == {"holdout"}
+    ]
+    excluded_local_holdout_names = [
+        name
+        for name in sorted(occurrences)
+        if "holdout" in roles_by_name[name]
+        and roles_by_name[name] != {"holdout"}
+    ]
     calibration_names: list[str] = []
     calibration_source: list[np.ndarray] = []
     calibration_target: list[np.ndarray] = []
@@ -1615,8 +1657,10 @@ def _synchronize_candidates(
         )
         for candidate in synchronized
     ]
+    safe_holdout_set = set(safe_holdout_names)
     holdout = [
-        _synchronized_holdout_quality(candidate) for candidate in synchronized
+        _synchronized_holdout_quality(candidate, safe_holdout_set)
+        for candidate in synchronized
     ]
     calibration_fraction = float(global_alignment.inlier_mask.mean())
     checks = {
@@ -1633,10 +1677,10 @@ def _synchronize_candidates(
         },
     }
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "method": (
             "adjacent_visual_overlap_fixed_se3_then_shared_safe_"
-            "calibration_gnss_fixed_se3_v1"
+            "calibration_gnss_fixed_se3_v2"
         ),
         "production_scale": 1.0,
         "sim3_scale_applied": False,
@@ -1662,6 +1706,34 @@ def _synchronize_candidates(
         "shared_safe_calibration_names_sha256": canonical_hash(
             calibration_names
         ),
+        "synchronized_holdout_scope": {
+            "schema_version": 1,
+            "method": "heldout_in_every_covering_optimizer_v1",
+            "decision_inputs": [
+                "sealed_local_prior_roles",
+                "covering_submap_image_inventory",
+            ],
+            "decision_inputs_exclude": [
+                "gnss_position_value",
+                "visual_pose",
+                "finished_visual_model_residual",
+                "heldout_evaluation_result",
+            ],
+            "physical_nonleakage_rule": (
+                "an evaluated GNSS observation must be held out in every "
+                "optimizer whose candidate contains that image"
+            ),
+            "safe_holdout_count": len(safe_holdout_names),
+            "safe_holdout_names_sha256": canonical_hash(
+                safe_holdout_names
+            ),
+            "excluded_local_holdout_count": len(
+                excluded_local_holdout_names
+            ),
+            "excluded_local_holdout_names_sha256": canonical_hash(
+                excluded_local_holdout_names
+            ),
+        },
         "global_alignment": {
             "rotation_target_source": global_alignment.rotation.tolist(),
             "translation_target_source_m": global_alignment.translation.tolist(),
