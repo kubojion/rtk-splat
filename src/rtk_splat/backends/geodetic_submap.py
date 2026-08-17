@@ -335,14 +335,15 @@ def _segment_binding(
     contract = provenance.get("contract_inputs")
     if not isinstance(contract, Mapping):
         raise ArtifactError("frontend provenance has no segment contract")
-    if Path(str(contract.get("segment_root", ""))).resolve() != segment:
-        raise ArtifactError("supplied segment differs from the sealed frontend")
+    sealed_source = Path(str(contract.get("segment_root", ""))).resolve()
+    if not sealed_source.is_dir():
+        raise ArtifactError("frontend sealed source segment is missing")
     files = contract.get("files")
     if not isinstance(files, Mapping):
         raise ArtifactError("frontend segment contract has no file evidence")
     current: dict[str, dict[str, Any]] = {}
     for relative, expected in files.items():
-        path = segment / str(relative)
+        path = sealed_source / str(relative)
         if not isinstance(expected, Mapping) or not path.is_file():
             raise ArtifactError(f"sealed segment input is missing: {relative}")
         record = {
@@ -352,10 +353,31 @@ def _segment_binding(
         if record != dict(expected):
             raise ArtifactError(f"sealed segment input changed: {relative}")
         current[str(relative)] = record
+    if segment == sealed_source:
+        return reader, {
+            "segment_root": str(segment),
+            "contract_inputs_sha256": canonical_hash(contract),
+            "files": current,
+        }
+    else:
+        # A completed frontend remains bound to the exact immutable source
+        # segment from which its images/features were built.  A later physical
+        # calibration may change only the camera priors in a separately sealed
+        # segment.  Accept that narrow case after recomputing its source delta;
+        # arbitrary replacement segments remain rejected.
+        from rtk_splat.diagnostics.raw_calibration import (
+            audited_calibrated_segment,
+        )
+
+        derived_evidence = audited_calibrated_segment(
+            segment, expected_source_segment=sealed_source
+        )
     return reader, {
         "segment_root": str(segment),
+        "frontend_source_segment_root": str(sealed_source),
         "contract_inputs_sha256": canonical_hash(contract),
         "files": current,
+        "calibrated_derivation": derived_evidence,
     }
 
 
@@ -2235,6 +2257,29 @@ def _decode_vector(blob: Any, shape: tuple[int, ...], label: str) -> np.ndarray:
     return result
 
 
+def _resolved_private_prior_position(
+    source_position: np.ndarray,
+    segment_center: np.ndarray,
+    *,
+    calibrated_derivation: bool,
+) -> tuple[np.ndarray, bool]:
+    """Resolve one private prior target without touching the source database."""
+    source = np.asarray(source_position, dtype=np.float64)
+    center = np.asarray(segment_center, dtype=np.float64)
+    if source.shape != (3,) or center.shape != (3,) or not (
+        np.isfinite(source).all() and np.isfinite(center).all()
+    ):
+        raise ArtifactError("pose-prior positions must be finite three-vectors")
+    if np.allclose(source, center, atol=1e-6, rtol=1e-9):
+        return source.copy(), False
+    if not calibrated_derivation:
+        raise ArtifactError(
+            "pose prior is not the segment's lever-arm-applied raw-GNSS "
+            "camera centre"
+        )
+    return center.copy(), True
+
+
 def _weight_and_split_priors(
     database: Path,
     rows: Sequence[Mapping[str, Any]],
@@ -2256,6 +2301,15 @@ def _weight_and_split_priors(
         }
         if "initial_camera_center_m" in frames
         else {}
+    )
+    calibrated_derivation = reader.meta.get("fixed_calibration_derivation")
+    calibrated_priors = bool(
+        isinstance(calibrated_derivation, Mapping)
+        and calibrated_derivation.get("kind")
+        == "rtk_splat_fixed_calibration_segment"
+        and calibrated_derivation.get("fixed_scale") == 1.0
+        and calibrated_derivation.get("raw_observations_changed") is False
+        and calibrated_derivation.get("frame_inventory_changed") is False
     )
     by_left = {
         str(row["left_image"]["name"]): (
@@ -2349,12 +2403,28 @@ def _weight_and_split_priors(
                     raise ArtifactError(
                         f"pose prior covariance is not positive definite: {name}"
                     ) from exc
-                if frame_id not in centers or not np.allclose(
-                    position, centers[frame_id], atol=1e-6, rtol=1e-9
-                ):
+                if frame_id not in centers:
                     raise ArtifactError(
-                        "pose prior is not the segment's lever-arm-applied raw-GNSS "
-                        f"camera centre: {name}"
+                        "pose prior has no segment camera centre: " + name
+                    )
+                source_position = position.copy()
+                position, position_replaced = _resolved_private_prior_position(
+                    source_position,
+                    centers[frame_id],
+                    calibrated_derivation=calibrated_priors,
+                )
+                if position_replaced:
+                    # The completed frontend remains immutable and retains its
+                    # rough-extrinsic priors.  Only its already-private submap
+                    # copy may receive the camera centres from an audited
+                    # fixed-calibration segment.
+                    connection.execute(
+                        "UPDATE pose_priors SET position=? "
+                        "WHERE pose_prior_id=?",
+                        (
+                            np.asarray(position, dtype="<f8").tobytes(),
+                            int(prior_id),
+                        ),
                     )
                 weighted = covariance / weight
                 eligible.append(
@@ -2363,6 +2433,10 @@ def _weight_and_split_priors(
                         "prior_id": int(prior_id),
                         "image_id": int(image_id),
                         "position_m": position.tolist(),
+                        "source_frontend_position_m": source_position.tolist(),
+                        "position_replaced_from_sealed_fixed_calibration": bool(
+                            position_replaced
+                        ),
                         "source_covariance_m2": covariance.tolist(),
                         "optimizer_covariance_m2": weighted.tolist(),
                         "optimizer_covariance_blob": np.asarray(

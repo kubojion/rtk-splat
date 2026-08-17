@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 from rosbags.rosbag2 import Reader
 from rosbags.typesys import Stores, get_types_from_msg, get_typestore
 
@@ -241,6 +242,49 @@ def _resolve_topic_bags(
             "calibration topics are missing: " + ", ".join(sorted(remaining))
         )
     return resolved
+
+
+def mcap_index_integrity(directory: Path) -> dict[str, int | bool]:
+    """Open and validate one indexed, single-file MCAP bag read-only."""
+    root = Path(directory).expanduser()
+    try:
+        with Reader(root) as reader:
+            storage_container = getattr(reader, "storage", None)
+            storages = getattr(storage_container, "storages", None)
+            if not storages or len(storages) != 1:
+                raise RuntimeError(
+                    "MCAP audit requires one indexed storage file"
+                )
+            storage = storages[0]
+            chunks = list(getattr(storage, "chunks", ()))
+            data_start = int(getattr(storage, "data_start"))
+            data_end = int(getattr(storage, "data_end"))
+            connection_count = len(reader.connections)
+    except RuntimeError:
+        raise
+    except BaseException as exc:
+        raise RuntimeError(
+            f"cannot parse MCAP indexes in {root}: {exc}"
+        ) from exc
+    if not chunks or data_start < 0 or data_end <= data_start:
+        raise RuntimeError(f"MCAP has no valid indexed data range: {root}")
+    offsets = [int(item.chunk_start_offset) for item in chunks]
+    starts = [int(item.message_start_time) for item in chunks]
+    stops = [int(item.message_end_time) for item in chunks]
+    if offsets != sorted(offsets) or any(
+        stop < start for start, stop in zip(starts, stops)
+    ):
+        raise RuntimeError(f"MCAP chunk index is inconsistent: {root}")
+    return {
+        "reader_opened": True,
+        "connection_count": connection_count,
+        "chunk_count": len(chunks),
+        "data_start_offset": data_start,
+        "data_end_offset": data_end,
+        "first_chunk_message_start_ns": min(starts),
+        "last_chunk_message_stop_ns": max(stops),
+        "chunk_offsets_monotonic": True,
+    }
 
 
 def _bounded_reader_messages(
@@ -533,6 +577,218 @@ def read_calibration_bag_observations(
         moving_base_pvt=tuple(pvt),
         topic_bags=tuple(
             sorted((topic, str(path)) for topic, path in topic_bags.items())
+        ),
+        header_window_ns=image_window,
+        rtk_window_ns=rtk_window,
+        log_window_ns=log_window,
+    )
+
+
+def read_selected_calibration_bag_observations(
+    *,
+    camera_bag: Path,
+    navigation_bag: Path,
+    topics: CalibrationTopics,
+    typestore,
+    frame_ids: Sequence[int],
+    left_header_ns: Sequence[int],
+    right_header_ns: Sequence[int],
+    left_image_paths: Sequence[Path],
+    right_image_paths: Sequence[Path],
+    rtk_start_header_ns: int,
+    rtk_stop_header_ns: int,
+    log_margin_ns: int = 5 * _NS_PER_S,
+) -> CalibrationBagObservations:
+    """Recover an explicit immutable stereo selection and nearby RTK data.
+
+    Unlike :func:`read_calibration_bag_observations`, this entry point does
+    not reproduce an historical stride or infer frame IDs from bag order.
+    Every selected camera header stamp and extracted JPEG path is provided by
+    the caller.  Camera evidence is read only from ``camera_bag`` and RTK
+    evidence only from ``navigation_bag`` even when a recording contains
+    duplicate topics.  This makes the source of each observation explicit and
+    prevents bag-order precedence from silently changing an audit.
+    """
+    ids = np.asarray(frame_ids)
+    left_ns = np.asarray(left_header_ns)
+    right_ns = np.asarray(right_header_ns)
+    left_paths = tuple(Path(path) for path in left_image_paths)
+    right_paths = tuple(Path(path) for path in right_image_paths)
+    n = len(ids)
+    if not (
+        ids.ndim == left_ns.ndim == right_ns.ndim == 1
+        and len(left_ns) == len(right_ns) == len(left_paths)
+        == len(right_paths) == n
+    ):
+        raise ValueError("selected stereo inputs must be equal-length vectors")
+    if n == 0:
+        raise ValueError("selected stereo inputs cannot be empty")
+    if (
+        not np.issubdtype(ids.dtype, np.integer)
+        or not np.issubdtype(left_ns.dtype, np.integer)
+        or not np.issubdtype(right_ns.dtype, np.integer)
+    ):
+        raise ValueError("selected frame IDs and timestamps must be integers")
+    ids = ids.astype(np.int64, copy=False)
+    left_ns = left_ns.astype(np.int64, copy=False)
+    right_ns = right_ns.astype(np.int64, copy=False)
+    if (
+        np.any(ids < 0)
+        or len(np.unique(ids)) != n
+        or len(np.unique(left_ns)) != n
+        or len(np.unique(right_ns)) != n
+        or np.any(np.diff(ids) <= 0)
+        or np.any(np.diff(left_ns) <= 0)
+        or np.any(np.diff(right_ns) <= 0)
+    ):
+        raise ValueError(
+            "selected frame IDs and timestamps must be unique and increasing"
+        )
+    if len(set(left_paths)) != n or len(set(right_paths)) != n:
+        raise ValueError("selected extracted image paths must be unique")
+    if any(not path.is_file() for path in left_paths + right_paths):
+        raise FileNotFoundError("a selected extracted stereo image is missing")
+
+    camera = Path(camera_bag).expanduser()
+    navigation = Path(navigation_bag).expanduser()
+    if camera.resolve() == navigation.resolve():
+        raise ValueError("camera and navigation bags must be distinct inputs")
+    margin = int(log_margin_ns)
+    if margin < 0:
+        raise ValueError("log_margin_ns cannot be negative")
+    rtk_window = _validate_windows(
+        rtk_start_header_ns, rtk_stop_header_ns, "RTK window"
+    )
+    image_window = (int(min(left_ns[0], right_ns[0])),
+                    int(max(left_ns[-1], right_ns[-1])))
+    log_window = (
+        min(image_window[0], rtk_window[0]) - margin,
+        max(image_window[1], rtk_window[1]) + margin,
+    )
+
+    expected_by_topic = {
+        topics.left_image: camera,
+        topics.right_image: camera,
+        topics.fix: navigation,
+        topics.relpos: navigation,
+        topics.moving_base_pvt: navigation,
+    }
+    grouped: dict[Path, set[str]] = {}
+    for topic, bag in expected_by_topic.items():
+        grouped.setdefault(bag, set()).add(topic)
+    for bag, required_topics in grouped.items():
+        with Reader(bag) as reader:
+            available = {item.topic for item in reader.connections}
+        missing = required_topics - available
+        if missing:
+            raise RuntimeError(
+                f"required topics are missing from {bag}: "
+                + ", ".join(sorted(missing))
+            )
+
+    wanted_left = {int(value) for value in left_ns}
+    wanted_right = {int(value) for value in right_ns}
+    left_digests: dict[int, _ImageDigest] = {}
+    right_digests: dict[int, _ImageDigest] = {}
+    fixes: list[NavSatFixObservation] = []
+    relpos: list[RelPosObservation] = []
+    pvt: list[NavPvtStatusObservation] = []
+
+    for bag, bag_topics in grouped.items():
+        with Reader(bag) as reader:
+            connections = [
+                connection
+                for connection in reader.connections
+                if connection.topic in bag_topics
+            ]
+            for connection, log_ns_value, raw in _bounded_reader_messages(
+                reader, connections, log_window[0], log_window[1]
+            ):
+                message = typestore.deserialize_cdr(raw, connection.msgtype)
+                stamp_ns = header_stamp_ns(message)
+                topic = connection.topic
+                if topic == topics.left_image and stamp_ns in wanted_left:
+                    if stamp_ns in left_digests:
+                        raise RuntimeError(
+                            f"duplicate selected left header stamp {stamp_ns}"
+                        )
+                    left_digests[stamp_ns] = _ImageDigest(
+                        header_ns=stamp_ns,
+                        log_ns=int(log_ns_value),
+                        sha256=_sha256_bytes(_jpeg_bytes(message)),
+                    )
+                elif topic == topics.right_image and stamp_ns in wanted_right:
+                    if stamp_ns in right_digests:
+                        raise RuntimeError(
+                            f"duplicate selected right header stamp {stamp_ns}"
+                        )
+                    right_digests[stamp_ns] = _ImageDigest(
+                        header_ns=stamp_ns,
+                        log_ns=int(log_ns_value),
+                        sha256=_sha256_bytes(_jpeg_bytes(message)),
+                    )
+                elif rtk_window[0] <= stamp_ns <= rtk_window[1]:
+                    if topic == topics.fix:
+                        fixes.append(navsat_fix_observation(message, log_ns_value))
+                    elif topic == topics.relpos:
+                        relpos.append(relpos_observation(message, log_ns_value))
+                    elif topic == topics.moving_base_pvt:
+                        pvt.append(
+                            navpvt_status_observation(message, log_ns_value)
+                        )
+
+    missing_left = wanted_left - set(left_digests)
+    missing_right = wanted_right - set(right_digests)
+    if missing_left or missing_right:
+        raise RuntimeError(
+            "selected stereo header stamps are missing from the camera bag "
+            f"(left={len(missing_left)}, right={len(missing_right)})"
+        )
+    if not fixes or not relpos or not pvt:
+        raise RuntimeError(
+            "bounded navigation pass did not recover all RTK streams "
+            f"(fix={len(fixes)}, relpos={len(relpos)}, pvt={len(pvt)})"
+        )
+
+    frames_out: list[StereoFrameObservation] = []
+    for frame_id, left_stamp, right_stamp, left_path, right_path in zip(
+        ids, left_ns, right_ns, left_paths, right_paths
+    ):
+        left = left_digests[int(left_stamp)]
+        right = right_digests[int(right_stamp)]
+        if _sha256_file(left_path) != left.sha256:
+            raise ValueError(
+                f"left JPEG hash mismatch at selected frame {int(frame_id)}"
+            )
+        if _sha256_file(right_path) != right.sha256:
+            raise ValueError(
+                f"right JPEG hash mismatch at selected frame {int(frame_id)}"
+            )
+        frames_out.append(
+            StereoFrameObservation(
+                frame_id=int(frame_id),
+                left_header_ns=left.header_ns,
+                left_log_ns=left.log_ns,
+                right_header_ns=right.header_ns,
+                right_log_ns=right.log_ns,
+                left_sha256=left.sha256,
+                right_sha256=right.sha256,
+            )
+        )
+
+    fixes.sort(key=lambda item: (item.header_ns, item.log_ns))
+    relpos.sort(key=lambda item: (item.header_ns, item.log_ns))
+    pvt.sort(key=lambda item: (item.header_ns, item.log_ns))
+    return CalibrationBagObservations(
+        stereo_frames=tuple(frames_out),
+        fixes=tuple(fixes),
+        relpos=tuple(relpos),
+        moving_base_pvt=tuple(pvt),
+        topic_bags=tuple(
+            sorted(
+                (topic, str(path.resolve()))
+                for topic, path in expected_by_topic.items()
+            )
         ),
         header_window_ns=image_window,
         rtk_window_ns=rtk_window,

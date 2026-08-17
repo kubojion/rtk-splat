@@ -14,6 +14,7 @@ from rtk_splat.adapters.calibration_bag import (
     _bounded_reader_messages,
     historical_stereo_bucket,
     read_calibration_bag_observations,
+    read_selected_calibration_bag_observations,
 )
 from rtk_splat.diagnostics.calibration_io import (
     CameraAntennaGeometry,
@@ -257,6 +258,53 @@ class ArtifactAndGeometryTests(unittest.TestCase):
                 ".audit_v2.*"))
             self.assertEqual(hidden, [])
 
+    def test_raw_trajectory_accepts_explicit_flat_image_assignment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model"
+            model.mkdir()
+            (model / "rigs.txt").write_text(
+                "3 2 CAMERA 1 CAMERA 2 1 1 0 0 0 -0.12 0 0\n"
+            )
+            (model / "frames.txt").write_text(
+                "10 3 1 0 0 0 0 0 0 2 CAMERA 1 1 CAMERA 2 2\n"
+                "11 3 1 0 0 0 -1 0 0 2 CAMERA 1 3 CAMERA 2 4\n"
+            )
+            database = root / "database.db"
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE images ("
+                    "image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO images VALUES (?, ?, ?)",
+                    [
+                        (1, "left_000010.jpg", 1),
+                        (2, "right_000010.jpg", 2),
+                        (3, "left_000011.jpg", 1),
+                        (4, "right_000011.jpg", 2),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            trajectory = load_raw_colmap_rig_trajectory(
+                model,
+                database,
+                left_image_frame_ids={
+                    "left_000010.jpg": 0,
+                    "left_000011.jpg": 1,
+                },
+                expected_frame_count=2,
+            )
+            self.assertEqual(
+                trajectory.image_names,
+                ("left_000010.jpg", "left_000011.jpg"),
+            )
+            np.testing.assert_array_equal(trajectory.frame_indices, [0, 1])
+
 
 class BagObservationTests(unittest.TestCase):
     def setUp(self):
@@ -407,6 +455,70 @@ class BagObservationTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "right JPEG hash"):
                     self.read([Path(camera_bag), Path(rtk_bag)], image_dir)
+
+    def test_explicit_selection_uses_declared_camera_and_navigation_bags(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            camera_bag, rtk_bag, _ = self.prepare_fake_bags(temporary)
+            camera_data = FakeReader.datasets[camera_bag]
+            rtk_data = FakeReader.datasets[rtk_bag]
+            # Both recordings deliberately expose all topics.  The explicit
+            # reader must still take images only from camera_bag and RTK only
+            # from navigation_bag.
+            camera_data["connections"] += rtk_data["connections"]
+            camera_data["messages"] += [
+                (connection, log_ns, fix_message(self.base_ns))
+                if connection.topic == "/fix"
+                else (connection, log_ns, message)
+                for connection, log_ns, message in rtk_data["messages"]
+            ]
+            rtk_data["connections"] += camera_data["connections"][:2]
+            rtk_data["messages"] += camera_data["messages"][:2]
+
+            ids = np.asarray([4, 9], dtype=np.int64)
+            left_ns = np.asarray(
+                [self.base_ns, self.base_ns + 4 * self.step_ns],
+                dtype=np.int64,
+            )
+            right_ns = left_ns + 1_000_000
+            left_paths = []
+            right_paths = []
+            for frame_id, source_index in zip(ids, [0, 4]):
+                left = Path(temporary) / f"selected-left-{frame_id}.jpg"
+                right = Path(temporary) / f"selected-right-{frame_id}.jpg"
+                left.write_bytes(f"left-{source_index}".encode())
+                right.write_bytes(f"right-{source_index}".encode())
+                left_paths.append(left)
+                right_paths.append(right)
+
+            with patch(
+                "rtk_splat.adapters.calibration_bag.Reader", FakeReader
+            ):
+                observations = read_selected_calibration_bag_observations(
+                    camera_bag=Path(camera_bag),
+                    navigation_bag=Path(rtk_bag),
+                    topics=self.topics,
+                    typestore=FakeTypestore(),
+                    frame_ids=ids,
+                    left_header_ns=left_ns,
+                    right_header_ns=right_ns,
+                    left_image_paths=left_paths,
+                    right_image_paths=right_paths,
+                    rtk_start_header_ns=self.base_ns,
+                    rtk_stop_header_ns=self.base_ns + 5 * self.step_ns,
+                    log_margin_ns=1_000_000_000,
+                )
+
+        np.testing.assert_array_equal(
+            [item.frame_id for item in observations.stereo_frames], [4, 9]
+        )
+        self.assertEqual(len(observations.fixes), 1)
+        self.assertEqual(observations.fixes[0].latitude_deg, 52.1)
+        self.assertEqual(
+            dict(observations.topic_bags)[self.topics.left_image], camera_bag
+        )
+        self.assertEqual(
+            dict(observations.topic_bags)[self.topics.fix], rtk_bag
+        )
 
     def test_historical_bucket_reproduces_epoch_float_expression(self):
         stamp_ns = self.base_ns + 987_654_321

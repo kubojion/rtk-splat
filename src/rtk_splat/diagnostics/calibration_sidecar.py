@@ -378,8 +378,16 @@ def _build_numerical_data(observations, trajectory, meta: dict,
     )
 
     origin = meta["world_origin"]
+    altitude = origin.get("alt0")
+    if altitude is None:
+        altitude = origin.get("alt0_ellipsoidal_m")
+    if altitude is None:
+        raise ValueError(
+            "world_origin must provide ellipsoidal altitude as alt0 or "
+            "alt0_ellipsoidal_m"
+        )
     enu = LocalWgs84Enu(
-        origin["lat0"], origin["lon0"], origin["alt0"])
+        origin["lat0"], origin["lon0"], altitude)
     raw_fix_enu = enu.to_enu(
         geodetic[:, 0], geodetic[:, 1], geodetic[:, 2])
 

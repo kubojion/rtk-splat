@@ -29,6 +29,7 @@ from rtk_splat.backends.geodetic_submap import (
     _full_trajectory_quality,
     _metric_specific_source_repairs,
     _plan_context,
+    _resolved_private_prior_position,
     _select_initial_pair_v2,
     _select_initial_pair_v3,
     _select_initial_pair_v5,
@@ -1096,6 +1097,22 @@ class GeodeticConditionalRtkGateTests(unittest.TestCase):
 
 
 class GeodeticSubmapArtifactTests(unittest.TestCase):
+    def test_fixed_calibration_updates_only_private_prior_target(self):
+        source = np.asarray([1.0, 2.0, 3.0])
+        corrected = np.asarray([1.04, 1.98, 3.01])
+        with self.assertRaisesRegex(ArtifactError, "lever-arm-applied"):
+            _resolved_private_prior_position(
+                source, corrected, calibrated_derivation=False
+            )
+
+        resolved, replaced = _resolved_private_prior_position(
+            source, corrected, calibrated_derivation=True
+        )
+
+        np.testing.assert_allclose(resolved, corrected)
+        np.testing.assert_allclose(source, [1.0, 2.0, 3.0])
+        self.assertTrue(replaced)
+
     def test_temporal_rejection_is_physically_absent_and_resealed_tamper_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
