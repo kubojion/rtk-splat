@@ -15,7 +15,10 @@ from pathlib import Path
 import statistics
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from rtk_splat.backends.artifact_io import _atomic_json, _json
+from rtk_splat.backends.colmap_model import _poses_from_images_txt
 from rtk_splat.backends.geodetic_assembly import (
     audited_geodetic_assembly_plan,
 )
@@ -26,6 +29,7 @@ from rtk_splat.backends.geodetic_submap import (
     prepare_geodetic_submap_plan,
     run_geodetic_submap_plan,
 )
+from rtk_splat.backends.quality import estimate_rigid_alignment
 from rtk_splat.frontends.artifact import (
     ArtifactError,
     canonical_hash,
@@ -35,6 +39,7 @@ from rtk_splat.frontends.artifact import (
 
 _BINDING_KIND = "rtk_splat_geodetic_continuous_window_binding"
 _SELECTION_KIND = "rtk_splat_geodetic_calibration_only_candidate_selection"
+_AUDIT_KIND = "rtk_splat_geodetic_calibration_only_residual_audit"
 
 
 def _selected_windows(
@@ -401,6 +406,288 @@ def _audited_selection(selection: str | Path, root: Path) -> dict[str, Any]:
     return recorded
 
 
+def _distribution(values: np.ndarray) -> dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or not len(array) or not np.isfinite(array).all():
+        raise ArtifactError("calibration audit distribution is invalid")
+    return {
+        "minimum": float(np.min(array)),
+        "median": float(np.median(array)),
+        "p95": float(np.quantile(array, 0.95)),
+        "maximum": float(np.max(array)),
+        "mean": float(np.mean(array)),
+    }
+
+
+def _correlation(first: np.ndarray, second: np.ndarray) -> float | None:
+    left = np.asarray(first, dtype=np.float64)
+    right = np.asarray(second, dtype=np.float64)
+    valid = np.isfinite(left) & np.isfinite(right)
+    if (
+        left.shape != right.shape
+        or valid.sum() < 3
+        or float(np.std(left[valid])) <= 1.0e-12
+        or float(np.std(right[valid])) <= 1.0e-12
+    ):
+        return None
+    return float(np.corrcoef(left[valid], right[valid])[0, 1])
+
+
+def _option(command: Sequence[str], name: str) -> str | None:
+    try:
+        index = list(command).index(name)
+    except ValueError:
+        return None
+    return str(command[index + 1]) if index + 1 < len(command) else None
+
+
+def _calibration_residual_audit(result_artifact: str | Path) -> dict[str, Any]:
+    """Audit a frozen result without loading any held-out target value."""
+
+    result = audited_geodetic_submap_result(
+        result_artifact, _include_internal_plan_context=True
+    )
+    plan_root, plan, _, mapper_config, context = result.pop(
+        "_internal_plan_context"
+    )
+    split = _json(plan_root / "prior_split.json")
+    calibration = [
+        record
+        for record in split.get("records", ())
+        if isinstance(record, Mapping) and record.get("role") == "calibration"
+    ]
+    if len(calibration) < 6:
+        raise ArtifactError("calibration-only audit has insufficient support")
+    names = [str(record["name"]) for record in calibration]
+    poses = _poses_from_images_txt(
+        Path(result["artifact"]) / "refined_text" / "images.txt"
+    )
+    if not set(names).issubset(poses):
+        raise ArtifactError("refined model lacks a calibration image")
+    source = np.stack([poses[name][1] for name in names])
+    target = np.stack(
+        [np.asarray(record["position_m"], dtype=np.float64) for record in calibration]
+    )
+    covariance = np.stack(
+        [
+            np.asarray(record["optimizer_covariance_m2"], dtype=np.float64)
+            for record in calibration
+        ]
+    )
+    timestamps_ns = np.asarray(
+        [int(record["timestamp_ns"]) for record in calibration],
+        dtype=np.int64,
+    )
+    block_ids = np.asarray(
+        [int(record["block_id"]) for record in calibration], dtype=np.int64
+    )
+    if np.any(np.diff(timestamps_ns) <= 0):
+        raise ArtifactError("calibration audit timestamps are not ordered")
+    alignment = estimate_rigid_alignment(
+        source,
+        target,
+        covariance,
+        ransac_threshold_m=mapper_config.alignment_ransac_threshold_m,
+        ransac_iterations=mapper_config.alignment_ransac_iterations,
+        random_seed=mapper_config.random_seed,
+    )
+    residual_vectors = (
+        source @ alignment.rotation.T + alignment.translation - target
+    )
+    residual_m = np.linalg.norm(residual_vectors, axis=1)
+
+    cross_validation: list[dict[str, Any]] = []
+    cross_validated_residuals: list[np.ndarray] = []
+    for block_id in sorted(int(value) for value in np.unique(block_ids)):
+        validation = block_ids == block_id
+        training = ~validation
+        if training.sum() < 3 or not validation.any():
+            raise ArtifactError("calibration block cross-validation is invalid")
+        fitted = estimate_rigid_alignment(
+            source[training],
+            target[training],
+            covariance[training],
+            ransac_threshold_m=mapper_config.alignment_ransac_threshold_m,
+            ransac_iterations=mapper_config.alignment_ransac_iterations,
+            random_seed=mapper_config.random_seed,
+        )
+        held_block = np.linalg.norm(
+            source[validation] @ fitted.rotation.T
+            + fitted.translation
+            - target[validation],
+            axis=1,
+        )
+        cross_validated_residuals.append(held_block)
+        cross_validation.append(
+            {
+                "validation_calibration_block_id": block_id,
+                "training_calibration_block_ids": sorted(
+                    int(value) for value in np.unique(block_ids[training])
+                ),
+                "validation_count": int(validation.sum()),
+                "residual_m": _distribution(held_block),
+            }
+        )
+    cross_validated = np.concatenate(cross_validated_residuals)
+
+    time_s = (timestamps_ns - timestamps_ns[0]).astype(np.float64) / 1.0e9
+    velocity = np.gradient(target, time_s, axis=0)
+    speed = np.linalg.norm(velocity[:, :2], axis=1)
+    moving = speed > 0.05
+    direction = np.full((len(speed), 2), np.nan, dtype=np.float64)
+    direction[moving] = velocity[moving, :2] / speed[moving, None]
+    longitudinal = np.sum(residual_vectors[:, :2] * direction, axis=1)
+    lateral = (
+        -residual_vectors[:, 0] * direction[:, 1]
+        + residual_vectors[:, 1] * direction[:, 0]
+    )
+    heading = np.unwrap(np.arctan2(velocity[:, 1], velocity[:, 0]))
+    turn_rate = np.gradient(heading, time_s)
+    source_residual_ms = np.asarray(
+        [
+            float(record["gnss_temporal_filter"]["source_residual_ns"])
+            / 1.0e6
+            for record in calibration
+        ],
+        dtype=np.float64,
+    )
+    implied_latency_ms = longitudinal[moving] / speed[moving] * 1.0e3
+
+    solve = result["solve"]
+    command = [str(value) for value in solve.get("command", ())]
+    log_path = Path(result["artifact"]) / str(solve["resources"]["log"])
+    log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    global_lines = [
+        index + 1
+        for index, line in enumerate(log_lines)
+        if "Retriangulation and Global bundle adjustment" in line
+    ]
+    fixed_mapper_contract = {
+        "pose_prior_mapper": len(command) > 1
+        and command[1] == "pose_prior_mapper",
+        "overwrite_prior_covariance": _option(
+            command, "--overwrite_priors_covariance"
+        )
+        == "0",
+        "fixed_intrinsics": all(
+            _option(command, option) == "0"
+            for option in (
+                "--Mapper.ba_refine_focal_length",
+                "--Mapper.ba_refine_principal_point",
+                "--Mapper.ba_refine_extra_params",
+            )
+        ),
+        "fixed_rig_extrinsics": _option(
+            command, "--Mapper.ba_refine_sensor_from_rig"
+        )
+        == "0",
+        "robust_position_priors": _option(
+            command, "--use_robust_loss_on_prior_position"
+        )
+        == "1",
+        "global_ba_backend": _option(command, "--Mapper.ba_global_backend"),
+        "global_bundle_adjustment_count": len(global_lines),
+        "last_global_bundle_adjustment_log_line": (
+            global_lines[-1] if global_lines else None
+        ),
+    }
+    fixed_mapper_contract["passed"] = bool(
+        all(
+            fixed_mapper_contract[name]
+            for name in (
+                "pose_prior_mapper",
+                "overwrite_prior_covariance",
+                "fixed_intrinsics",
+                "fixed_rig_extrinsics",
+                "robust_position_priors",
+            )
+        )
+        and fixed_mapper_contract["global_ba_backend"] == "CERES"
+        and fixed_mapper_contract["global_bundle_adjustment_count"] > 0
+    )
+    derivation = context["reader"].meta.get("fixed_calibration_derivation")
+    if not isinstance(derivation, Mapping):
+        raise ArtifactError("calibration audit lacks fixed calibration evidence")
+    body = {
+        "schema_version": 1,
+        "kind": _AUDIT_KIND,
+        "result_artifact": str(Path(result["artifact"]).resolve()),
+        "result_seal_sha256": result["result_seal_sha256"],
+        "plan_seal_sha256": sha256_file(plan_root / "plan_seal.json"),
+        "method": "calibration_roles_only_fixed_se3_temporal_block_cv_v1",
+        "heldout_target_values_used": False,
+        "calibration_count": len(calibration),
+        "calibration_block_ids": sorted(
+            int(value) for value in np.unique(block_ids)
+        ),
+        "all_calibration_fit": {
+            "residual_m": _distribution(residual_m),
+            "inlier_count": int(alignment.inlier_mask.sum()),
+            "inlier_fraction": float(alignment.inlier_mask.mean()),
+            "sim3_scale_diagnostic_only": float(
+                alignment.sim3_scale_diagnostic
+            ),
+            "production_scale": 1.0,
+        },
+        "calibration_block_cross_validation": {
+            "folds": cross_validation,
+            "all_validation_residual_m": _distribution(cross_validated),
+        },
+        "motion_and_timing": {
+            "speed_m_s": _distribution(speed),
+            "absolute_turn_rate_rad_s": _distribution(np.abs(turn_rate)),
+            "gnss_source_association_residual_ms": _distribution(
+                np.abs(source_residual_ms)
+            ),
+            "implied_longitudinal_latency_ms": _distribution(
+                implied_latency_ms
+            ),
+            "correlations": {
+                "residual_m_vs_time": _correlation(residual_m, time_s),
+                "residual_m_vs_speed": _correlation(residual_m, speed),
+                "residual_m_vs_absolute_turn_rate": _correlation(
+                    residual_m, np.abs(turn_rate)
+                ),
+                "longitudinal_residual_vs_speed": _correlation(
+                    longitudinal, speed
+                ),
+                "lateral_residual_vs_turn_rate": _correlation(
+                    lateral, turn_rate
+                ),
+                "longitudinal_residual_vs_gnss_source_residual": (
+                    _correlation(longitudinal, source_residual_ms)
+                ),
+                "east_residual_vs_heading_east": _correlation(
+                    residual_vectors[:, 0], direction[:, 0]
+                ),
+                "north_residual_vs_heading_north": _correlation(
+                    residual_vectors[:, 1], direction[:, 1]
+                ),
+            },
+        },
+        "fixed_calibration": {
+            "fixed_scale": derivation.get("fixed_scale"),
+            "camera_to_rtk_offset_ns": derivation.get(
+                "camera_to_rtk_offset_ns"
+            ),
+            "orientation_method": derivation.get(
+                "dual_antenna_orientation_method"
+            ),
+            "translation_sigma_camera_m": derivation.get(
+                "extrinsic_translation_sigma_camera_m"
+            ),
+            "raw_observations_changed": derivation.get(
+                "raw_observations_changed"
+            ),
+            "calibration_result_seal_sha256": derivation.get(
+                "calibration_result_seal_sha256"
+            ),
+        },
+        "pose_prior_preserving_global_refinement": fixed_mapper_contract,
+    }
+    return {**body, "audit_sha256": canonical_hash(body)}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -420,6 +707,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--result", required=True)
     run.add_argument("--colmap", required=True)
 
+    audit = commands.add_parser("audit-calibration")
+    audit.add_argument("--result", required=True)
+    audit.add_argument("--output", required=True)
+
     status = commands.add_parser("status")
     status.add_argument("--workspace", required=True)
     status.add_argument("--result")
@@ -428,6 +719,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "audit-calibration":
+        audit = _calibration_residual_audit(args.result)
+        _atomic_json(Path(args.output).expanduser().resolve(), audit)
+        print(json.dumps(audit, indent=2, sort_keys=True))
+        return 0 if audit["pose_prior_preserving_global_refinement"]["passed"] else 2
     if args.command == "prepare":
         value = _prepare(args)
         print(json.dumps(value, indent=2, sort_keys=True))

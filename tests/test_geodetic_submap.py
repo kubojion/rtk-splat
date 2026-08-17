@@ -1731,6 +1731,7 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
         )
         self.assertIn("prepare", continuous_help.stdout)
         self.assertIn("run", continuous_help.stdout)
+        self.assertIn("audit-calibration", continuous_help.stdout)
         contents = continuous.read_text(encoding="utf-8").lower()
         for token in ("field1", "/data/jkobo", "1100", "1800"):
             self.assertNotIn(token, contents)
