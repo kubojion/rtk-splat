@@ -42,6 +42,7 @@ from rtk_splat.backends.geodetic_submap import (
     _pair_candidates,
     _plan_context,
     _raw_gnss_endpoints,
+    _sealed_evaluation_priors,
     _selection_payload,
     _select_initial_pair_for_method,
     _selected_rows,
@@ -888,9 +889,8 @@ def _aligned_submap_candidate(
         for item in split["records"]
         if item.get("role") in {"calibration", "holdout"}
     }
-    priors = _cartesian_camera_priors(
-        Path(plan["frontend_artifact"]) / "database.db",
-        set(left_names),
+    priors = _sealed_evaluation_priors(
+        plan_root, plan, set(left_names)
     )
     priors = {
         name: value for name, value in priors.items() if name in evaluation_names
@@ -2146,6 +2146,49 @@ def _load_assembly_candidates(
     return candidates
 
 
+def _assembly_evaluation_priors(
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Combine identical sealed prior targets from accepted local plans."""
+
+    priors: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for candidate in candidates:
+        names = list(candidate["left_image_names"])
+        roles = list(candidate["roles"])
+        centers = np.asarray(candidate["prior_centers"], dtype=np.float64)
+        covariances = np.asarray(
+            candidate["prior_covariances"], dtype=np.float64
+        )
+        if (
+            centers.shape != (len(names), 3)
+            or covariances.shape != (len(names), 3, 3)
+            or len(roles) != len(names)
+        ):
+            raise ArtifactError("candidate sealed-prior arrays are invalid")
+        for index, (name, role) in enumerate(zip(names, roles, strict=True)):
+            if role == "excluded":
+                continue
+            position = centers[index]
+            covariance = covariances[index]
+            if not (
+                np.isfinite(position).all()
+                and np.isfinite(covariance).all()
+            ):
+                raise ArtifactError("candidate sealed prior is missing")
+            previous = priors.get(str(name))
+            if previous is not None and not (
+                np.array_equal(previous[0], position)
+                and np.array_equal(previous[1], covariance)
+            ):
+                raise ArtifactError(
+                    "overlapping submaps disagree on a sealed evaluation prior"
+                )
+            priors[str(name)] = (position.copy(), covariance.copy())
+    if len(priors) < 3:
+        raise ArtifactError("assembly has fewer than three sealed priors")
+    return priors
+
+
 def _direct_rtk_evaluation(
     centers: np.ndarray,
     names: Sequence[str],
@@ -2251,7 +2294,7 @@ def publish_geodetic_full_pose_artifact(
         [int(row["timestamp_ns"]) for row in rows], dtype=np.int64
     )
     names = [str(row["left_image"]["name"]) for row in rows]
-    priors = _cartesian_camera_priors(frontend / "database.db", set(names))
+    priors = _assembly_evaluation_priors(candidates)
     holdout_names = list(assembly["global_holdout"]["holdout_names"])
     excluded_set = set(assembly["global_holdout"]["excluded_names"])
     missing_eligible_priors = sorted(set(names) - set(priors) - excluded_set)

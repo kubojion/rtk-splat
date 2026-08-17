@@ -78,13 +78,16 @@ from rtk_splat.frontends.artifact import (
     sqlite_logical_record,
     verify_frontend_seal,
 )
+from rtk_splat.frontends.colmap import _trusted_priors
 
 
 _PAIR_ID_BASE = 2_147_483_647
 _SELECTION_KIND = "rtk_splat_geodetic_submap_frame_selection"
 _PLAN_KIND = "rtk_splat_geodetic_submap_plan"
 _RESULT_KIND = "rtk_splat_geodetic_submap_result"
-_HARDENED_PLAN_SCHEMA_VERSION = 3
+_HARDENED_PLAN_SCHEMA_VERSION = 4
+_SUPPORTED_PLAN_SCHEMA_VERSIONS = {1, 2, 3, 4}
+_SEALED_EVALUATION_PRIOR_SCHEMA_VERSION = 4
 _PLAN_FILES = (
     "all_images.txt",
     "calibration_prior_names.txt",
@@ -2280,8 +2283,116 @@ def _resolved_private_prior_position(
     return center.copy(), True
 
 
+def _resolved_private_prior_covariance(
+    source_covariance: np.ndarray,
+    segment_covariance: np.ndarray,
+    *,
+    calibrated_derivation: bool,
+) -> tuple[np.ndarray, bool]:
+    """Resolve the covariance paired with a private calibrated target.
+
+    A fixed-calibration segment may replace the rough camera/antenna lever-arm
+    uncertainty that was used when the immutable frontend database was built.
+    The private optimizer copy must use that same rederived camera-centre
+    covariance.  The source frontend remains byte-for-byte unchanged.
+    """
+
+    source = np.asarray(source_covariance, dtype=np.float64)
+    derived = np.asarray(segment_covariance, dtype=np.float64)
+    for label, value in (("source", source), ("segment", derived)):
+        if value.shape != (3, 3) or not np.isfinite(value).all():
+            raise ArtifactError(f"{label} pose-prior covariance is invalid")
+        value = 0.5 * (value + value.T)
+        try:
+            np.linalg.cholesky(value)
+        except np.linalg.LinAlgError as exc:
+            raise ArtifactError(
+                f"{label} pose-prior covariance is not positive definite"
+            ) from exc
+        if label == "source":
+            source = value
+        else:
+            derived = value
+    if np.allclose(source, derived, atol=1.0e-12, rtol=1.0e-12):
+        return source.copy(), False
+    if not calibrated_derivation:
+        raise ArtifactError(
+            "pose-prior covariance differs without a sealed fixed calibration"
+        )
+    return derived.copy(), True
+
+
+def _fixed_calibration_pose_priors(
+    frontend: Path,
+    reader: SegmentReader,
+) -> tuple[dict[int, tuple[np.ndarray, np.ndarray]], dict[str, Any]]:
+    """Recompute camera targets using the frontend's sealed prior policy.
+
+    This deliberately reuses the normal frontend covariance implementation.
+    Only the immutable segment's accepted fixed calibration changes; the raw
+    GNSS observations and the frontend's status/floor policy stay fixed.
+    """
+
+    marker_path = frontend / "stages" / "pose_priors.json"
+    if not marker_path.is_file():
+        raise ArtifactError(
+            "fixed-calibration prior rederivation needs the frontend "
+            "pose-prior stage marker"
+        )
+    marker = _json(marker_path)
+    inputs = marker.get("inputs")
+    if (
+        marker.get("schema_version") != 1
+        or marker.get("stage") != "pose_priors"
+        or marker.get("state") != "complete"
+        or not isinstance(inputs, Mapping)
+    ):
+        raise ArtifactError("frontend pose-prior stage marker is invalid")
+    try:
+        settings = {
+            "covariance_floor_m": float(inputs["covariance_floor_m"]),
+            "max_covariance_m2": (
+                None
+                if inputs["max_covariance_m2"] is None
+                else float(inputs["max_covariance_m2"])
+            ),
+            "min_fix_status": int(inputs["min_fix_status"]),
+            "min_carrier_status": int(inputs["min_carrier_status"]),
+            "max_source_residual_s": (
+                None
+                if inputs["max_source_residual_s"] is None
+                else float(inputs["max_source_residual_s"])
+            ),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactError(
+            "frontend pose-prior stage settings are invalid"
+        ) from exc
+    priors, skipped, quality_counts, covariance_model = _trusted_priors(
+        reader, **settings
+    )
+    return priors, {
+        "schema_version": 1,
+        "method": "normal_frontend_prior_rederivation_on_fixed_segment_v1",
+        "source_pose_prior_stage_sha256": sha256_file(marker_path),
+        "source_pose_prior_settings": settings,
+        "derived_segment_meta_sha256": sha256_file(
+            reader.root / "segment_meta.json"
+        ),
+        "derived_frames_sha256": sha256_file(reader.root / "frames.npz"),
+        "derived_gnss_sha256": sha256_file(
+            reader.root / "observations" / "gnss.npz"
+        ),
+        "camera_center_covariance_model": covariance_model,
+        "n_rederived_priors": len(priors),
+        "skipped_by_reason": skipped,
+        "position_quality_counts": quality_counts,
+    }
+
+
 def _weight_and_split_priors(
     database: Path,
+    frontend: Path,
     rows: Sequence[Mapping[str, Any]],
     reader: SegmentReader,
     gnss: Mapping[int, RawGnssEndpoint],
@@ -2311,6 +2422,12 @@ def _weight_and_split_priors(
         and calibrated_derivation.get("raw_observations_changed") is False
         and calibrated_derivation.get("frame_inventory_changed") is False
     )
+    fixed_priors: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    fixed_prior_derivation: dict[str, Any] | None = None
+    if calibrated_priors:
+        fixed_priors, fixed_prior_derivation = _fixed_calibration_pose_priors(
+            frontend, reader
+        )
     by_left = {
         str(row["left_image"]["name"]): (
             int(row["frame_id"]),
@@ -2382,6 +2499,16 @@ def _weight_and_split_priors(
                         {**base, "role": "excluded", "reason": reason}
                     )
                     continue
+                if calibrated_priors and frame_id not in fixed_priors:
+                    remove_ids.append(int(prior_id))
+                    records.append(
+                        {
+                            **base,
+                            "role": "excluded",
+                            "reason": "fixed_calibration_prior_preflight",
+                        }
+                    )
+                    continue
                 if (
                     int(sensor_type) != 0
                     or int(sensor_id) != int(camera_id)
@@ -2393,12 +2520,14 @@ def _weight_and_split_priors(
                         "rows without gravity/IMU data"
                     )
                 position = _decode_vector(position_blob, (3,), f"prior {name} position")
-                covariance = _decode_vector(
+                source_covariance = _decode_vector(
                     covariance_blob, (3, 3), f"prior {name} covariance"
                 )
-                covariance = 0.5 * (covariance + covariance.T)
+                source_covariance = 0.5 * (
+                    source_covariance + source_covariance.T
+                )
                 try:
-                    np.linalg.cholesky(covariance)
+                    np.linalg.cholesky(source_covariance)
                 except np.linalg.LinAlgError as exc:
                     raise ArtifactError(
                         f"pose prior covariance is not positive definite: {name}"
@@ -2408,10 +2537,26 @@ def _weight_and_split_priors(
                         "pose prior has no segment camera centre: " + name
                     )
                 source_position = position.copy()
+                segment_position = (
+                    np.asarray(fixed_priors[frame_id][0], dtype=np.float64)
+                    if calibrated_priors
+                    else centers[frame_id]
+                )
                 position, position_replaced = _resolved_private_prior_position(
                     source_position,
-                    centers[frame_id],
+                    segment_position,
                     calibrated_derivation=calibrated_priors,
+                )
+                covariance, covariance_replaced = (
+                    _resolved_private_prior_covariance(
+                        source_covariance,
+                        np.asarray(
+                            fixed_priors[frame_id][1], dtype=np.float64
+                        ),
+                        calibrated_derivation=True,
+                    )
+                    if calibrated_priors
+                    else (source_covariance.copy(), False)
                 )
                 if position_replaced:
                     # The completed frontend remains immutable and retains its
@@ -2437,7 +2582,11 @@ def _weight_and_split_priors(
                         "position_replaced_from_sealed_fixed_calibration": bool(
                             position_replaced
                         ),
-                        "source_covariance_m2": covariance.tolist(),
+                        "source_covariance_m2": source_covariance.tolist(),
+                        "calibrated_covariance_m2": covariance.tolist(),
+                        "covariance_replaced_from_sealed_fixed_calibration": bool(
+                            covariance_replaced
+                        ),
                         "optimizer_covariance_m2": weighted.tolist(),
                         "optimizer_covariance_blob": np.asarray(
                             weighted, dtype="<f8"
@@ -2497,10 +2646,10 @@ def _weight_and_split_priors(
     ):
         raise ArtifactError("held-out position priors remain in the optimizer DB")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "method": (
             "raw_temporal_filter_then_alternating_blocks_status_"
-            "covariance_weighted_v2"
+            "fixed_calibration_covariance_weighted_v3"
         ),
         "calibration_block_ids": list(split.calibration_block_ids),
         "holdout_block_ids": list(split.holdout_block_ids),
@@ -2517,9 +2666,10 @@ def _weight_and_split_priors(
         "position_quality_weights": [
             list(item) for item in config.position_quality_weights
         ],
+        "fixed_calibration_prior_derivation": fixed_prior_derivation,
         "optimizer_uses": [
             "raw_gnss_derived_camera_position",
-            "source_covariance",
+            "sealed_camera_center_covariance",
             "position_quality_status_weight",
         ],
         "optimizer_excludes": [
@@ -2530,6 +2680,284 @@ def _weight_and_split_priors(
         ],
         "records": sorted(records, key=lambda item: item["timestamp_ns"]),
     }
+
+
+def _evaluation_prior_contract(prior_split: Mapping[str, Any]) -> dict[str, Any]:
+    derivation = prior_split.get("fixed_calibration_prior_derivation")
+    return {
+        "schema_version": 1,
+        "target_quantity": "left_camera_center_in_sealed_local_enu_m",
+        "target_source": "sealed_prior_split_records",
+        "position_field": "position_m",
+        "covariance_field": "optimizer_covariance_m2",
+        "alignment_role": "calibration",
+        "final_evaluation_role": "holdout",
+        "optimizer_evaluator_target_identity_required": True,
+        "heldout_priors_physically_absent": True,
+        "raw_gnss_observations_mutated": False,
+        "fixed_calibration_prior_derivation_sha256": (
+            canonical_hash(derivation) if derivation is not None else None
+        ),
+    }
+
+
+def _recomputed_evaluation_prior_records(
+    frontend: Path,
+    reader: SegmentReader,
+    rows: Sequence[Mapping[str, Any]],
+    gnss: Mapping[int, RawGnssEndpoint],
+    gnss_records: Mapping[int, Mapping[str, Any]],
+    config: GeodeticSubmapConfig,
+    temporal_blocks: int,
+) -> dict[str, Any]:
+    """Recompute sealed evaluation targets from immutable physical inputs."""
+
+    left_names = {str(row["left_image"]["name"]) for row in rows}
+    source_priors = _cartesian_camera_priors(
+        frontend / "database.db", left_names
+    )
+    derivation = reader.meta.get("fixed_calibration_derivation")
+    calibrated = bool(
+        isinstance(derivation, Mapping)
+        and derivation.get("kind") == "rtk_splat_fixed_calibration_segment"
+        and derivation.get("fixed_scale") == 1.0
+        and derivation.get("raw_observations_changed") is False
+        and derivation.get("frame_inventory_changed") is False
+    )
+    fixed_priors: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    fixed_derivation: dict[str, Any] | None = None
+    if calibrated:
+        fixed_priors, fixed_derivation = _fixed_calibration_pose_priors(
+            frontend, reader
+        )
+    weights = dict(config.position_quality_weights)
+    eligible: list[dict[str, Any]] = []
+    for row in rows:
+        name = str(row["left_image"]["name"])
+        frame_id = int(row["frame_id"])
+        endpoint = gnss[frame_id]
+        weight = float(weights.get(endpoint.position_quality, 0.0))
+        if (
+            name not in source_priors
+            or endpoint.trusted_std_m() is None
+            or weight <= 0.0
+            or (calibrated and frame_id not in fixed_priors)
+        ):
+            continue
+        source_position, source_covariance = source_priors[name]
+        if calibrated:
+            position, position_replaced = _resolved_private_prior_position(
+                source_position,
+                fixed_priors[frame_id][0],
+                calibrated_derivation=True,
+            )
+            covariance, covariance_replaced = (
+                _resolved_private_prior_covariance(
+                    source_covariance,
+                    fixed_priors[frame_id][1],
+                    calibrated_derivation=True,
+                )
+            )
+        else:
+            position = np.asarray(source_position, dtype=np.float64).copy()
+            covariance = np.asarray(source_covariance, dtype=np.float64).copy()
+            position_replaced = False
+            covariance_replaced = False
+        eligible.append(
+            {
+                "name": name,
+                "frame_id": frame_id,
+                "timestamp_ns": int(row["timestamp_ns"]),
+                "position_quality": endpoint.position_quality,
+                "fix_status": endpoint.fix_status,
+                "carrier_status": endpoint.carrier_status,
+                "status_weight": weight,
+                "gnss_temporal_filter": dict(gnss_records[frame_id]),
+                "position_m": position.tolist(),
+                "source_frontend_position_m": np.asarray(
+                    source_position, dtype=np.float64
+                ).tolist(),
+                "position_replaced_from_sealed_fixed_calibration": bool(
+                    position_replaced
+                ),
+                "source_covariance_m2": np.asarray(
+                    source_covariance, dtype=np.float64
+                ).tolist(),
+                "calibrated_covariance_m2": covariance.tolist(),
+                "covariance_replaced_from_sealed_fixed_calibration": bool(
+                    covariance_replaced
+                ),
+                "optimizer_covariance_m2": (covariance / weight).tolist(),
+            }
+        )
+    eligible.sort(key=lambda item: item["timestamp_ns"])
+    if len(eligible) < 4:
+        raise ArtifactError(
+            "fewer than four recomputed sealed evaluation priors"
+        )
+    split = temporal_block_split(
+        np.asarray(
+            [item["timestamp_ns"] for item in eligible], dtype=np.int64
+        ),
+        temporal_blocks=temporal_blocks,
+    )
+    calibration_names: list[str] = []
+    holdout_names: list[str] = []
+    for index, item in enumerate(eligible):
+        role = "calibration" if split.calibration_mask[index] else "holdout"
+        item["role"] = role
+        item["block_id"] = int(split.block_ids[index])
+        (calibration_names if role == "calibration" else holdout_names).append(
+            str(item["name"])
+        )
+    return {
+        "calibration_names": calibration_names,
+        "holdout_names": holdout_names,
+        "fixed_calibration_prior_derivation": fixed_derivation,
+        "records": eligible,
+    }
+
+
+def _verify_recomputed_evaluation_prior_records(
+    prior_split: Mapping[str, Any],
+    recomputed: Mapping[str, Any],
+) -> None:
+    if (
+        prior_split.get("calibration_names")
+        != recomputed.get("calibration_names")
+        or prior_split.get("holdout_names")
+        != recomputed.get("holdout_names")
+        or prior_split.get("fixed_calibration_prior_derivation")
+        != recomputed.get("fixed_calibration_prior_derivation")
+    ):
+        raise ArtifactError("sealed evaluation prior derivation changed")
+    recorded_by_name = {
+        str(record.get("name")): record
+        for record in prior_split.get("records", ())
+        if isinstance(record, Mapping)
+        and record.get("role") in {"calibration", "holdout"}
+    }
+    expected_records = list(recomputed.get("records", ()))
+    if set(recorded_by_name) != {
+        str(record["name"]) for record in expected_records
+    }:
+        raise ArtifactError("sealed evaluation prior inventory changed")
+    for expected in expected_records:
+        recorded = recorded_by_name[str(expected["name"])]
+        if any(recorded.get(key) != value for key, value in expected.items()):
+            raise ArtifactError("sealed evaluation prior evidence changed")
+
+
+def _sealed_evaluation_priors(
+    plan_root: Path,
+    plan: Mapping[str, Any],
+    allowed_names: set[str],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Load the exact sealed targets shared by optimization and evaluation."""
+
+    if int(plan.get("schema_version", 1)) < _SEALED_EVALUATION_PRIOR_SCHEMA_VERSION:
+        # Preserve byte-equivalent audits for already-published legacy plans.
+        return _cartesian_camera_priors(
+            Path(str(plan["frontend_artifact"])) / "database.db",
+            allowed_names,
+        )
+    split = _json(plan_root / "prior_split.json")
+    if split.get("schema_version") != 3:
+        raise ArtifactError("sealed evaluation prior split schema changed")
+    expected_contract = _evaluation_prior_contract(split)
+    if plan.get("evaluation_prior_contract") != expected_contract:
+        raise ArtifactError("sealed evaluation prior contract changed")
+    records = split.get("records")
+    if not isinstance(records, list):
+        raise ArtifactError("sealed evaluation prior records are missing")
+    expected_names = set(split.get("calibration_names", ())) | set(
+        split.get("holdout_names", ())
+    )
+    priors: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    roles: dict[str, str] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ArtifactError("sealed evaluation prior record is invalid")
+        role = str(record.get("role", ""))
+        if role not in {"calibration", "holdout"}:
+            continue
+        name = str(record.get("name", ""))
+        if not name or name in priors or name not in allowed_names:
+            raise ArtifactError("sealed evaluation prior inventory changed")
+        position = np.asarray(record.get("position_m"), dtype=np.float64)
+        covariance = np.asarray(
+            record.get("optimizer_covariance_m2"), dtype=np.float64
+        )
+        if (
+            position.shape != (3,)
+            or covariance.shape != (3, 3)
+            or not np.isfinite(position).all()
+            or not np.isfinite(covariance).all()
+        ):
+            raise ArtifactError("sealed evaluation prior is numerically invalid")
+        covariance = 0.5 * (covariance + covariance.T)
+        try:
+            np.linalg.cholesky(covariance)
+        except np.linalg.LinAlgError as exc:
+            raise ArtifactError(
+                "sealed evaluation prior covariance is not positive definite"
+            ) from exc
+        priors[name] = (position, covariance)
+        roles[name] = role
+    if (
+        set(priors) != expected_names
+        or set(split.get("calibration_names", ()))
+        != {name for name, role in roles.items() if role == "calibration"}
+        or set(split.get("holdout_names", ()))
+        != {name for name, role in roles.items() if role == "holdout"}
+    ):
+        raise ArtifactError("sealed evaluation prior roles changed")
+    if len(priors) < 3:
+        raise ArtifactError("fewer than three sealed evaluation priors")
+    return priors
+
+
+def _verify_private_evaluation_prior_identity(
+    database: Path,
+    priors: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    calibration_names: Sequence[str],
+    holdout_names: Sequence[str],
+) -> None:
+    """Prove calibration rows equal the sealed evaluator target exactly."""
+
+    try:
+        with _readonly_database(database, immutable=True) as connection:
+            rows = list(
+                connection.execute(
+                    """
+                    SELECT i.name, p.position, p.position_covariance
+                    FROM pose_priors AS p
+                    JOIN images AS i ON i.image_id=p.corr_data_id
+                    ORDER BY i.image_id
+                    """
+                )
+            )
+    except sqlite3.Error as exc:
+        raise ArtifactError(
+            f"cannot verify optimizer/evaluator prior identity: {exc}"
+        ) from exc
+    actual_names = {str(name) for name, _, _ in rows}
+    if actual_names != set(calibration_names) or actual_names & set(holdout_names):
+        raise ArtifactError("optimizer/evaluator prior role inventory changed")
+    for name, position_blob, covariance_blob in rows:
+        name = str(name)
+        expected_position, expected_covariance = priors[name]
+        actual_position = _decode_vector(
+            position_blob, (3,), f"private prior {name} position"
+        )
+        actual_covariance = _decode_vector(
+            covariance_blob, (3, 3), f"private prior {name} covariance"
+        )
+        if not (
+            np.array_equal(actual_position, expected_position)
+            and np.array_equal(actual_covariance, expected_covariance)
+        ):
+            raise ArtifactError("optimizer/evaluator prior targets differ")
 
 
 def _digest_sql_value(digest: Any, value: Any) -> None:
@@ -2996,6 +3424,7 @@ def prepare_geodetic_submap_plan(
             raise ArtifactError("source database differs from its frontend seal")
         prior_split = _weight_and_split_priors(
             staging / "database.db",
+            frontend,
             rows,
             reader,
             gnss,
@@ -3096,6 +3525,9 @@ def prepare_geodetic_submap_plan(
             "private_database_sqlite_metadata": private_sqlite_metadata,
             "pair_audit_sha256": sha256_file(staging / "pair_audit.json"),
             "prior_split_sha256": sha256_file(staging / "prior_split.json"),
+            "evaluation_prior_contract": _evaluation_prior_contract(
+                prior_split
+            ),
             "gnss_temporal_audit_sha256": canonical_hash(
                 gnss_temporal_audit
             ),
@@ -3115,6 +3547,10 @@ def prepare_geodetic_submap_plan(
                 "colmap_auto_initial_pair": _initial_pair_method == "v4",
                 "colmap_auto_second_image": _initial_pair_method == "v5",
                 "position_priors": "raw_gnss_covariance_status_weighted",
+                "optimizer_evaluator_prior_identity": True,
+                "evaluation_targets": (
+                    "sealed_prior_split_position_and_optimizer_covariance"
+                ),
                 "heldout_priors_physically_absent": True,
                 "temporally_rejected_priors_physically_absent": True,
                 "fixed_stereo_rig": True,
@@ -3172,7 +3608,7 @@ def _plan_context(
     schema_version = plan.get("schema_version")
     if (
         plan.get("kind") != _PLAN_KIND
-        or schema_version not in {1, 2, _HARDENED_PLAN_SCHEMA_VERSION}
+        or schema_version not in _SUPPORTED_PLAN_SCHEMA_VERSIONS
     ):
         raise ArtifactError("invalid geodetic submap plan")
     legacy_schema = schema_version == 1
@@ -3281,8 +3717,18 @@ def _plan_context(
         != inventory.get("rig_ids")
     ):
         raise ArtifactError("geodetic plan optimizer inventory changed")
+    if schema_version >= _SEALED_EVALUATION_PRIOR_SCHEMA_VERSION:
+        evaluation_priors = _sealed_evaluation_priors(
+            root, plan, set(expected_left)
+        )
+        _verify_private_evaluation_prior_identity(
+            root / "database.db",
+            evaluation_priors,
+            calibration_names,
+            holdout_names,
+        )
     if schema_version >= 3:
-        gnss, _gnss_records, expected_gnss_audit = (
+        gnss, gnss_records, expected_gnss_audit = (
             _temporally_filtered_gnss(
                 reader,
                 config.gnss_temporal_policy,
@@ -3295,6 +3741,19 @@ def _plan_context(
             != canonical_hash(expected_gnss_audit)
         ):
             raise ArtifactError("sealed raw-GNSS temporal audit changed")
+        if schema_version >= _SEALED_EVALUATION_PRIOR_SCHEMA_VERSION:
+            recomputed_priors = _recomputed_evaluation_prior_records(
+                frontend,
+                reader,
+                rows,
+                gnss,
+                gnss_records,
+                config,
+                mapper_config.alignment_temporal_blocks,
+            )
+            _verify_recomputed_evaluation_prior_records(
+                prior_split, recomputed_priors
+            )
     else:
         gnss = _raw_gnss_endpoints(reader)
     candidates, pair_sources = _pair_candidates(
@@ -3379,6 +3838,12 @@ def _plan_context(
         "temporally_rejected_priors_physically_absent"
     ) is not True:
         raise ArtifactError("temporal GNSS exclusion contract changed")
+    if schema_version >= _SEALED_EVALUATION_PRIOR_SCHEMA_VERSION and (
+        optimizer.get("optimizer_evaluator_prior_identity") is not True
+        or optimizer.get("evaluation_targets")
+        != "sealed_prior_split_position_and_optimizer_covariance"
+    ):
+        raise ArtifactError("optimizer/evaluator prior contract changed")
     if not legacy_schema:
         auto_initialization = initial_pair_method == "v4"
         anchored_initialization = initial_pair_method == "v5"
@@ -3923,13 +4388,12 @@ def _quality_report(
         for item in split["records"]
         if item.get("role") in {"calibration", "holdout"}
     }
-    source_priors = _cartesian_camera_priors(
-        Path(str(plan["frontend_artifact"])) / "database.db",
-        set(left_names),
+    evaluation_priors = _sealed_evaluation_priors(
+        plan_root, plan, set(left_names)
     )
     priors = {
         name: value
-        for name, value in source_priors.items()
+        for name, value in evaluation_priors.items()
         if name in evaluation_names
     }
     source_rtk, source_evaluation = _heldout_evaluation(

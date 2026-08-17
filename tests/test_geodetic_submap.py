@@ -29,7 +29,10 @@ from rtk_splat.backends.geodetic_submap import (
     _full_trajectory_quality,
     _metric_specific_source_repairs,
     _plan_context,
+    _fixed_calibration_pose_priors,
+    _resolved_private_prior_covariance,
     _resolved_private_prior_position,
+    _sealed_evaluation_priors,
     _select_initial_pair_v2,
     _select_initial_pair_v3,
     _select_initial_pair_v5,
@@ -44,6 +47,7 @@ from rtk_splat.backends.geodetic_assembly import (
     GeodeticAssemblyConfig,
     GeodeticOverlapPolicy,
     _aligned_submap_candidate,
+    _assembly_evaluation_priors,
     _evaluate_overlap_candidates,
     _file_evidence,
     _legacy_overlap_report,
@@ -67,7 +71,11 @@ from rtk_splat.backends.mapper import (
     run_mapper_solve,
     run_quality_summary,
 )
-from rtk_splat.core.segment import POSITION_QUALITY_VOCABULARY, SegmentWriter
+from rtk_splat.core.segment import (
+    POSITION_QUALITY_VOCABULARY,
+    SegmentReader,
+    SegmentWriter,
+)
 from rtk_splat.frontends.artifact import (
     ArtifactError,
     FrontendArtifactBuilder,
@@ -1113,6 +1121,127 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
         np.testing.assert_allclose(source, [1.0, 2.0, 3.0])
         self.assertTrue(replaced)
 
+        source_covariance = np.diag([0.01, 0.01, 0.01])
+        corrected_covariance = np.diag([0.0016, 0.01, 0.0016])
+        with self.assertRaisesRegex(ArtifactError, "without a sealed"):
+            _resolved_private_prior_covariance(
+                source_covariance,
+                corrected_covariance,
+                calibrated_derivation=False,
+            )
+        resolved_covariance, covariance_replaced = (
+            _resolved_private_prior_covariance(
+                source_covariance,
+                corrected_covariance,
+                calibrated_derivation=True,
+            )
+        )
+        np.testing.assert_array_equal(
+            resolved_covariance, corrected_covariance
+        )
+        np.testing.assert_array_equal(
+            source_covariance, np.diag([0.01, 0.01, 0.01])
+        )
+        self.assertTrue(covariance_replaced)
+
+    def test_fixed_calibration_covariance_reuses_frontend_prior_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment = _segment(root / "segment")
+            frontend = root / "frontend"
+            (frontend / "stages").mkdir(parents=True)
+            _write_json(
+                frontend / "stages" / "pose_priors.json",
+                {
+                    "schema_version": 1,
+                    "stage": "pose_priors",
+                    "state": "complete",
+                    "inputs": {
+                        "covariance_floor_m": 0.001,
+                        "max_covariance_m2": 1.0,
+                        "min_fix_status": 1,
+                        "min_carrier_status": 2,
+                        "max_source_residual_s": 0.15,
+                    },
+                },
+            )
+
+            priors, audit = _fixed_calibration_pose_priors(
+                frontend, SegmentReader(segment).validate()
+            )
+
+            self.assertEqual(len(priors), 8)
+            self.assertEqual(
+                audit["method"],
+                "normal_frontend_prior_rederivation_on_fixed_segment_v1",
+            )
+            np.testing.assert_allclose(
+                priors[0][1], np.eye(3) * 0.0005, atol=1.0e-12
+            )
+
+    def test_sealed_evaluation_prior_identity_and_resealed_tamper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, _, _, plan, colmap, _ = _fixture(root)
+            plan_record = json.loads(
+                (plan / "geodetic_submap_plan.json").read_text()
+            )
+            split_path = plan / "prior_split.json"
+            split = json.loads(split_path.read_text())
+            priors = _sealed_evaluation_priors(
+                plan,
+                plan_record,
+                set(plan_record["selected_left_image_names"]),
+            )
+            expected_names = set(split["calibration_names"]) | set(
+                split["holdout_names"]
+            )
+            self.assertEqual(set(priors), expected_names)
+            with sqlite3.connect(
+                f"file:{plan / 'database.db'}?mode=ro&immutable=1", uri=True
+            ) as connection:
+                optimizer_names = {
+                    str(name)
+                    for (name,) in connection.execute(
+                        "SELECT i.name FROM pose_priors p "
+                        "JOIN images i ON i.image_id=p.corr_data_id"
+                    )
+                }
+            self.assertEqual(optimizer_names, set(split["calibration_names"]))
+            self.assertFalse(optimizer_names & set(split["holdout_names"]))
+
+            holdout = next(
+                record
+                for record in split["records"]
+                if record.get("role") == "holdout"
+            )
+            holdout["position_m"][0] += 1.0
+            _write_json(split_path, split)
+            plan_path = plan / "geodetic_submap_plan.json"
+            plan_record["prior_split_sha256"] = sha256_file(split_path)
+            _write_json(plan_path, plan_record)
+            seal_path = plan / "plan_seal.json"
+            seal = json.loads(seal_path.read_text())
+            for path in (split_path, plan_path):
+                seal["files"][path.name] = {
+                    "sha256": sha256_file(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            seal["seal_sha256"] = canonical_hash(
+                {
+                    "schema_version": seal["schema_version"],
+                    "files": seal["files"],
+                }
+            )
+            _write_json(seal_path, seal)
+
+            with self.assertRaisesRegex(
+                ArtifactError, "evaluation prior evidence changed"
+            ):
+                build_geodetic_submap_command(
+                    plan, root / "execution", colmap
+                )
+
     def test_temporal_rejection_is_physically_absent_and_resealed_tamper_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1585,6 +1714,27 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
         for token in ("field1", "/data/jkobo", "1100", "1800"):
             self.assertNotIn(token, contents)
 
+        continuous = (
+            repository
+            / "scripts"
+            / "experiments"
+            / "geodetic_continuous_boundary_v1.py"
+        )
+        continuous_help = subprocess.run(
+            [sys.executable, str(continuous), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            continuous_help.returncode, 0, continuous_help.stderr
+        )
+        self.assertIn("prepare", continuous_help.stdout)
+        self.assertIn("run", continuous_help.stdout)
+        contents = continuous.read_text(encoding="utf-8").lower()
+        for token in ("field1", "/data/jkobo", "1100", "1800"):
+            self.assertNotIn(token, contents)
+
 
 class GeodeticAssemblyArtifactTests(unittest.TestCase):
     def _completed_assembly(self, root: Path):
@@ -1823,6 +1973,28 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                 ],
                 [1, 2],
             )
+
+    def test_assembly_requires_identical_sealed_priors_in_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, _, _, results = self._completed_assembly(root)
+            candidates = [_aligned_submap_candidate(path) for path in results]
+            priors = _assembly_evaluation_priors(candidates)
+            shared = set(candidates[0]["left_image_names"]) & set(
+                candidates[1]["left_image_names"]
+            )
+            shared_prior = next(name for name in shared if name in priors)
+            changed = [dict(candidate) for candidate in candidates]
+            changed[1]["prior_centers"] = np.asarray(
+                changed[1]["prior_centers"]
+            ).copy()
+            index = changed[1]["left_image_names"].index(shared_prior)
+            changed[1]["prior_centers"][index, 0] += 0.001
+
+            with self.assertRaisesRegex(
+                ArtifactError, "disagree on a sealed evaluation prior"
+            ):
+                _assembly_evaluation_priors(changed)
 
     def test_synchronized_holdout_excludes_cross_optimizer_role_leakage(self):
         with tempfile.TemporaryDirectory() as tmp:
