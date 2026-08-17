@@ -10,6 +10,7 @@ from rtk_splat.diagnostics.raw_calibration import (
     _PLAN_FILES,
     _PLAN_KIND,
     _audit_config_record,
+    _fixed_calibration_translation_uncertainty,
     _seal_files,
     atomic_raw_calibration_artifact,
     audited_raw_calibration_plan,
@@ -148,6 +149,42 @@ def test_audit_config_is_normalized_to_json_representation():
 
     assert record["solver"]["clock_offset_bounds_s"] == [-0.25, 0.25]
     assert record == json.loads(json.dumps(record))
+
+
+def test_fixed_calibration_uncertainty_preserves_untrusted_axes():
+    names = (
+        "lever_camera_x_m",
+        "lever_camera_y_m",
+        "lever_camera_z_m",
+        "baseline_tangent_0_rad",
+        "baseline_tangent_1_rad",
+        "clock_offset_delta_s",
+    )
+    result = {
+        "observability": {
+            "prior_sigma": [0.1] * 6,
+            "posterior_sigma_linearized": [0.004, 0.02, 0.04, 0.01, 0.01, 0.02],
+        },
+        "parameters": {
+            name: {
+                "trusted": index != 1,
+                "temporal_refit_std": [0.006, 0.01, 0.025, 0.01, 0.01, 0.02][
+                    index
+                ],
+            }
+            for index, name in enumerate(names)
+        },
+    }
+    plan = {
+        "audit_config": {"solver": {"position_sigma_floor_m": 0.03}}
+    }
+
+    uncertainty = _fixed_calibration_translation_uncertainty(result, plan)
+
+    assert uncertainty["sigma_camera_m"] == [0.03, 0.1, 0.04]
+    assert uncertainty["axes"][0]["trusted"] is True
+    assert uncertainty["axes"][1]["trusted"] is False
+    assert "untrusted_axes_retain_prior" in uncertainty["method"]
 
 
 def test_reusable_code_has_no_field_specific_path_or_frame_window():

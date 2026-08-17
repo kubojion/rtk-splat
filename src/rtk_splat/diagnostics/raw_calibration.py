@@ -1065,6 +1065,22 @@ def _derived_meta(
         "RTK position/dual-antenna heading plus sealed fixed "
         "antenna-to-camera calibration"
     )
+    calibrated_sigma = derivation.get(
+        "extrinsic_translation_sigma_camera_m"
+    )
+    if calibrated_sigma is not None:
+        sigma = np.asarray(calibrated_sigma, dtype=np.float64)
+        if (
+            sigma.shape != (3,)
+            or not np.isfinite(sigma).all()
+            or np.any(sigma <= 0.0)
+        ):
+            raise ArtifactError(
+                "fixed-calibration translation uncertainty is invalid"
+            )
+        value["initial_pose"]["extrinsic_translation_sigma_m"] = (
+            sigma.tolist()
+        )
     semantics = value.get("initial_pose_semantics")
     if isinstance(semantics, dict):
         semantics["camera_centres"] = (
@@ -1076,12 +1092,106 @@ def _derived_meta(
             "status": "accepted fixed calibration",
             "result_seal_sha256": derivation["calibration_result_seal_sha256"],
         }
+        if calibrated_sigma is not None:
+            semantics["extrinsic_provenance"]["translation_uncertainty"] = {
+                "sigma_camera_m": list(calibrated_sigma),
+                "method": derivation[
+                    "extrinsic_translation_uncertainty_method"
+                ],
+            }
         semantics["rough_extrinsic_convention"] = (
             "T_camera_primary_antenna maps primary-antenna frame coordinates "
             "into the camera optical frame"
         )
     value["fixed_calibration_derivation"] = dict(derivation)
     return value
+
+
+def _fixed_calibration_translation_uncertainty(
+    calibration_result: Mapping[str, Any],
+    calibration_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Conservatively convert accepted observability into camera-axis sigma.
+
+    Trusted lever-arm axes use the largest of the configured calibration
+    position floor, their linearized posterior sigma, and their temporal-refit
+    spread.  An untrusted axis keeps its complete physical prior sigma.  This
+    prevents an accepted fixed calibration from silently retaining the rough
+    tape-measure uncertainty on every axis, while never claiming information
+    on a mode that the sidecar did not accept.
+    """
+    result = calibration_result
+    observability = result.get("observability", {})
+    parameters = result.get("parameters", {})
+    prior = np.asarray(observability.get("prior_sigma", []), dtype=np.float64)
+    posterior = np.asarray(
+        observability.get("posterior_sigma_linearized", []),
+        dtype=np.float64,
+    )
+    try:
+        floor = float(
+            calibration_plan["audit_config"]["solver"][
+                "position_sigma_floor_m"
+            ]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactError(
+            "sealed calibration plan has no position uncertainty floor"
+        ) from exc
+    if (
+        prior.shape != (len(CALIBRATION_PARAMETER_NAMES),)
+        or posterior.shape != prior.shape
+        or not np.isfinite(prior).all()
+        or not np.isfinite(posterior).all()
+        or np.any(prior <= 0.0)
+        or np.any(posterior <= 0.0)
+        or not math.isfinite(floor)
+        or floor <= 0.0
+    ):
+        raise ArtifactError("calibration parameter uncertainty is invalid")
+    axes = CALIBRATION_PARAMETER_NAMES[:3]
+    records = []
+    sigma = []
+    for index, name in enumerate(axes):
+        parameter = parameters.get(name)
+        if not isinstance(parameter, Mapping):
+            raise ArtifactError(f"calibration result has no parameter {name}")
+        trusted = parameter.get("trusted") is True
+        temporal = float(parameter.get("temporal_refit_std", math.nan))
+        if not math.isfinite(temporal) or temporal < 0.0:
+            raise ArtifactError(
+                f"calibration parameter has invalid temporal spread: {name}"
+            )
+        if trusted:
+            value = max(floor, float(posterior[index]), temporal)
+            if value > float(prior[index]) * (1.0 + 1.0e-9):
+                raise ArtifactError(
+                    f"trusted calibration axis is less certain than its prior: {name}"
+                )
+            method = "trusted_max_of_floor_posterior_and_temporal_spread"
+        else:
+            value = float(prior[index])
+            method = "untrusted_axis_retains_full_prior_sigma"
+        sigma.append(value)
+        records.append(
+            {
+                "parameter": name,
+                "trusted": trusted,
+                "sigma_camera_m": value,
+                "prior_sigma_m": float(prior[index]),
+                "posterior_sigma_m": float(posterior[index]),
+                "temporal_refit_std_m": temporal,
+                "method": method,
+            }
+        )
+    return {
+        "sigma_camera_m": sigma,
+        "method": (
+            "trusted_axes_use_max_calibration_floor_posterior_and_temporal_"
+            "spread; untrusted_axes_retain_prior_v1"
+        ),
+        "axes": records,
+    }
 
 
 def _hardlink_payloads(
@@ -1193,6 +1303,9 @@ def publish_calibrated_segment(
     frames["initial_camera_center_m"] = new_centers
 
     result_seal_sha256 = result["result_seal_sha256"]
+    uncertainty = _fixed_calibration_translation_uncertainty(
+        result["result"], plan
+    )
     derivation = {
         "schema_version": 1,
         "kind": _DERIVED_SEGMENT_KIND,
@@ -1204,6 +1317,11 @@ def publish_calibrated_segment(
         "recommendation_sha256": canonical_hash(recommendation),
         "fixed_scale": 1.0,
         "camera_to_rtk_offset_ns": offset_ns,
+        "extrinsic_translation_sigma_camera_m": uncertainty[
+            "sigma_camera_m"
+        ],
+        "extrinsic_translation_uncertainty_method": uncertainty["method"],
+        "extrinsic_translation_uncertainty_axes": uncertainty["axes"],
         "dual_antenna_orientation_method": (
             "measured_horizontal_baseline_yaw_minus_sealed_calibrated_"
             "baseline_yaw_in_primary_antenna_frame"
