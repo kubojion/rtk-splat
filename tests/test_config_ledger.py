@@ -145,7 +145,8 @@ class ConfigLedgerTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            ValueError, "valid only for backend-export, cloud, and train"
+            ValueError,
+            "valid only for backend-export, tiles-plan, cloud, and train",
         ):
             cli.main(
                 [

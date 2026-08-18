@@ -33,6 +33,7 @@ from rtk_splat.backends.geodetic_submap import (
     _resolved_private_prior_covariance,
     _resolved_private_prior_position,
     _sealed_evaluation_priors,
+    _seal_files,
     _select_initial_pair_v2,
     _select_initial_pair_v3,
     _select_initial_pair_v5,
@@ -45,6 +46,7 @@ from rtk_splat.backends.geodetic_submap import (
 )
 from rtk_splat.backends.geodetic_assembly import (
     GeodeticAssemblyConfig,
+    GeodeticDiagnosticPolicy,
     GeodeticOverlapPolicy,
     _aligned_submap_candidate,
     _assembly_evaluation_priors,
@@ -55,12 +57,18 @@ from rtk_splat.backends.geodetic_assembly import (
     _overlap_csv,
     _overlap_svg,
     audited_geodetic_assembly_plan,
+    audited_geodetic_diagnostic_full_pose_artifact,
+    audited_geodetic_diagnostic_overlap_report,
+    audited_geodetic_diagnostic_result_inventory,
     audited_geodetic_full_pose_artifact,
     audited_geodetic_overlap_report,
     audited_geodetic_submap_pose_export,
     export_geodetic_submap_poses,
     prepare_geodetic_assembly_plan,
     prepare_geodetic_assembly_window,
+    publish_geodetic_diagnostic_full_pose_artifact,
+    publish_geodetic_diagnostic_overlap_report,
+    publish_geodetic_diagnostic_result_inventory,
     publish_geodetic_full_pose_artifact,
     publish_geodetic_overlap_report,
 )
@@ -1965,6 +1973,156 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             results.append(Path(prepared["result"]))
         return segment, assembly_plan, audited, submaps, results
 
+    def _copy_result_with_failed_checks(
+        self,
+        source: Path,
+        destination_workspace: Path,
+        failed_checks: tuple[str, ...],
+    ) -> Path:
+        destination_workspace.mkdir(parents=True)
+        shutil.copy2(
+            source.parent / "window_binding.json",
+            destination_workspace / "window_binding.json",
+        )
+        destination = destination_workspace / "result"
+        shutil.copytree(source, destination)
+        quality_path = destination / "reports" / "quality.json"
+        quality = json.loads(quality_path.read_text())
+        for name in failed_checks:
+            self.assertIn(name, quality["checks"])
+            quality["checks"][name]["passed"] = False
+        quality["passed"] = False
+        quality["publication_eligible"] = False
+        _write_json(quality_path, quality)
+        result_path = destination / "geodetic_submap_result.json"
+        result = json.loads(result_path.read_text())
+        result["passed"] = False
+        result["publication_eligible"] = False
+        result["quality_report_sha256"] = sha256_file(quality_path)
+        _write_json(result_path, result)
+        files = sorted(
+            path.relative_to(destination).as_posix()
+            for path in destination.rglob("*")
+            if path.is_file() and path.name != "result_seal.json"
+        )
+        _write_json(destination / "result_seal.json", _seal_files(destination, files))
+        return destination
+
+    def test_diagnostic_inventory_overlap_and_pose_preserve_rtk_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment, plan, audited, _, results = self._completed_assembly(root)
+            failed = self._copy_result_with_failed_checks(
+                results[1],
+                root / "failed-window",
+                ("heldout_rtk_absolute_gates",),
+            )
+            with self.assertRaisesRegex(ArtifactError, "acceptance gates"):
+                _aligned_submap_candidate(failed)
+            policy = GeodeticDiagnosticPolicy(median_rtk_warning_m=1.0e-6)
+            result_by_window = {
+                audited["windows"][0]["window_id"]: results[0],
+                audited["windows"][1]["window_id"]: failed,
+            }
+            inventory = publish_geodetic_diagnostic_result_inventory(
+                plan,
+                result_by_window,
+                root / "diagnostic-inventory",
+                policy=policy,
+            )
+            record = audited_geodetic_diagnostic_result_inventory(inventory)
+            self.assertEqual(
+                record["production_failed_window_ids"],
+                [audited["windows"][1]["window_id"]],
+            )
+            self.assertIsInstance(record["warning_exceeded_window_ids"], list)
+            overlap = publish_geodetic_diagnostic_overlap_report(
+                [results[0], failed],
+                root / "diagnostic-overlap",
+                overlap_policy=audited["config_object"].overlap_policy,
+                diagnostic_policy=policy,
+            )
+            overlap_record = audited_geodetic_diagnostic_overlap_report(overlap)
+            self.assertFalse(overlap_record["production_passed"])
+            self.assertTrue(
+                overlap_record["structurally_safe_for_diagnostic"]
+            )
+            pose = publish_geodetic_diagnostic_full_pose_artifact(
+                inventory, root / "poses", "diagnostic-assembled"
+            )
+            final = audited_geodetic_diagnostic_full_pose_artifact(pose)
+            self.assertEqual(final["manifest"]["n_frames"], 8)
+            self.assertEqual(
+                final["georeferencing"]["artifact_class"],
+                "diagnostic_render_only",
+            )
+            self.assertEqual(
+                final["georeferencing"]["georeferencing_status"], "FAILED"
+            )
+            self.assertFalse(
+                final["georeferencing"][
+                    "metric_georeferencing_claim_eligible"
+                ]
+            )
+            self.assertTrue((pose / "GEOREFERENCING_FAILED.json").is_file())
+            cfg = SimpleNamespace(
+                pose=SimpleNamespace(
+                    artifact="diagnostic-assembled", artifact_root=root / "poses"
+                )
+            )
+            from rtk_splat.core.pose_artifacts import load_pose_artifact
+
+            with self.assertRaisesRegex(ValueError, "explicit render-only"):
+                load_pose_artifact(segment, cfg)
+            loaded, _ = load_pose_artifact(
+                segment, cfg, allow_failed_georeferencing_for_render=True
+            )
+            self.assertEqual(loaded.shape, (8, 4, 4))
+            with self.assertRaises(FileExistsError):
+                publish_geodetic_diagnostic_full_pose_artifact(
+                    inventory, root / "poses", "diagnostic-assembled"
+                )
+
+    def test_diagnostic_inventory_rejects_structural_failure_and_tampering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, plan, audited, _, results = self._completed_assembly(root)
+            unsafe = self._copy_result_with_failed_checks(
+                results[1],
+                root / "unsafe-window",
+                ("selected_visual_quality",),
+            )
+            result_by_window = {
+                audited["windows"][0]["window_id"]: results[0],
+                audited["windows"][1]["window_id"]: unsafe,
+            }
+            with self.assertRaisesRegex(ArtifactError, "non-RTK"):
+                publish_geodetic_diagnostic_result_inventory(
+                    plan, result_by_window, root / "unsafe-inventory"
+                )
+
+            valid_by_window = {
+                window["window_id"]: result
+                for window, result in zip(
+                    audited["windows"], results, strict=True
+                )
+            }
+            inventory = publish_geodetic_diagnostic_result_inventory(
+                plan, valid_by_window, root / "valid-inventory"
+            )
+            record_path = inventory / "diagnostic_result_inventory.json"
+            record = json.loads(record_path.read_text())
+            record["selected_frame_count"] += 1
+            _write_json(record_path, record)
+            _write_json(
+                inventory / "manifest.json",
+                _file_evidence(
+                    inventory, ["diagnostic_result_inventory.json"]
+                ),
+            )
+            with self.assertRaisesRegex(ArtifactError, "content changed"):
+                audited_geodetic_diagnostic_result_inventory(inventory)
+
     def test_sealed_export_overlap_and_full_pose(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2322,20 +2480,32 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             / "scripts"
             / "experiments"
             / "geodetic_submap_assembly_v1.py",
+            repository
+            / "scripts"
+            / "experiments"
+            / "geodetic_full_field_diagnostic_v1.py",
         ]
         for path in paths:
             contents = path.read_text(encoding="utf-8").lower()
             for token in ("field1", "/data/jkobo", "10227", "1100", "1800"):
                 self.assertNotIn(token, contents, f"{token!r} in {path.name}")
-        completed = subprocess.run(
-            [sys.executable, str(paths[1]), "--help"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("prepare-all", completed.stdout)
-        self.assertIn("assemble", completed.stdout)
+        launcher_help = {}
+        for launcher in paths[1:]:
+            completed = subprocess.run(
+                [sys.executable, str(launcher), "--help"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            launcher_help[launcher] = completed.stdout
+        assembly_help = launcher_help[paths[1]]
+        self.assertIn("prepare-all", assembly_help)
+        self.assertIn("assemble", assembly_help)
+        self.assertIn("diagnostic-inventory", assembly_help)
+        diagnostic_help = launcher_help[paths[2]]
+        self.assertIn("--reuse", diagnostic_help)
+        self.assertIn("--resume", diagnostic_help)
         launcher = paths[1].read_text(encoding="utf-8")
         self.assertIn("ProcessPoolExecutor", launcher)
         self.assertIn('get_context("spawn")', launcher)

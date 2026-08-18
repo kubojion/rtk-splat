@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Run a generic, resumable diagnostic geodetic assembly sequence.
+
+All dataset locations, reused results, window order, and destinations are
+explicit inputs.  This launcher never converts a diagnostic result into a
+production result; the reusable backend retains every production-gate failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Sequence
+
+from rtk_splat.backends.geodetic_assembly import (
+    GeodeticDiagnosticPolicy,
+    audited_geodetic_assembly_plan,
+    audited_geodetic_diagnostic_full_pose_artifact,
+    audited_geodetic_diagnostic_overlap_report,
+    audited_geodetic_diagnostic_result_inventory,
+    audited_geodetic_diagnostic_submap_result,
+    prepare_geodetic_assembly_window,
+    publish_geodetic_diagnostic_full_pose_artifact,
+    publish_geodetic_diagnostic_overlap_report,
+    publish_geodetic_diagnostic_result_inventory,
+)
+from rtk_splat.backends.geodetic_submap import (
+    run_geodetic_submap_plan,
+)
+
+
+def _binding(value: str) -> tuple[str, Path]:
+    window_id, separator, path = value.partition("=")
+    if not separator or not window_id or not path:
+        raise argparse.ArgumentTypeError("expected WINDOW_ID=RESULT_PATH")
+    return window_id, Path(path).expanduser()
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", required=True, type=Path)
+    parser.add_argument("--pilot-root", required=True, type=Path)
+    parser.add_argument("--colmap", required=True, type=Path)
+    parser.add_argument("--pose-name", required=True)
+    parser.add_argument("--reuse", action="append", type=_binding, default=[])
+    parser.add_argument(
+        "--run-window",
+        action="append",
+        default=[],
+        help="window ID to solve, in launch order; default is every non-reused window",
+    )
+    parser.add_argument(
+        "--median-rtk-warning-m",
+        type=float,
+        default=GeodeticDiagnosticPolicy().median_rtk_warning_m,
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="verify and continue an existing pilot root without overwriting outputs",
+    )
+    return parser
+
+
+def _result_path(root: Path, window_id: str) -> Path:
+    return root / "submaps" / window_id / "result"
+
+
+def _publish_available_overlaps(
+    windows: list[dict],
+    results: dict[str, Path],
+    root: Path,
+    overlap_policy,
+    diagnostic_policy: GeodeticDiagnosticPolicy,
+    verified_input_context,
+) -> list[dict]:
+    records = []
+    for first, second in zip(windows, windows[1:]):
+        first_id = str(first["window_id"])
+        second_id = str(second["window_id"])
+        if first_id not in results or second_id not in results:
+            continue
+        destination = root / "overlaps" / f"{first_id}--{second_id}"
+        if destination.exists():
+            report = audited_geodetic_diagnostic_overlap_report(
+                destination,
+                _verified_input_context=verified_input_context,
+            )
+        else:
+            published = publish_geodetic_diagnostic_overlap_report(
+                [results[first_id], results[second_id]],
+                destination,
+                overlap_policy=overlap_policy,
+                diagnostic_policy=diagnostic_policy,
+                _verified_input_context=verified_input_context,
+            )
+            report = json.loads(
+                (published / "diagnostic_overlap.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            report["artifact"] = str(published)
+        expected_paths = {
+            str(results[first_id].resolve()), str(results[second_id].resolve())
+        }
+        recorded_paths = {
+            str(item["result"])
+            for item in report["submap_assessments"]
+        }
+        if recorded_paths != expected_paths:
+            raise RuntimeError(
+                f"existing overlap {first_id}--{second_id} binds other results"
+            )
+        records.append(
+            {
+                "first_window_id": first_id,
+                "second_window_id": second_id,
+                "artifact": report["artifact"],
+                "production_passed": report["production_passed"],
+                "structurally_safe_for_diagnostic": report[
+                    "structurally_safe_for_diagnostic"
+                ],
+                "synchronized_rtk_assessments": report[
+                    "synchronized_rtk_assessments"
+                ],
+            }
+        )
+    return records
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    root = args.pilot_root.expanduser().resolve()
+    if args.resume:
+        if not root.is_dir() or root.is_symlink():
+            raise RuntimeError("--resume requires an existing safe pilot root")
+    else:
+        root.mkdir(parents=True, exist_ok=False)
+    assembly = audited_geodetic_assembly_plan(
+        args.plan, _include_runtime_context=True
+    )
+    windows = list(assembly["windows"])
+    by_id = {str(window["window_id"]): window for window in windows}
+    reuse = dict(args.reuse)
+    if len(reuse) != len(args.reuse) or not set(reuse) <= set(by_id):
+        raise ValueError("reused window bindings are duplicate or unknown")
+    requested = list(args.run_window) or [
+        window_id for window_id in by_id if window_id not in reuse
+    ]
+    if (
+        len(requested) != len(set(requested))
+        or not set(requested) <= set(by_id)
+        or set(requested) & set(reuse)
+        or set(requested) | set(reuse) != set(by_id)
+    ):
+        raise ValueError(
+            "reuse and run-window inputs must partition every assembly window exactly"
+        )
+    policy = GeodeticDiagnosticPolicy(
+        median_rtk_warning_m=args.median_rtk_warning_m
+    )
+    results: dict[str, Path] = {}
+    submap_records = []
+    for window_id, path in reuse.items():
+        result = path.expanduser().resolve()
+        assessment = audited_geodetic_diagnostic_submap_result(
+            result,
+            policy=policy,
+            _verified_input_context=assembly["_runtime_context"],
+        )
+        results[window_id] = result
+        submap_records.append(
+            {"window_id": window_id, "state": "reused", **assessment}
+        )
+    overlap_records = _publish_available_overlaps(
+        windows,
+        results,
+        root,
+        assembly["config_object"].overlap_policy,
+        policy,
+        assembly["_runtime_context"],
+    )
+
+    for index, window_id in enumerate(requested, start=1):
+        workspace = root / "submaps" / window_id
+        result_path = _result_path(root, window_id)
+        if result_path.exists():
+            state = "verified"
+        else:
+            prepared = prepare_geodetic_assembly_window(
+                args.plan,
+                window_id,
+                workspace,
+                _audited_plan=assembly,
+            )
+            run_geodetic_submap_plan(
+                prepared["plan"],
+                prepared["result"],
+                args.colmap,
+                _verified_input_context=assembly["_runtime_context"],
+            )
+            state = "completed"
+        assessment = audited_geodetic_diagnostic_submap_result(
+            result_path,
+            policy=policy,
+            _verified_input_context=assembly["_runtime_context"],
+        )
+        results[window_id] = result_path.resolve()
+        submap_records.append(
+            {"window_id": window_id, "state": state, **assessment}
+        )
+        print(
+            json.dumps(
+                {
+                    "progress": f"{index}/{len(requested)}",
+                    "window_id": window_id,
+                    "state": state,
+                    "production_passed": assessment["production_passed"],
+                    "production_failed_checks": assessment[
+                        "production_failed_checks"
+                    ],
+                    "structurally_safe_for_diagnostic": True,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        overlap_records = _publish_available_overlaps(
+            windows,
+            results,
+            root,
+            assembly["config_object"].overlap_policy,
+            policy,
+            assembly["_runtime_context"],
+        )
+
+    inventory_path = root / "diagnostic-result-inventory"
+    if inventory_path.exists():
+        inventory = audited_geodetic_diagnostic_result_inventory(
+            inventory_path, _verified_assembly=assembly
+        )
+    else:
+        inventory_path = publish_geodetic_diagnostic_result_inventory(
+            args.plan,
+            results,
+            inventory_path,
+            policy=policy,
+        )
+        inventory = json.loads(
+            (inventory_path / "diagnostic_result_inventory.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        inventory["artifact"] = str(inventory_path)
+    pose_path = root / "pose_artifacts" / args.pose_name
+    if pose_path.exists():
+        pose = audited_geodetic_diagnostic_full_pose_artifact(pose_path)
+    else:
+        published_pose = publish_geodetic_diagnostic_full_pose_artifact(
+            inventory_path, root / "pose_artifacts", args.pose_name
+        )
+        pose = {
+            "artifact": str(published_pose),
+            "quality": json.loads(
+                (published_pose / "quality.json").read_text(encoding="utf-8")
+            ),
+        }
+    summary = {
+        "schema_version": 1,
+        "diagnostic_only": True,
+        "pilot_root": str(root),
+        "submaps": sorted(submap_records, key=lambda item: item["window_id"]),
+        "overlaps": overlap_records,
+        "inventory": inventory["artifact"],
+        "pose": pose["artifact"],
+        "pose_quality": {
+            "production_passed": pose["quality"]["passed"],
+            "production_failed_checks": pose["quality"][
+                "production_failed_checks"
+            ],
+            "diagnostic_structurally_safe": pose["quality"][
+                "diagnostic_structurally_safe"
+            ],
+            "global_holdout_median_rtk_residual_m": pose["quality"][
+                "global_holdout_median_rtk_residual_m"
+            ],
+        },
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

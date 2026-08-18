@@ -224,7 +224,99 @@ def _legacy_pose(reader: SegmentReader, parent: Path, name: str) -> Path:
     return root
 
 
+def _diagnostic_pose(reader: SegmentReader, parent: Path, name: str) -> Path:
+    root = parent / name
+    root.mkdir(parents=True)
+    np.save(root / "viewmats.npy", reader.frames["initial_viewmat"])
+    np.save(root / "cam_centers.npy", reader.frames["initial_camera_center_m"])
+    status = {
+        "artifact_class": "diagnostic_render_only",
+        "georeferencing_status": "FAILED",
+        "metric_georeferencing_claim_eligible": False,
+        "diagnostic_export_requested": True,
+        "diagnostic_export_override_used": True,
+    }
+    declaration = {"schema_version": 1, **status}
+    (root / "quality.json").write_text(
+        json.dumps(
+            {**declaration, "rtk_alignment_passed": False},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    for filename in (
+        "alignment.json",
+        "provenance.json",
+        "georeferencing.json",
+        "GEOREFERENCING_FAILED.json",
+    ):
+        (root / filename).write_text(
+            json.dumps(declaration, indent=2, sort_keys=True) + "\n"
+        )
+    files = {}
+    for path in sorted(root.iterdir()):
+        if path.is_file():
+            payload = path.read_bytes()
+            files[path.name] = {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "name": name,
+                **status,
+                "files": files,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return root
+
+
 class TilePlanTests(unittest.TestCase):
+    def test_diagnostic_pose_requires_permission_and_status_is_propagated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reader = _segment(root / "segment")
+            pose_parent = root / "poses"
+            _diagnostic_pose(reader, pose_parent, "diagnostic")
+            cfg = _cfg(root / "work")
+            cfg.pose.artifact = "diagnostic"
+            cfg.pose.artifact_root = pose_parent
+            with self.assertRaisesRegex(ValueError, "explicit render-only"):
+                build_tile_plan(
+                    reader,
+                    cfg,
+                    name="refused",
+                    output_root=root / "work",
+                    tile_count=2,
+                )
+            artifact = build_tile_plan(
+                reader,
+                cfg,
+                name="diagnostic-plan",
+                output_root=root / "work",
+                tile_count=2,
+                allow_failed_georeferencing_for_render=True,
+            )
+            plan = verify_tile_plan(
+                artifact,
+                segment=reader.root,
+                pose_root=pose_parent / "diagnostic",
+            )
+            self.assertTrue(plan["diagnostic_render_only"])
+            self.assertTrue(plan["provisional"])
+            self.assertFalse(plan["metric_georeferencing_claim_eligible"])
+            self.assertEqual(
+                plan["evidence_tier"],
+                "metric_depth_and_diagnostic_global_pose",
+            )
+
     def test_tile_execution_builds_context_masked_plan_bound_cloud(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -17,14 +17,22 @@ from typing import Sequence
 
 from rtk_splat.backends.geodetic_assembly import (
     GeodeticAssemblyConfig,
+    GeodeticDiagnosticPolicy,
     GeodeticOverlapPolicy,
     audited_geodetic_assembly_plan,
+    audited_geodetic_diagnostic_full_pose_artifact,
+    audited_geodetic_diagnostic_overlap_report,
+    audited_geodetic_diagnostic_result_inventory,
+    audited_geodetic_diagnostic_submap_result,
     audited_geodetic_full_pose_artifact,
     audited_geodetic_overlap_report,
     audited_geodetic_submap_pose_export,
     export_geodetic_submap_poses,
     prepare_geodetic_assembly_plan,
     prepare_geodetic_assembly_window,
+    publish_geodetic_diagnostic_full_pose_artifact,
+    publish_geodetic_diagnostic_overlap_report,
+    publish_geodetic_diagnostic_result_inventory,
     publish_geodetic_full_pose_artifact,
     publish_geodetic_overlap_report,
 )
@@ -75,6 +83,20 @@ def _assembly_config(args: argparse.Namespace) -> GeodeticAssemblyConfig:
         blend_boundary_power=args.blend_boundary_power,
         overlap_policy=overlap,
         submap_config=_submap_config(args),
+    )
+
+
+def _diagnostic_policy(args: argparse.Namespace) -> GeodeticDiagnosticPolicy:
+    return GeodeticDiagnosticPolicy(
+        median_rtk_warning_m=args.median_rtk_warning_m
+    )
+
+
+def _add_diagnostic_policy(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--median-rtk-warning-m",
+        type=float,
+        default=GeodeticDiagnosticPolicy().median_rtk_warning_m,
     )
 
 
@@ -169,6 +191,35 @@ def build_parser() -> argparse.ArgumentParser:
     overlap.add_argument("--result", action="append", required=True)
     overlap.add_argument("--output", required=True)
     _add_config(overlap)
+
+    diagnostic_run = commands.add_parser("run-window-diagnostic")
+    diagnostic_run.add_argument("--plan", required=True)
+    diagnostic_run.add_argument("--submaps-root", required=True)
+    diagnostic_run.add_argument("--window-id", required=True)
+    diagnostic_run.add_argument("--colmap", required=True)
+    _add_diagnostic_policy(diagnostic_run)
+
+    diagnostic_overlap = commands.add_parser("diagnostic-overlap")
+    diagnostic_overlap.add_argument("--result", action="append", required=True)
+    diagnostic_overlap.add_argument("--output", required=True)
+    _add_config(diagnostic_overlap)
+    _add_diagnostic_policy(diagnostic_overlap)
+
+    diagnostic_inventory = commands.add_parser("diagnostic-inventory")
+    diagnostic_inventory.add_argument("--plan", required=True)
+    diagnostic_inventory.add_argument(
+        "--result",
+        action="append",
+        required=True,
+        help="exact WINDOW_ID=RESULT_PATH binding; repeat for every window",
+    )
+    diagnostic_inventory.add_argument("--output", required=True)
+    _add_diagnostic_policy(diagnostic_inventory)
+
+    diagnostic_assemble = commands.add_parser("diagnostic-assemble")
+    diagnostic_assemble.add_argument("--inventory", required=True)
+    diagnostic_assemble.add_argument("--pose-root", required=True)
+    diagnostic_assemble.add_argument("--pose-name", required=True)
 
     assemble = commands.add_parser("assemble")
     assemble.add_argument("--plan", required=True)
@@ -362,6 +413,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         return 1 if failures else 0
+    if args.command == "run-window-diagnostic":
+        args.window_id = [args.window_id]
+        prepared = _prepared_for_run(args)
+        if len(prepared) != 1:
+            raise RuntimeError("diagnostic window selection is not exact")
+        item = prepared[0]
+        result_path = Path(item["result"])
+        if result_path.exists():
+            result = audited_geodetic_submap_result(result_path)
+            state = "verified"
+        else:
+            result = run_geodetic_submap_plan(
+                item["plan"],
+                result_path,
+                args.colmap,
+                _verified_input_context=item.get("_verified_input_context"),
+            )
+            state = "completed"
+        assessment = audited_geodetic_diagnostic_submap_result(
+            result_path, policy=_diagnostic_policy(args)
+        )
+        _json_print(
+            {
+                "window_id": item["window_id"],
+                "state": state,
+                "result": result,
+                "diagnostic_assessment": assessment,
+            }
+        )
+        return 0
     if args.command == "export-submap":
         print(export_geodetic_submap_poses(args.result, args.output))
         return 0
@@ -375,6 +456,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         report["artifact"] = str(output)
         _json_print(report)
         return 0 if report["passed"] else 2
+    if args.command == "diagnostic-overlap":
+        output = publish_geodetic_diagnostic_overlap_report(
+            args.result,
+            args.output,
+            overlap_policy=_assembly_config(args).overlap_policy,
+            diagnostic_policy=_diagnostic_policy(args),
+        )
+        _json_print(audited_geodetic_diagnostic_overlap_report(output))
+        return 0
+    if args.command == "diagnostic-inventory":
+        result_by_window = {}
+        for binding in args.result:
+            if "=" not in binding:
+                raise ValueError("--result must be WINDOW_ID=RESULT_PATH")
+            window_id, result_path = binding.split("=", 1)
+            if not window_id or not result_path or window_id in result_by_window:
+                raise ValueError("diagnostic result bindings must be unique")
+            result_by_window[window_id] = result_path
+        output = publish_geodetic_diagnostic_result_inventory(
+            args.plan,
+            result_by_window,
+            args.output,
+            policy=_diagnostic_policy(args),
+        )
+        _json_print(audited_geodetic_diagnostic_result_inventory(output))
+        return 0
+    if args.command == "diagnostic-assemble":
+        output = publish_geodetic_diagnostic_full_pose_artifact(
+            args.inventory, args.pose_root, args.pose_name
+        )
+        _json_print(audited_geodetic_diagnostic_full_pose_artifact(output))
+        return 0
     if args.command == "assemble":
         output = publish_geodetic_full_pose_artifact(
             args.plan,

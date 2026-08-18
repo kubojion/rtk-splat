@@ -491,6 +491,9 @@ def cmd_tiles_plan(cfg, args) -> None:
         name=name,
         output_root=cfg.paths.workdir,
         tile_count=args.tile_count,
+        allow_failed_georeferencing_for_render=bool(
+            getattr(args, "allow_failed_georeferencing_for_render", False)
+        ),
     )
     plan = json.loads((output / "tile_plan.json").read_text())
     print(
@@ -796,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "explicitly consume or publish a diagnostic-render-only pose "
             "whose held-out georeferencing gate failed; valid only for "
-            "backend-export, cloud, and train"
+            "backend-export, tiles-plan, cloud, and train"
         ),
     )
     parser.add_argument(
@@ -975,11 +978,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     if (
         args.allow_failed_georeferencing_for_render
-        and args.stage not in {"backend-export", "cloud", "train"}
+        and args.stage not in {
+            "backend-export",
+            "tiles-plan",
+            "cloud",
+            "train",
+        }
     ):
         raise ValueError(
             "--allow-failed-georeferencing-for-render is valid only for "
-            "backend-export, cloud, and train"
+            "backend-export, tiles-plan, cloud, and train"
         )
     cfg = load_config(args.config, config_root=args.config_root)
     _validate_diagnostic_render_names(args, cfg)

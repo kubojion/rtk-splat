@@ -1022,15 +1022,25 @@ def verify_tile_plan(
         and georeferencing.get("georeferencing_status") == "PASSED"
         and georeferencing.get("metric_georeferencing_claim_eligible") is True
     )
+    diagnostic_pose = bool(
+        has_modern_pose_declaration
+        and georeferencing.get("artifact_class") == "diagnostic_render_only"
+        and georeferencing.get("metric_georeferencing_claim_eligible") is False
+    )
+    expected_tier = (
+        "metric_depth_and_production_global_pose"
+        if claim_eligible
+        else (
+            "metric_depth_and_diagnostic_global_pose"
+            if diagnostic_pose
+            else "metric_depth_and_unassessed_global_pose"
+        )
+    )
     if (
         plan.get("metric_georeferencing_claim_eligible") is not claim_eligible
         or plan.get("provisional") is not (not claim_eligible)
-        or plan.get("evidence_tier")
-        != (
-            "metric_depth_and_production_global_pose"
-            if claim_eligible
-            else "metric_depth_and_unassessed_global_pose"
-        )
+        or plan.get("diagnostic_render_only", False) is not diagnostic_pose
+        or plan.get("evidence_tier") != expected_tier
     ):
         raise ArtifactError("tile-plan pose status was promoted or changed")
     basis = np.asarray(plan["coordinate_frame"]["R_enu_from_partition"], dtype=float)
@@ -1423,6 +1433,7 @@ def build_tile_plan(
     name: str,
     output_root: str | Path,
     tile_count: int | None = None,
+    allow_failed_georeferencing_for_render: bool = False,
 ) -> Path:
     """Build and atomically publish one non-overwriting final-mode TilePlan."""
     reader.validate()
@@ -1436,9 +1447,18 @@ def build_tile_plan(
     images_before = _image_inventory(reader)
     georeferencing = pose_georeferencing_evidence(reader.root, cfg)
     require_render_permission(
-        georeferencing, allow_failed_georeferencing_for_render=False
+        georeferencing,
+        allow_failed_georeferencing_for_render=(
+            allow_failed_georeferencing_for_render
+        ),
     )
-    viewmats, centers = load_pose_artifact(reader.root, cfg)
+    viewmats, centers = load_pose_artifact(
+        reader.root,
+        cfg,
+        allow_failed_georeferencing_for_render=(
+            allow_failed_georeferencing_for_render
+        ),
+    )
     if (
         _contract_inventory(reader) != contract_before
         or _pose_inventory(reader, cfg) != pose_before
@@ -1448,6 +1468,10 @@ def build_tile_plan(
         georeferencing.get("artifact_class") == "production"
         and georeferencing.get("georeferencing_status") == "PASSED"
         and georeferencing.get("metric_georeferencing_claim_eligible") is True
+    )
+    diagnostic_pose = bool(
+        georeferencing.get("artifact_class") == "diagnostic_render_only"
+        and georeferencing.get("metric_georeferencing_claim_eligible") is False
     )
     origin, basis, _ = _partition_basis(viewmats, centers)
     support, depth_records, support_quality, sampled_depth_m = _sample_support(
@@ -1548,10 +1572,15 @@ def build_tile_plan(
         "evidence_tier": (
             "metric_depth_and_production_global_pose"
             if pose_claim_eligible
-            else "metric_depth_and_unassessed_global_pose"
+            else (
+                "metric_depth_and_diagnostic_global_pose"
+                if diagnostic_pose
+                else "metric_depth_and_unassessed_global_pose"
+            )
         ),
         "provisional": not pose_claim_eligible,
         "metric_georeferencing_claim_eligible": pose_claim_eligible,
+        **({"diagnostic_render_only": True} if diagnostic_pose else {}),
         "coordinate_frame": {
             "source": reader.meta["coordinate_frame"],
             "partition_origin_enu_m": origin.tolist(),
@@ -1629,6 +1658,11 @@ def build_tile_plan(
             else str(pose_artifact_dir(reader.root, cfg).resolve())
         ),
         "georeferencing": georeferencing,
+        **(
+            {"allow_failed_georeferencing_for_render": True}
+            if allow_failed_georeferencing_for_render
+            else {}
+        ),
         "configuration": configuration_evidence(cfg),
         "package": collect_package_state(),
         "source_inventory_sha256": canonical_hash(inventory),

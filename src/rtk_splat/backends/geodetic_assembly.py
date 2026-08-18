@@ -76,6 +76,10 @@ from rtk_splat.frontends.artifact import (
 _PLAN_KIND = "rtk_splat_geodetic_assembly_plan"
 _EXPORT_KIND = "rtk_splat_geodetic_submap_pose_export"
 _OVERLAP_KIND = "rtk_splat_geodetic_overlap_report"
+_DIAGNOSTIC_INVENTORY_KIND = (
+    "rtk_splat_geodetic_diagnostic_result_inventory"
+)
+_DIAGNOSTIC_OVERLAP_KIND = "rtk_splat_geodetic_diagnostic_overlap_report"
 _PLAN_FILES = (
     "frame_selection.json",
     "geodetic_assembly_plan.json",
@@ -126,6 +130,43 @@ class GeodeticOverlapPolicy:
             <= self.max_rotation_disagreement_deg
         ):
             raise ValueError("rotation disagreement limits must be ordered")
+
+
+@dataclass(frozen=True)
+class GeodeticDiagnosticPolicy:
+    """Explicit non-production policy for structurally safe RTK failures.
+
+    The warning limit is intentionally not an acceptance limit.  It makes a
+    large absolute disagreement prominent while the structural checks below
+    remain fail-closed.  Production acceptance continues to use the mapper's
+    unchanged RTK gates.
+    """
+
+    median_rtk_warning_m: float = 0.15
+    allowed_submap_failure_checks: tuple[str, ...] = (
+        "heldout_median_not_worse_m",
+        "heldout_rtk_absolute_gates",
+    )
+
+    def __post_init__(self) -> None:
+        warning = float(self.median_rtk_warning_m)
+        if not math.isfinite(warning) or warning <= 0.0:
+            raise ValueError("median_rtk_warning_m must be finite and positive")
+        allowed = tuple(str(value) for value in self.allowed_submap_failure_checks)
+        if (
+            not allowed
+            or len(set(allowed)) != len(allowed)
+            or any(not value for value in allowed)
+        ):
+            raise ValueError("allowed diagnostic submap checks must be unique")
+        expected = {
+            "heldout_median_not_worse_m",
+            "heldout_rtk_absolute_gates",
+        }
+        if set(allowed) != expected:
+            raise ValueError(
+                "diagnostic policy may waive only the two declared RTK checks"
+            )
 
 
 @dataclass(frozen=True)
@@ -851,6 +892,7 @@ def _aligned_submap_candidate(
     result_artifact: str | Path,
     *,
     _verified_input_context: tuple[Any, ...] | None = None,
+    _allow_failed_result_for_diagnostic: bool = False,
 ) -> dict[str, Any]:
     """Load one accepted result and reproduce its calibration-only SE(3)."""
     result = audited_geodetic_submap_result(
@@ -858,7 +900,10 @@ def _aligned_submap_candidate(
         _include_internal_plan_context=True,
         _verified_input_context=_verified_input_context,
     )
-    if not result.get("passed") or not result.get("publication_eligible"):
+    if (
+        (not result.get("passed") or not result.get("publication_eligible"))
+        and not _allow_failed_result_for_diagnostic
+    ):
         raise ArtifactError("submap result did not pass its acceptance gates")
     (
         plan_root,
@@ -1015,6 +1060,84 @@ def _aligned_submap_candidate(
         "refined_alignment": refined_evaluation.alignment,
         "source_alignment": source_evaluation.alignment,
     }
+
+
+def _failed_authoritative_checks(
+    checks: Mapping[str, Any],
+) -> list[str]:
+    return sorted(
+        str(name)
+        for name, check in checks.items()
+        if isinstance(check, Mapping)
+        and check.get("authoritative", True) is True
+        and check.get("passed") is not True
+    )
+
+
+def _diagnostic_submap_assessment(
+    candidate: Mapping[str, Any],
+    policy: GeodeticDiagnosticPolicy,
+) -> dict[str, Any]:
+    quality = candidate["result"]["quality"]
+    checks = quality.get("checks")
+    if not isinstance(checks, Mapping):
+        raise ArtifactError("submap quality has no check inventory")
+    production_failures = _failed_authoritative_checks(checks)
+    allowed = set(policy.allowed_submap_failure_checks)
+    structural_failures = sorted(set(production_failures) - allowed)
+    refined = quality.get("rtk_holdout", {}).get("refined", {})
+    residual = refined.get("residual_m", {})
+    median = residual.get("median")
+    if (
+        isinstance(median, bool)
+        or not isinstance(median, (int, float))
+        or not math.isfinite(float(median))
+    ):
+        raise ArtifactError("submap has no finite refined RTK median")
+    production_passed = bool(
+        candidate["result"].get("passed")
+        and candidate["result"].get("publication_eligible")
+    )
+    if production_passed != (not production_failures):
+        raise ArtifactError("submap production state disagrees with its checks")
+    return {
+        "schema_version": 1,
+        "result": candidate["result"]["artifact"],
+        "result_seal_sha256": candidate["result"]["result_seal_sha256"],
+        "production_passed": production_passed,
+        "production_failed_checks": production_failures,
+        "allowed_rtk_only_failed_checks": sorted(
+            set(production_failures) & allowed
+        ),
+        "structural_failed_checks": structural_failures,
+        "structurally_safe_for_diagnostic": not structural_failures,
+        "refined_holdout_median_rtk_residual_m": float(median),
+        "median_rtk_warning_m": float(policy.median_rtk_warning_m),
+        "median_rtk_warning_exceeded": (
+            float(median) > float(policy.median_rtk_warning_m)
+        ),
+    }
+
+
+def audited_geodetic_diagnostic_submap_result(
+    result_artifact: str | Path,
+    *,
+    policy: GeodeticDiagnosticPolicy = GeodeticDiagnosticPolicy(),
+    _verified_input_context: tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
+    """Audit one result and classify only declared RTK failures as diagnostic."""
+    candidate = _aligned_submap_candidate(
+        result_artifact,
+        _verified_input_context=_verified_input_context,
+        _allow_failed_result_for_diagnostic=True,
+    )
+    assessment = _diagnostic_submap_assessment(candidate, policy)
+    if not assessment["structurally_safe_for_diagnostic"]:
+        raise ArtifactError(
+            "submap has non-RTK diagnostic failures: "
+            + ", ".join(assessment["structural_failed_checks"])
+        )
+    return assessment
 
 
 def _trajectory_csv(
@@ -2073,6 +2196,254 @@ def publish_geodetic_overlap_report(
     return output
 
 
+def _diagnostic_overlap_record(
+    candidates: Sequence[Mapping[str, Any]],
+    overlap_policy: GeodeticOverlapPolicy,
+    diagnostic_policy: GeodeticDiagnosticPolicy,
+) -> dict[str, Any]:
+    production = _evaluate_overlap_candidates(candidates, overlap_policy)
+    submaps = [
+        _diagnostic_submap_assessment(candidate, diagnostic_policy)
+        for candidate in _ordered_overlap_candidates(candidates)
+    ]
+    pair_failures = [
+        {
+            "first_result": pair["first_result"],
+            "second_result": pair["second_result"],
+            "failed_checks": _failed_authoritative_checks(pair["checks"]),
+        }
+        for pair in production["pairs"]
+        if _failed_authoritative_checks(pair["checks"])
+    ]
+    synchronization = production["synchronization"]
+    synchronization_failures = _failed_authoritative_checks(
+        synchronization["checks"]
+    )
+    allowed_sync_failure = "all_synchronized_heldout_rtk_absolute_gates"
+    structural_sync_failures = sorted(
+        set(synchronization_failures) - {allowed_sync_failure}
+    )
+    fixed_metric_contract = bool(
+        synchronization.get("production_scale") == 1.0
+        and synchronization.get("sim3_scale_applied") is False
+        and all(
+            edge.get("production_scale") == 1.0
+            and edge.get("sim3_scale_applied") is False
+            for edge in synchronization.get("edges", [])
+        )
+    )
+    structural_checks = {
+        "all_submaps_structurally_safe": {
+            "value": all(
+                item["structurally_safe_for_diagnostic"] for item in submaps
+            ),
+            "expected": True,
+            "passed": all(
+                item["structurally_safe_for_diagnostic"] for item in submaps
+            ),
+        },
+        "all_visual_overlap_gates_passed": {
+            "value": not pair_failures,
+            "expected": True,
+            "passed": not pair_failures,
+        },
+        "calibration_synchronization_gates_passed": {
+            "value": not structural_sync_failures,
+            "expected": True,
+            "passed": not structural_sync_failures,
+        },
+        "fixed_scale_se3_contract": {
+            "value": fixed_metric_contract,
+            "expected": True,
+            "passed": fixed_metric_contract,
+        },
+    }
+    synchronized_warnings = []
+    for item in synchronization.get("synchronized_holdout", []):
+        median = item.get("residual_m", {}).get("median")
+        if (
+            isinstance(median, bool)
+            or not isinstance(median, (int, float))
+            or not math.isfinite(float(median))
+        ):
+            raise ArtifactError("synchronized overlap has no finite RTK median")
+        synchronized_warnings.append(
+            {
+                "result": item["result"],
+                "median_rtk_residual_m": float(median),
+                "median_rtk_warning_m": float(
+                    diagnostic_policy.median_rtk_warning_m
+                ),
+                "warning_exceeded": float(median)
+                > float(diagnostic_policy.median_rtk_warning_m),
+                "production_passed": bool(item["passed"]),
+                "production_failed_checks": _failed_authoritative_checks(
+                    item["checks"]
+                ),
+            }
+        )
+    structurally_safe = _authoritative_checks_pass(structural_checks)
+    return {
+        "schema_version": 1,
+        "kind": _DIAGNOSTIC_OVERLAP_KIND,
+        "experimental": True,
+        "artifact_class": "diagnostic_render_only",
+        "diagnostic_policy": asdict(diagnostic_policy),
+        "production_passed": bool(production["passed"])
+        and all(item["production_passed"] for item in submaps),
+        "production_failed_synchronization_checks": synchronization_failures,
+        "production_failed_visual_pairs": pair_failures,
+        "submap_assessments": submaps,
+        "synchronized_rtk_assessments": synchronized_warnings,
+        "structural_checks": structural_checks,
+        "structurally_safe_for_diagnostic": structurally_safe,
+        "production_evaluation": production,
+    }
+
+
+def publish_geodetic_diagnostic_overlap_report(
+    result_artifacts: Sequence[str | Path],
+    destination: str | Path,
+    *,
+    overlap_policy: GeodeticOverlapPolicy = GeodeticOverlapPolicy(),
+    diagnostic_policy: GeodeticDiagnosticPolicy = GeodeticDiagnosticPolicy(),
+    _verified_input_context: tuple[Any, ...] | None = None,
+) -> Path:
+    """Publish an honest non-production overlap assessment."""
+    if len(result_artifacts) < 2:
+        raise ArtifactError("diagnostic overlap requires at least two results")
+    first_result = Path(result_artifacts[0]).expanduser().resolve()
+    first_record = _json(first_result / "geodetic_submap_result.json")
+    first_plan = Path(str(first_record.get("plan_artifact", ""))).resolve()
+    first_plan_record = _json(first_plan / "geodetic_submap_plan.json")
+    shared_context = (
+        _input_context(
+            first_plan_record.get("frontend_artifact", ""),
+            first_plan_record.get("completed_backend", ""),
+            first_plan_record.get("segment", ""),
+        )
+        if _verified_input_context is None
+        else _verified_input_context
+    )
+    candidates = [
+        _aligned_submap_candidate(
+            path,
+            _verified_input_context=shared_context,
+            _allow_failed_result_for_diagnostic=True,
+        )
+        for path in result_artifacts
+    ]
+    report = _diagnostic_overlap_record(
+        candidates, overlap_policy, diagnostic_policy
+    )
+    if not report["structurally_safe_for_diagnostic"]:
+        failed = [
+            name
+            for name, check in report["structural_checks"].items()
+            if not check["passed"]
+        ]
+        raise ArtifactError(
+            "diagnostic overlap has structural failures: " + ", ".join(failed)
+        )
+    output = Path(destination).expanduser().resolve()
+    for candidate in candidates:
+        immutable = Path(candidate["result"]["artifact"])
+        if output == immutable or immutable in output.parents:
+            raise ArtifactError("diagnostic overlap must be outside result inputs")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite diagnostic overlap: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = output.parent / f".{output.name}.writing-{uuid.uuid4().hex}"
+    staging.mkdir()
+    try:
+        production = report["production_evaluation"]
+        _atomic_json(staging / "diagnostic_overlap.json", report)
+        _atomic_write(staging / "overlap.csv", _overlap_csv(production))
+        _atomic_write(staging / "overlap.svg", _overlap_svg(production))
+        _atomic_json(
+            staging / "manifest.json",
+            _file_evidence(
+                staging,
+                ["diagnostic_overlap.json", "overlap.csv", "overlap.svg"],
+            ),
+        )
+        publish_directory_noreplace(staging, output)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    audited_geodetic_diagnostic_overlap_report(
+        output, _verified_input_context=shared_context
+    )
+    return output
+
+
+def audited_geodetic_diagnostic_overlap_report(
+    artifact: str | Path,
+    *,
+    _verified_input_context: tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
+    root = Path(artifact).expanduser().resolve()
+    expected_files = {
+        "diagnostic_overlap.json",
+        "overlap.csv",
+        "overlap.svg",
+        "manifest.json",
+    }
+    if (
+        not root.is_dir()
+        or root.is_symlink()
+        or {path.name for path in root.iterdir()} != expected_files
+    ):
+        raise ArtifactError("diagnostic overlap report is missing or changed")
+    _verify_file_evidence(
+        root,
+        "manifest.json",
+        ["diagnostic_overlap.json", "overlap.csv", "overlap.svg"],
+    )
+    recorded = _json(root / "diagnostic_overlap.json")
+    if recorded.get("kind") != _DIAGNOSTIC_OVERLAP_KIND:
+        raise ArtifactError("invalid diagnostic overlap report")
+    production = recorded.get("production_evaluation", {})
+    paths: list[str] = []
+    for pair in production.get("pairs", []):
+        for key in ("first_result", "second_result"):
+            value = str(pair.get(key, ""))
+            if value not in paths:
+                paths.append(value)
+    if len(paths) < 2:
+        raise ArtifactError("diagnostic overlap result inventory is invalid")
+    first_record = _json(Path(paths[0]) / "geodetic_submap_result.json")
+    first_plan = Path(str(first_record.get("plan_artifact", ""))).resolve()
+    plan_record = _json(first_plan / "geodetic_submap_plan.json")
+    shared_context = (
+        _input_context(
+            plan_record.get("frontend_artifact", ""),
+            plan_record.get("completed_backend", ""),
+            plan_record.get("segment", ""),
+        )
+        if _verified_input_context is None
+        else _verified_input_context
+    )
+    candidates = [
+        _aligned_submap_candidate(
+            path,
+            _verified_input_context=shared_context,
+            _allow_failed_result_for_diagnostic=True,
+        )
+        for path in paths
+    ]
+    expected = _diagnostic_overlap_record(
+        candidates,
+        GeodeticOverlapPolicy(**dict(production.get("policy", {}))),
+        GeodeticDiagnosticPolicy(
+            **dict(recorded.get("diagnostic_policy", {}))
+        ),
+    )
+    if expected != recorded:
+        raise ArtifactError("diagnostic overlap report content changed")
+    return {**recorded, "artifact": str(root)}
+
+
 def _verify_overlap_report_files(
     root: Path, expected_report: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -2241,6 +2612,227 @@ def _load_assembly_candidates(
     return candidates
 
 
+def _diagnostic_inventory_record(
+    assembly: Mapping[str, Any],
+    result_by_window: Mapping[str, str | Path],
+    policy: GeodeticDiagnosticPolicy,
+    *,
+    _verified_input_context: tuple[Any, ...] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    expected_ids = [str(window["window_id"]) for window in assembly["windows"]]
+    if set(result_by_window) != set(expected_ids):
+        missing = sorted(set(expected_ids) - set(result_by_window))
+        unexpected = sorted(set(result_by_window) - set(expected_ids))
+        raise ArtifactError(
+            "diagnostic result inventory differs from assembly windows: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    resolved = [
+        Path(result_by_window[window_id]).expanduser().resolve()
+        for window_id in expected_ids
+    ]
+    if len(set(resolved)) != len(resolved):
+        raise ArtifactError("diagnostic result inventory contains duplicates")
+
+    candidates: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    global_holdout = set(assembly["global_holdout"]["holdout_names"])
+    globally_excluded = set(assembly["global_holdout"]["excluded_names"])
+    for window, result_path in zip(
+        assembly["windows"], resolved, strict=True
+    ):
+        candidate = _aligned_submap_candidate(
+            result_path,
+            _verified_input_context=_verified_input_context,
+            _allow_failed_result_for_diagnostic=True,
+        )
+        window_id = str(window["window_id"])
+        if candidate["frame_ids"].astype(int).tolist() != window["frame_ids"]:
+            raise ArtifactError(f"{window_id} result has the wrong frame inventory")
+        if (
+            candidate["calibration_names"] != window["calibration_names"]
+            or candidate["holdout_names"] != window["holdout_names"]
+        ):
+            raise ArtifactError(f"{window_id} prior split differs from assembly plan")
+        names = set(candidate["left_image_names"])
+        required_absent = global_holdout & names
+        rejected_absent = globally_excluded & names
+        if (
+            not required_absent <= set(candidate["holdout_names"])
+            or required_absent & set(candidate["calibration_names"])
+        ):
+            raise ArtifactError(f"{window_id} consumed a global held-out prior")
+        if rejected_absent & (
+            set(candidate["calibration_names"])
+            | set(candidate["holdout_names"])
+        ):
+            raise ArtifactError(
+                f"{window_id} consumed a rejected GNSS observation"
+            )
+        workspace = result_path.parent
+        binding = _json(workspace / "window_binding.json")
+        if (
+            Path(str(binding.get("assembly_plan", ""))).resolve()
+            != Path(str(assembly["artifact"])).resolve()
+            or binding.get("assembly_plan_seal_sha256")
+            != assembly["plan_seal_sha256"]
+            or binding.get("window_id") != window_id
+            or binding.get("frame_ids_sha256") != window["frame_ids_sha256"]
+        ):
+            raise ArtifactError(f"{window_id} binding changed")
+        assessment = _diagnostic_submap_assessment(candidate, policy)
+        if not assessment["structurally_safe_for_diagnostic"]:
+            raise ArtifactError(
+                f"{window_id} has non-RTK diagnostic failures: "
+                + ", ".join(assessment["structural_failed_checks"])
+            )
+        candidate["window"] = window
+        candidates.append(candidate)
+        records.append(
+            {
+                "window_id": window_id,
+                "frame_ids_sha256": window["frame_ids_sha256"],
+                "result": candidate["result"]["artifact"],
+                "result_seal_sha256": candidate["result"][
+                    "result_seal_sha256"
+                ],
+                "plan_seal_sha256": candidate["result"]["plan_seal_sha256"],
+                "window_binding_sha256": sha256_file(
+                    workspace / "window_binding.json"
+                ),
+                "assessment": assessment,
+            }
+        )
+    record = {
+        "schema_version": 1,
+        "kind": _DIAGNOSTIC_INVENTORY_KIND,
+        "experimental": True,
+        "artifact_class": "diagnostic_render_only",
+        "production_publication_eligible": False,
+        "assembly_plan": assembly["artifact"],
+        "assembly_plan_seal_sha256": assembly["plan_seal_sha256"],
+        "policy": asdict(policy),
+        "window_count": len(records),
+        "selected_frame_count": assembly["selected_frame_count"],
+        "all_windows_structurally_safe": True,
+        "production_failed_window_ids": [
+            item["window_id"]
+            for item in records
+            if not item["assessment"]["production_passed"]
+        ],
+        "warning_exceeded_window_ids": [
+            item["window_id"]
+            for item in records
+            if item["assessment"]["median_rtk_warning_exceeded"]
+        ],
+        "windows": records,
+    }
+    return record, candidates
+
+
+def publish_geodetic_diagnostic_result_inventory(
+    assembly_plan: str | Path,
+    result_by_window: Mapping[str, str | Path],
+    destination: str | Path,
+    *,
+    policy: GeodeticDiagnosticPolicy = GeodeticDiagnosticPolicy(),
+) -> Path:
+    """Seal an exact mixed-root inventory of structurally safe submaps."""
+    assembly = audited_geodetic_assembly_plan(
+        assembly_plan, _include_runtime_context=True
+    )
+    record, candidates = _diagnostic_inventory_record(
+        assembly,
+        result_by_window,
+        policy,
+        _verified_input_context=assembly["_runtime_context"],
+    )
+    output = Path(destination).expanduser().resolve()
+    immutable = [Path(assembly["artifact"])] + [
+        Path(candidate["result"]["artifact"]) for candidate in candidates
+    ]
+    if any(output == item or item in output.parents for item in immutable):
+        raise ArtifactError("diagnostic inventory must be outside immutable inputs")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite diagnostic inventory: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = output.parent / f".{output.name}.writing-{uuid.uuid4().hex}"
+    staging.mkdir()
+    try:
+        _atomic_json(staging / "diagnostic_result_inventory.json", record)
+        _atomic_json(
+            staging / "manifest.json",
+            _file_evidence(staging, ["diagnostic_result_inventory.json"]),
+        )
+        publish_directory_noreplace(staging, output)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    audited_geodetic_diagnostic_result_inventory(
+        output, _verified_assembly=assembly
+    )
+    return output
+
+
+def audited_geodetic_diagnostic_result_inventory(
+    artifact: str | Path,
+    *,
+    _include_candidates: bool = False,
+    _verified_assembly: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    root = Path(artifact).expanduser().resolve()
+    expected_files = {"diagnostic_result_inventory.json", "manifest.json"}
+    if (
+        not root.is_dir()
+        or root.is_symlink()
+        or {path.name for path in root.iterdir()} != expected_files
+    ):
+        raise ArtifactError("diagnostic result inventory is missing or changed")
+    _verify_file_evidence(
+        root, "manifest.json", ["diagnostic_result_inventory.json"]
+    )
+    recorded = _json(root / "diagnostic_result_inventory.json")
+    if recorded.get("kind") != _DIAGNOSTIC_INVENTORY_KIND:
+        raise ArtifactError("invalid diagnostic result inventory")
+    policy = GeodeticDiagnosticPolicy(**dict(recorded.get("policy", {})))
+    assembly = (
+        audited_geodetic_assembly_plan(
+            recorded.get("assembly_plan", ""), _include_runtime_context=True
+        )
+        if _verified_assembly is None
+        else _verified_assembly
+    )
+    if Path(str(assembly.get("artifact", ""))).resolve() != Path(
+        str(recorded.get("assembly_plan", ""))
+    ).resolve():
+        raise ArtifactError("cached diagnostic assembly refers to another plan")
+    if recorded.get("assembly_plan_seal_sha256") != assembly["plan_seal_sha256"]:
+        raise ArtifactError("diagnostic inventory assembly binding changed")
+    entries = recorded.get("windows")
+    if not isinstance(entries, list):
+        raise ArtifactError("diagnostic inventory has no window records")
+    result_by_window = {
+        str(item.get("window_id")): str(item.get("result", ""))
+        for item in entries
+        if isinstance(item, Mapping)
+    }
+    if len(result_by_window) != len(entries):
+        raise ArtifactError("diagnostic inventory window records are invalid")
+    expected, candidates = _diagnostic_inventory_record(
+        assembly,
+        result_by_window,
+        policy,
+        _verified_input_context=assembly["_runtime_context"],
+    )
+    if expected != recorded:
+        raise ArtifactError("diagnostic result inventory content changed")
+    audited = {**recorded, "artifact": str(root)}
+    if _include_candidates:
+        audited["_assembly"] = assembly
+        audited["_candidates"] = candidates
+    return audited
+
+
 def _assembly_evaluation_priors(
     candidates: Sequence[Mapping[str, Any]],
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -2319,6 +2911,326 @@ def _direct_rtk_evaluation(
     }
 
 
+def _diagnostic_full_pose_evidence(
+    inventory: Mapping[str, Any],
+) -> dict[str, Any]:
+    assembly = inventory["_assembly"]
+    candidates = inventory["_candidates"]
+    synchronized, synchronization = _synchronize_candidates(
+        candidates,
+        minimum_overlap_frames=(
+            assembly["config_object"].overlap_policy.minimum_overlap_frames
+        ),
+    )
+    production_overlap = _synchronized_overlap_report(
+        candidates,
+        synchronized,
+        synchronization,
+        assembly["config_object"].overlap_policy,
+    )
+    diagnostic_overlap = _diagnostic_overlap_record(
+        candidates,
+        assembly["config_object"].overlap_policy,
+        GeodeticDiagnosticPolicy(**dict(inventory["policy"])),
+    )
+    (
+        frontend,
+        manifest_source,
+        source,
+        _source_plan,
+        mapper_config,
+        source_quality,
+        segment,
+        reader,
+        source_evidence,
+    ) = assembly["_runtime_context"]
+    _, selection = _load_frame_selection(
+        Path(assembly["artifact"]) / "frame_selection.json",
+        frontend,
+        segment,
+        manifest_source,
+    )
+    rows = _selected_rows(manifest_source, selection["frame_ids"])
+    viewmats, centers, contributors, contributor_counts = _blend_candidates(
+        rows,
+        synchronized,
+        boundary_power=assembly["config_object"].blend_boundary_power,
+    )
+    frame_ids = np.asarray(
+        [int(row["frame_id"]) for row in rows], dtype=np.int64
+    )
+    timestamps = np.asarray(
+        [int(row["timestamp_ns"]) for row in rows], dtype=np.int64
+    )
+    names = [str(row["left_image"]["name"]) for row in rows]
+    priors = _assembly_evaluation_priors(candidates)
+    holdout_names = list(assembly["global_holdout"]["holdout_names"])
+    excluded_set = set(assembly["global_holdout"]["excluded_names"])
+    missing_eligible_priors = sorted(set(names) - set(priors) - excluded_set)
+    if missing_eligible_priors:
+        raise ArtifactError(
+            "assembled eligible frames lack source position priors: "
+            f"{missing_eligible_priors[:8]}"
+        )
+    holdout_quality, holdout_detail = _direct_rtk_evaluation(
+        centers, names, priors, holdout_names, mapper_config
+    )
+    holdout_passed = all(
+        check["passed"]
+        for check in holdout_quality["checks"].values()
+        if check.get("authoritative", True)
+    )
+    frame_index = {
+        int(frame_id): index
+        for index, frame_id in enumerate(reader.frames["frame_id"].astype(int))
+    }
+    prior_centers = np.stack(
+        [
+            np.asarray(priors[name][0], dtype=np.float64)
+            if name in priors
+            else np.full(3, np.nan, dtype=np.float64)
+            for name in names
+        ]
+    )
+    raw_centers = np.stack(
+        [
+            np.asarray(
+                reader.frames["initial_camera_center_m"][
+                    frame_index[int(row["frame_id"])]
+                ],
+                dtype=np.float64,
+            )
+            for row in rows
+        ]
+    )
+    all_covariance = np.stack(
+        [
+            priors[name][1]
+            if name in priors
+            else np.eye(3, dtype=np.float64)
+            for name in names
+        ]
+    )
+    all_sigma = np.sqrt(
+        np.maximum(np.linalg.eigvalsh(all_covariance)[:, -1], 1.0e-8)
+    )
+    all_thresholds = np.maximum(
+        float(mapper_config.alignment_ransac_threshold_m), 3.0 * all_sigma
+    )
+    all_inliers = np.linalg.norm(centers - prior_centers, axis=1) <= all_thresholds
+    holdout_set = set(holdout_names)
+    roles = [
+        "excluded"
+        if name in excluded_set
+        else "holdout"
+        if name in holdout_set
+        else "calibration"
+        for name in names
+    ]
+    trajectory_prior_centers = prior_centers.copy()
+    trajectory_raw_centers = raw_centers.copy()
+    excluded_mask = np.asarray(
+        [name in excluded_set for name in names], dtype=bool
+    )
+    trajectory_prior_centers[excluded_mask] = np.nan
+    trajectory_raw_centers[excluded_mask] = np.nan
+    all_inliers[excluded_mask] = False
+    trajectory = _full_trajectory_quality(
+        centers,
+        trajectory_prior_centers,
+        trajectory_raw_centers,
+        roles,
+        all_inliers,
+        names,
+        frame_ids.astype(int).tolist(),
+        assembly["config_object"].trajectory_policy,
+    )
+    submap_calibration_passed = all(
+        candidate["result"]["quality"]["checks"][
+            "calibration_parameter_max_change"
+        ]["passed"]
+        and candidate["result"]["quality"]["checks"][
+            "stereo_baseline_max_change_m"
+        ]["passed"]
+        for candidate in candidates
+    )
+    inventory_exact = (
+        len(frame_ids) == assembly["selected_frame_count"]
+        and frame_ids.astype(int).tolist() == selection["frame_ids"]
+        and len(contributors) == len(frame_ids)
+        and bool((contributor_counts >= 1).all())
+    )
+    rotations = viewmats[:, :3, :3]
+    pose_integrity = bool(
+        np.isfinite(viewmats).all()
+        and np.isfinite(centers).all()
+        and np.allclose(
+            rotations @ np.swapaxes(rotations, 1, 2), np.eye(3), atol=2.0e-4
+        )
+        and np.allclose(np.linalg.det(rotations), 1.0, atol=2.0e-4)
+    )
+    global_nonleakage = all(
+        set(holdout_names) & set(candidate["left_image_names"])
+        <= set(candidate["holdout_names"])
+        for candidate in candidates
+    )
+    temporal_nonleakage = all(
+        not (
+            excluded_set
+            & (
+                set(candidate["calibration_names"])
+                | set(candidate["holdout_names"])
+            )
+        )
+        for candidate in candidates
+    )
+    production_checks = {
+        "all_submaps_passed": {
+            "value": all(candidate["result"]["passed"] for candidate in candidates),
+            "expected": True,
+            "passed": all(candidate["result"]["passed"] for candidate in candidates),
+        },
+        "all_adjacent_overlaps_passed": {
+            "value": bool(production_overlap["passed"]),
+            "expected": True,
+            "passed": bool(production_overlap["passed"]),
+        },
+        "selected_frame_inventory_exact": {
+            "value": inventory_exact,
+            "expected": True,
+            "passed": inventory_exact,
+        },
+        "global_holdout_physically_absent_from_every_optimizer": {
+            "value": global_nonleakage,
+            "expected": True,
+            "passed": global_nonleakage,
+        },
+        "temporally_rejected_gnss_absent_from_every_optimizer": {
+            "value": temporal_nonleakage,
+            "expected": True,
+            "passed": temporal_nonleakage,
+        },
+        "submap_fixed_calibration_and_baseline": {
+            "value": submap_calibration_passed,
+            "expected": True,
+            "passed": submap_calibration_passed,
+        },
+        "assembled_pose_integrity": {
+            "value": pose_integrity,
+            "expected": True,
+            "passed": pose_integrity,
+        },
+        "global_heldout_rtk_absolute_gates": {
+            "value": holdout_passed,
+            "expected": True,
+            "passed": holdout_passed,
+        },
+        **trajectory["checks"],
+    }
+    submap_assessments = [
+        _diagnostic_submap_assessment(
+            candidate,
+            GeodeticDiagnosticPolicy(**dict(inventory["policy"])),
+        )
+        for candidate in candidates
+    ]
+    trajectory_structural_passed = all(
+        check.get("passed") is True
+        for check in trajectory["checks"].values()
+        if check.get("authoritative", True)
+    )
+    structural_checks = {
+        "all_submaps_structurally_safe": {
+            "value": all(
+                item["structurally_safe_for_diagnostic"]
+                for item in submap_assessments
+            ),
+            "expected": True,
+            "passed": all(
+                item["structurally_safe_for_diagnostic"]
+                for item in submap_assessments
+            ),
+        },
+        "all_adjacent_overlaps_structurally_safe": {
+            "value": diagnostic_overlap["structurally_safe_for_diagnostic"],
+            "expected": True,
+            "passed": diagnostic_overlap["structurally_safe_for_diagnostic"],
+        },
+        "selected_frame_inventory_exact": production_checks[
+            "selected_frame_inventory_exact"
+        ],
+        "global_holdout_physically_absent_from_every_optimizer": (
+            production_checks[
+                "global_holdout_physically_absent_from_every_optimizer"
+            ]
+        ),
+        "temporally_rejected_gnss_absent_from_every_optimizer": (
+            production_checks[
+                "temporally_rejected_gnss_absent_from_every_optimizer"
+            ]
+        ),
+        "submap_fixed_calibration_and_baseline": production_checks[
+            "submap_fixed_calibration_and_baseline"
+        ],
+        "assembled_pose_integrity": production_checks[
+            "assembled_pose_integrity"
+        ],
+        "full_trajectory_structurally_safe": {
+            "value": trajectory_structural_passed,
+            "expected": True,
+            "passed": trajectory_structural_passed,
+        },
+    }
+    production_passed = _authoritative_checks_pass(production_checks)
+    structurally_safe = _authoritative_checks_pass(structural_checks)
+    median = holdout_quality.get("residual_m", {}).get("median")
+    if (
+        isinstance(median, bool)
+        or not isinstance(median, (int, float))
+        or not math.isfinite(float(median))
+    ):
+        raise ArtifactError("global holdout has no finite median")
+    policy = GeodeticDiagnosticPolicy(**dict(inventory["policy"]))
+    return {
+        "assembly": assembly,
+        "candidates": candidates,
+        "frontend": frontend,
+        "source": source,
+        "segment": segment,
+        "source_evidence": source_evidence,
+        "source_quality": source_quality,
+        "viewmats": viewmats,
+        "centers": centers,
+        "frame_ids": frame_ids,
+        "timestamps_ns": timestamps,
+        "names": names,
+        "roles": roles,
+        "raw_centers": raw_centers,
+        "contributors": contributors,
+        "contributor_counts": contributor_counts,
+        "holdout_names": holdout_names,
+        "holdout_quality": holdout_quality,
+        "holdout_detail": holdout_detail,
+        "trajectory": trajectory,
+        "synchronization": synchronization,
+        "production_overlap": production_overlap,
+        "diagnostic_overlap": diagnostic_overlap,
+        "production_checks": production_checks,
+        "structural_checks": structural_checks,
+        "submap_assessments": submap_assessments,
+        "production_passed": production_passed,
+        "structurally_safe": structurally_safe,
+        "production_failed_checks": _failed_authoritative_checks(
+            production_checks
+        ),
+        "global_holdout_median_rtk_residual_m": float(median),
+        "median_rtk_warning_m": float(policy.median_rtk_warning_m),
+        "median_rtk_warning_exceeded": (
+            float(median) > float(policy.median_rtk_warning_m)
+        ),
+    }
+
+
 def _status_record() -> dict[str, Any]:
     return {
         "artifact_class": "production",
@@ -2326,6 +3238,129 @@ def _status_record() -> dict[str, Any]:
         "metric_georeferencing_claim_eligible": True,
         "diagnostic_export_requested": False,
         "diagnostic_export_override_used": False,
+    }
+
+
+def _diagnostic_status_record(production_passed: bool) -> dict[str, Any]:
+    return {
+        "artifact_class": "diagnostic_render_only",
+        "georeferencing_status": "PASSED" if production_passed else "FAILED",
+        "metric_georeferencing_claim_eligible": False,
+        "diagnostic_export_requested": True,
+        "diagnostic_export_override_used": not production_passed,
+    }
+
+
+def _diagnostic_pose_quality_record(
+    evidence: Mapping[str, Any],
+    inventory: Mapping[str, Any],
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    counts = np.asarray(evidence["contributor_counts"], dtype=np.int64)
+    return {
+        "schema_version": 3,
+        **status,
+        "stage": "geodetic_submap_diagnostic_assembly_quality",
+        "passed": bool(evidence["production_passed"]),
+        "rtk_alignment_passed": bool(evidence["production_passed"]),
+        "diagnostic_structurally_safe": bool(evidence["structurally_safe"]),
+        "production_publication_eligible": False,
+        "n_frames": len(evidence["frame_ids"]),
+        "n_submaps": len(evidence["candidates"]),
+        "n_global_holdout": len(evidence["holdout_names"]),
+        "source_visual_quality_passed": bool(
+            evidence["source_quality"].get("passed")
+        ),
+        "diagnostic_policy": dict(inventory["policy"]),
+        "production_failed_checks": evidence["production_failed_checks"],
+        "global_holdout_median_rtk_residual_m": evidence[
+            "global_holdout_median_rtk_residual_m"
+        ],
+        "median_rtk_warning_m": evidence["median_rtk_warning_m"],
+        "median_rtk_warning_exceeded": evidence[
+            "median_rtk_warning_exceeded"
+        ],
+        "checks": evidence["production_checks"],
+        "structural_checks": evidence["structural_checks"],
+        "submap_assessments": evidence["submap_assessments"],
+        "global_holdout_quality": evidence["holdout_quality"],
+        "global_holdout_detail": evidence["holdout_detail"],
+        "full_trajectory": evidence["trajectory"],
+        "overlap": evidence["diagnostic_overlap"],
+        "contributor_count": {
+            "minimum": int(counts.min()),
+            "median": float(np.median(counts)),
+            "maximum": int(counts.max()),
+        },
+    }
+
+
+def _diagnostic_pose_alignment_record(
+    evidence: Mapping[str, Any],
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    assembly = evidence["assembly"]
+    return {
+        "schema_version": 4,
+        **status,
+        "method": (
+            "diagnostic_overlap_synchronized_then_calibration_only_"
+            "fixed_se3_submaps_boundary_weighted_v1"
+        ),
+        "source_frame": "independent_colmap_submap_worlds",
+        "target_frame": "local_enu_cartesian_pose_priors",
+        "production_scale": 1.0,
+        "sim3_scale_applied": False,
+        "blend_boundary_power": assembly["config_object"].blend_boundary_power,
+        "global_holdout_used_for_alignment_or_blending": False,
+        "synchronization": evidence["synchronization"],
+    }
+
+
+def _diagnostic_pose_provenance_record(
+    evidence: Mapping[str, Any],
+    inventory: Mapping[str, Any],
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    assembly = evidence["assembly"]
+    inventory_root = Path(inventory["artifact"])
+    return {
+        "schema_version": 1,
+        **status,
+        "method": "sealed_geodetic_submap_diagnostic_assembly_v1",
+        "assembly_plan": assembly["artifact"],
+        "assembly_plan_seal_sha256": assembly["plan_seal_sha256"],
+        "diagnostic_result_inventory": inventory["artifact"],
+        "diagnostic_result_inventory_manifest_sha256": sha256_file(
+            inventory_root / "manifest.json"
+        ),
+        "diagnostic_result_inventory_sha256": sha256_file(
+            inventory_root / "diagnostic_result_inventory.json"
+        ),
+        "frontend_artifact": str(evidence["frontend"]),
+        "completed_backend": str(evidence["source"]),
+        "segment": str(evidence["segment"]),
+        "source_evidence": evidence["source_evidence"],
+        "submap_results": [
+            {
+                "window_id": candidate["window"]["window_id"],
+                "artifact": candidate["result"]["artifact"],
+                "result_seal_sha256": candidate["result"][
+                    "result_seal_sha256"
+                ],
+                "plan_seal_sha256": candidate["result"]["plan_seal_sha256"],
+            }
+            for candidate in evidence["candidates"]
+        ],
+        "pose_convention": {
+            "viewmats": "world_to_left_camera",
+            "viewmat_camera_axes": "OpenCV_x_right_y_down_z_forward",
+            "cam_centers": "left_camera_center_in_local_enu_m",
+            "world_alignment": (
+                "fixed_scale_SE3_overlap_synchronization_then_one_"
+                "calibration_only_fixed_scale_SE3"
+            ),
+        },
     }
 
 
@@ -2696,6 +3731,207 @@ def publish_geodetic_full_pose_artifact(
     return output
 
 
+def publish_geodetic_diagnostic_full_pose_artifact(
+    diagnostic_inventory: str | Path,
+    output_root: str | Path,
+    name: str,
+) -> Path:
+    """Publish a structurally safe pose that remains diagnostic-only."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise ValueError(f"invalid pose artifact name: {name!r}")
+    inventory = audited_geodetic_diagnostic_result_inventory(
+        diagnostic_inventory, _include_candidates=True
+    )
+    evidence = _diagnostic_full_pose_evidence(inventory)
+    if not evidence["structurally_safe"]:
+        failed = [
+            key
+            for key, check in evidence["structural_checks"].items()
+            if check.get("passed") is not True
+        ]
+        raise ArtifactError(
+            "diagnostic full pose has structural failures: " + ", ".join(failed)
+        )
+    status = _diagnostic_status_record(evidence["production_passed"])
+    output = Path(output_root).expanduser().resolve() / name
+    immutable = [
+        Path(inventory["artifact"]),
+        Path(evidence["frontend"]),
+        Path(evidence["source"]),
+        Path(evidence["segment"]),
+    ] + [
+        Path(candidate["result"]["artifact"])
+        for candidate in evidence["candidates"]
+    ]
+    if any(output == item or item in output.parents for item in immutable):
+        raise ArtifactError("diagnostic pose must be outside immutable inputs")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite pose artifact: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = output.parent / f".{name}.writing-{uuid.uuid4().hex}"
+    staging.mkdir()
+    try:
+        _atomic_save_npy(staging / "viewmats.npy", evidence["viewmats"])
+        _atomic_save_npy(staging / "cam_centers.npy", evidence["centers"])
+        _atomic_save_npy(staging / "frame_ids.npy", evidence["frame_ids"])
+        _atomic_save_npy(staging / "timestamps_ns.npy", evidence["timestamps_ns"])
+        _atomic_save_npy(
+            staging / "left_image_names.npy", np.asarray(evidence["names"])
+        )
+        trajectories = {
+            "raw GNSS": evidence["raw_centers"],
+            "diagnostic assembled geodetic": evidence["centers"],
+        }
+        _atomic_write(
+            staging / "trajectory.csv",
+            _trajectory_csv(
+                evidence["frame_ids"],
+                evidence["timestamps_ns"],
+                evidence["names"],
+                evidence["roles"],
+                trajectories,
+            ),
+        )
+        _atomic_write(
+            staging / "trajectory.svg",
+            _trajectory_svg(
+                trajectories,
+                title="Diagnostic-only full-field geodetic trajectory",
+            ),
+        )
+        _atomic_json(staging / "overlap.json", evidence["diagnostic_overlap"])
+        quality = _diagnostic_pose_quality_record(evidence, inventory, status)
+        alignment = _diagnostic_pose_alignment_record(evidence, status)
+        provenance = _diagnostic_pose_provenance_record(
+            evidence, inventory, status
+        )
+        _atomic_json(staging / "quality.json", quality)
+        _atomic_json(staging / "alignment.json", alignment)
+        _atomic_json(staging / "provenance.json", provenance)
+        report_path = output / "quality.json"
+        report_sha256 = sha256_file(staging / "quality.json")
+        warning = (
+            "Diagnostic render only: one or more production geodetic gates "
+            "failed. The structurally safe result is not eligible for metric "
+            "georeferencing claims."
+            if not evidence["production_passed"]
+            else "Diagnostic render only: export was explicitly requested in "
+            "diagnostic mode and is not eligible for production claims."
+        )
+        georeferencing = {
+            "schema_version": 1,
+            **status,
+            "fixed_scale_se3_applied": True,
+            "rtk_alignment_passed": bool(evidence["production_passed"]),
+            "global_holdout_physically_absent": True,
+            "diagnostic_structurally_safe": True,
+            "diagnostic_report": str(report_path),
+            "diagnostic_report_sha256": report_sha256,
+            "checks": evidence["production_checks"],
+            "structural_checks": evidence["structural_checks"],
+            "warning": warning,
+        }
+        _atomic_json(staging / "georeferencing.json", georeferencing)
+        if not evidence["production_passed"]:
+            _atomic_json(
+                staging / "GEOREFERENCING_FAILED.json",
+                {
+                    "schema_version": 1,
+                    **status,
+                    "warning": warning,
+                    "diagnostic_report": str(report_path),
+                    "diagnostic_report_sha256": report_sha256,
+                },
+            )
+        file_evidence = {
+            path.name: {
+                "sha256": sha256_file(path),
+                "size_bytes": path.stat().st_size,
+            }
+            for path in sorted(staging.iterdir())
+            if path.is_file()
+        }
+        _atomic_json(
+            staging / "manifest.json",
+            {
+                "schema_version": 2,
+                "name": name,
+                "n_frames": len(evidence["frame_ids"]),
+                **status,
+                "files": file_evidence,
+            },
+        )
+        publish_directory_noreplace(staging, output)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    audited_geodetic_diagnostic_full_pose_artifact(output)
+    return output
+
+
+def audited_geodetic_diagnostic_full_pose_artifact(
+    artifact: str | Path,
+) -> dict[str, Any]:
+    root = Path(artifact).expanduser().resolve()
+    manifest = _verify_pose_artifact(root)
+    georeferencing = verify_pose_georeferencing_artifact(
+        root, expected_name=root.name
+    )
+    if georeferencing.get("artifact_class") != "diagnostic_render_only":
+        raise ArtifactError("geodetic diagnostic pose was promoted")
+    provenance = _json(root / "provenance.json")
+    if provenance.get("method") != "sealed_geodetic_submap_diagnostic_assembly_v1":
+        raise ArtifactError("unsupported diagnostic pose assembly method")
+    inventory_root = Path(
+        str(provenance.get("diagnostic_result_inventory", ""))
+    ).resolve()
+    if (
+        provenance.get("diagnostic_result_inventory_manifest_sha256")
+        != sha256_file(inventory_root / "manifest.json")
+        or provenance.get("diagnostic_result_inventory_sha256")
+        != sha256_file(inventory_root / "diagnostic_result_inventory.json")
+    ):
+        raise ArtifactError("diagnostic pose inventory binding changed")
+    inventory = audited_geodetic_diagnostic_result_inventory(
+        inventory_root, _include_candidates=True
+    )
+    evidence = _diagnostic_full_pose_evidence(inventory)
+    if not evidence["structurally_safe"]:
+        raise ArtifactError("diagnostic pose is no longer structurally safe")
+    status = _diagnostic_status_record(evidence["production_passed"])
+    expected_quality = _diagnostic_pose_quality_record(
+        evidence, inventory, status
+    )
+    expected_alignment = _diagnostic_pose_alignment_record(evidence, status)
+    expected_provenance = _diagnostic_pose_provenance_record(
+        evidence, inventory, status
+    )
+    viewmats = np.load(root / "viewmats.npy", allow_pickle=False)
+    centers = np.load(root / "cam_centers.npy", allow_pickle=False)
+    frame_ids = np.load(root / "frame_ids.npy", allow_pickle=False)
+    timestamps = np.load(root / "timestamps_ns.npy", allow_pickle=False)
+    names = np.load(root / "left_image_names.npy", allow_pickle=False).tolist()
+    if (
+        not np.allclose(viewmats, evidence["viewmats"], atol=1.0e-12)
+        or not np.allclose(centers, evidence["centers"], atol=1.0e-12)
+        or not np.array_equal(frame_ids, evidence["frame_ids"])
+        or not np.array_equal(timestamps, evidence["timestamps_ns"])
+        or names != evidence["names"]
+        or _json(root / "quality.json") != expected_quality
+        or _json(root / "alignment.json") != expected_alignment
+        or provenance != expected_provenance
+        or _json(root / "overlap.json") != evidence["diagnostic_overlap"]
+        or manifest.get("n_frames") != len(evidence["frame_ids"])
+    ):
+        raise ArtifactError("diagnostic full pose no longer matches sealed inputs")
+    return {
+        "artifact": str(root),
+        "manifest": manifest,
+        "georeferencing": georeferencing,
+        "quality": expected_quality,
+    }
+
+
 def audited_geodetic_full_pose_artifact(
     artifact: str | Path,
 ) -> dict[str, Any]:
@@ -2830,14 +4066,22 @@ def audited_geodetic_full_pose_artifact(
 
 __all__ = [
     "GeodeticAssemblyConfig",
+    "GeodeticDiagnosticPolicy",
     "GeodeticOverlapPolicy",
     "audited_geodetic_assembly_plan",
+    "audited_geodetic_diagnostic_full_pose_artifact",
+    "audited_geodetic_diagnostic_overlap_report",
+    "audited_geodetic_diagnostic_result_inventory",
+    "audited_geodetic_diagnostic_submap_result",
     "audited_geodetic_full_pose_artifact",
     "audited_geodetic_overlap_report",
     "audited_geodetic_submap_pose_export",
     "export_geodetic_submap_poses",
     "prepare_geodetic_assembly_plan",
     "prepare_geodetic_assembly_window",
+    "publish_geodetic_diagnostic_full_pose_artifact",
+    "publish_geodetic_diagnostic_overlap_report",
+    "publish_geodetic_diagnostic_result_inventory",
     "publish_geodetic_full_pose_artifact",
     "publish_geodetic_overlap_report",
 ]
