@@ -1243,6 +1243,97 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
                     plan, root / "execution", colmap
                 )
 
+    def test_predeclared_window_roles_are_sealed_physical_and_recomputed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment, frontend, backend, selection, default_plan, colmap, _ = (
+                _fixture(root)
+            )
+            role_plan = prepare_geodetic_submap_plan(
+                frontend,
+                backend,
+                segment,
+                selection,
+                root / "role-plan",
+                config=_plan_context(default_plan)[2],
+                _initial_pair_method="v4",
+                _predeclared_prior_role_windows=(
+                    (0, 1, 2, 3, 4),
+                    (2, 3, 4, 6, 7),
+                ),
+            )
+            _plan_context(role_plan, require_hardened=True)
+            split_path = role_plan / "prior_split.json"
+            split = json.loads(split_path.read_text())
+            contract = split["predeclared_prior_role_contract"]
+            self.assertEqual(
+                contract["method"],
+                "calibration_in_any_window_holdout_in_every_window_v1",
+            )
+            self.assertEqual(split["n_calibration"], 4)
+            self.assertEqual(split["n_holdout"], 3)
+            by_frame = {item["frame_id"]: item for item in split["records"]}
+            self.assertEqual(by_frame[2]["role"], "calibration")
+            self.assertEqual(
+                [
+                    item["role"]
+                    for item in by_frame[2][
+                        "predeclared_local_role_evidence"
+                    ]
+                ],
+                ["calibration", "calibration"],
+            )
+            self.assertEqual(by_frame[3]["role"], "holdout")
+            self.assertEqual(
+                [
+                    item["role"]
+                    for item in by_frame[3][
+                        "predeclared_local_role_evidence"
+                    ]
+                ],
+                ["holdout", "holdout"],
+            )
+            with sqlite3.connect(
+                f"file:{role_plan / 'database.db'}?mode=ro&immutable=1",
+                uri=True,
+            ) as connection:
+                optimizer_names = {
+                    str(name)
+                    for (name,) in connection.execute(
+                        "SELECT i.name FROM pose_priors p "
+                        "JOIN images i ON i.image_id=p.corr_data_id"
+                    )
+                }
+            self.assertEqual(optimizer_names, set(split["calibration_names"]))
+            self.assertFalse(optimizer_names & set(split["holdout_names"]))
+
+            contract["role_membership_sha256"] = "0" * 64
+            _write_json(split_path, split)
+            plan_path = role_plan / "geodetic_submap_plan.json"
+            plan_record = json.loads(plan_path.read_text())
+            plan_record["prior_split_sha256"] = sha256_file(split_path)
+            _write_json(plan_path, plan_record)
+            seal_path = role_plan / "plan_seal.json"
+            seal = json.loads(seal_path.read_text())
+            for path in (split_path, plan_path):
+                seal["files"][path.name] = {
+                    "sha256": sha256_file(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            seal["seal_sha256"] = canonical_hash(
+                {
+                    "schema_version": seal["schema_version"],
+                    "files": seal["files"],
+                }
+            )
+            _write_json(seal_path, seal)
+            with self.assertRaisesRegex(
+                ArtifactError, "evaluation prior derivation changed"
+            ):
+                build_geodetic_submap_command(
+                    role_plan, root / "role-execution", colmap
+                )
+
     def test_temporal_rejection_is_physically_absent_and_resealed_tamper_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

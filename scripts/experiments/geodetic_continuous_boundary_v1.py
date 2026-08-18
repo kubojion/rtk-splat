@@ -97,6 +97,11 @@ def _expected_binding(
     selection: Path,
     plan: Path,
 ) -> dict[str, Any]:
+    role_contract = _json(plan / "prior_split.json").get(
+        "predeclared_prior_role_contract"
+    )
+    if not isinstance(role_contract, Mapping):
+        raise ArtifactError("continuous plan lacks a sealed prior-role contract")
     body = {
         "schema_version": 1,
         "kind": _BINDING_KIND,
@@ -110,6 +115,8 @@ def _expected_binding(
         "frame_ids_sha256": canonical_hash(list(frame_ids)),
         "selection_sha256": sha256_file(selection),
         "submap_plan_seal_sha256": sha256_file(plan / "plan_seal.json"),
+        "prior_role_method": role_contract.get("method"),
+        "prior_role_contract_sha256": role_contract.get("contract_sha256"),
         "continuous_single_model": True,
     }
     return {**body, "binding_sha256": canonical_hash(body)}
@@ -164,6 +171,8 @@ def _audited_workspace(
         plan_root != plan
         or plan_record.get("selected_frame_ids") != frame_ids
         or plan_record.get("n_frames") != len(frame_ids)
+        or plan_record.get("predeclared_prior_role_windows")
+        != [list(window["frame_ids"]) for window in selected]
     ):
         raise ArtifactError("continuous submap inventory changed")
     return root, assembly
@@ -208,6 +217,9 @@ def _prepare(args: argparse.Namespace) -> dict[str, Any]:
         _verified_input_context=assembly["_runtime_context"],
         _defer_full_reaudit_until_execution=True,
         _initial_pair_method="v5",
+        _predeclared_prior_role_windows=[
+            list(window["frame_ids"]) for window in selected
+        ],
     )
     binding = _expected_binding(
         assembly, selected, frame_ids, selection, plan

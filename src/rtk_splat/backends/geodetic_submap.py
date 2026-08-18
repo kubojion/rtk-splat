@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import uuid
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -2400,6 +2401,7 @@ def _weight_and_split_priors(
     gnss_temporal_audit: Mapping[str, Any],
     config: GeodeticSubmapConfig,
     temporal_blocks: int,
+    predeclared_role_windows: Sequence[Sequence[int]] | None = None,
 ) -> dict[str, Any]:
     weights = dict(config.position_quality_weights)
     frames = reader.frames
@@ -2598,19 +2600,23 @@ def _weight_and_split_priors(
                 raise ArtifactError(
                     "geodetic submap needs at least four trusted position priors"
                 )
-            split = temporal_block_split(
-                np.asarray(
-                    [item["timestamp_ns"] for item in eligible], dtype=np.int64
-                ),
-                temporal_blocks=temporal_blocks,
+            role_assignment = _prior_role_assignment(
+                eligible,
+                temporal_blocks,
+                predeclared_role_windows,
             )
             calibration_names: list[str] = []
             holdout_names: list[str] = []
-            for index, item in enumerate(eligible):
-                calibration = bool(split.calibration_mask[index])
-                role = "calibration" if calibration else "holdout"
+            for item in eligible:
+                name = str(item["name"])
+                role = role_assignment["role_by_name"][name]
+                calibration = role == "calibration"
                 item["role"] = role
-                item["block_id"] = int(split.block_ids[index])
+                item["block_id"] = role_assignment["block_id_by_name"][name]
+                if predeclared_role_windows is not None:
+                    item["predeclared_local_role_evidence"] = (
+                        role_assignment["local_role_evidence_by_name"][name]
+                    )
                 records.append(
                     {key: value for key, value in item.items() if not key.endswith("blob")}
                 )
@@ -2646,13 +2652,16 @@ def _weight_and_split_priors(
     ):
         raise ArtifactError("held-out position priors remain in the optimizer DB")
     return {
-        "schema_version": 3,
+        "schema_version": 4 if predeclared_role_windows is not None else 3,
         "method": (
-            "raw_temporal_filter_then_alternating_blocks_status_"
+            "raw_temporal_filter_then_predeclared_window_role_union_status_"
+            "fixed_calibration_covariance_weighted_v4"
+            if predeclared_role_windows is not None
+            else "raw_temporal_filter_then_alternating_blocks_status_"
             "fixed_calibration_covariance_weighted_v3"
         ),
-        "calibration_block_ids": list(split.calibration_block_ids),
-        "holdout_block_ids": list(split.holdout_block_ids),
+        "calibration_block_ids": role_assignment["calibration_block_ids"],
+        "holdout_block_ids": role_assignment["holdout_block_ids"],
         "calibration_names": calibration_names,
         "holdout_names": holdout_names,
         "n_calibration": len(calibration_names),
@@ -2667,6 +2676,15 @@ def _weight_and_split_priors(
             list(item) for item in config.position_quality_weights
         ],
         "fixed_calibration_prior_derivation": fixed_prior_derivation,
+        **(
+            {
+                "predeclared_prior_role_contract": role_assignment[
+                    "contract"
+                ]
+            }
+            if predeclared_role_windows is not None
+            else {}
+        ),
         "optimizer_uses": [
             "raw_gnss_derived_camera_position",
             "sealed_camera_center_covariance",
@@ -2679,6 +2697,184 @@ def _weight_and_split_priors(
             "lever_arm_estimation",
         ],
         "records": sorted(records, key=lambda item: item["timestamp_ns"]),
+    }
+
+
+def _normalized_prior_role_windows(
+    selected_frame_ids: Sequence[int],
+    value: Sequence[Sequence[int]] | None,
+) -> list[list[int]] | None:
+    if value is None:
+        return None
+    selected = [int(frame_id) for frame_id in selected_frame_ids]
+    selected_set = set(selected)
+    windows: list[list[int]] = []
+    for raw_window in value:
+        window = [int(frame_id) for frame_id in raw_window]
+        if (
+            len(window) < 4
+            or window != sorted(set(window))
+            or not set(window) <= selected_set
+        ):
+            raise ArtifactError("invalid predeclared prior-role window")
+        windows.append(window)
+    if (
+        not windows
+        or len(windows) != len({tuple(window) for window in windows})
+        or windows != sorted(windows, key=lambda item: (item[0], item[-1]))
+        or any(
+            not set(left) & set(right)
+            for left, right in zip(windows, windows[1:])
+        )
+        or set().union(*(set(window) for window in windows)) != selected_set
+    ):
+        raise ArtifactError("predeclared prior-role windows do not cover selection")
+    return windows
+
+
+def _prior_role_assignment(
+    eligible: Sequence[Mapping[str, Any]],
+    temporal_blocks: int,
+    predeclared_role_windows: Sequence[Sequence[int]] | None,
+) -> dict[str, Any]:
+    """Derive roles without consulting visual poses or evaluation residuals."""
+
+    ordered = list(eligible)
+    union_split = temporal_block_split(
+        np.asarray(
+            [int(item["timestamp_ns"]) for item in ordered], dtype=np.int64
+        ),
+        temporal_blocks=temporal_blocks,
+    )
+    block_id_by_name = {
+        str(item["name"]): int(union_split.block_ids[index])
+        for index, item in enumerate(ordered)
+    }
+    if predeclared_role_windows is None:
+        role_by_name = {
+            str(item["name"]): (
+                "calibration"
+                if bool(union_split.calibration_mask[index])
+                else "holdout"
+            )
+            for index, item in enumerate(ordered)
+        }
+        return {
+            "role_by_name": role_by_name,
+            "block_id_by_name": block_id_by_name,
+            "local_role_evidence_by_name": {},
+            "calibration_block_ids": list(union_split.calibration_block_ids),
+            "holdout_block_ids": list(union_split.holdout_block_ids),
+            "contract": None,
+        }
+
+    by_frame = {int(item["frame_id"]): item for item in ordered}
+    evidence_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    membership: dict[str, list[str]] = defaultdict(list)
+    window_evidence: list[dict[str, Any]] = []
+    for ordinal, frame_ids in enumerate(predeclared_role_windows):
+        local = [
+            by_frame[int(frame_id)]
+            for frame_id in frame_ids
+            if int(frame_id) in by_frame
+        ]
+        if len(local) < 4:
+            raise ArtifactError(
+                "predeclared prior-role window has fewer than four trusted priors"
+            )
+        local_split = temporal_block_split(
+            np.asarray(
+                [int(item["timestamp_ns"]) for item in local], dtype=np.int64
+            ),
+            temporal_blocks=temporal_blocks,
+        )
+        local_names: list[str] = []
+        for index, item in enumerate(local):
+            name = str(item["name"])
+            role = (
+                "calibration"
+                if bool(local_split.calibration_mask[index])
+                else "holdout"
+            )
+            membership[name].append(role)
+            evidence_by_name[name].append(
+                {
+                    "window_ordinal": ordinal,
+                    "role": role,
+                    "block_id": int(local_split.block_ids[index]),
+                }
+            )
+            local_names.append(name)
+        window_evidence.append(
+            {
+                "window_ordinal": ordinal,
+                "frame_ids_sha256": canonical_hash(
+                    [int(frame_id) for frame_id in frame_ids]
+                ),
+                "eligible_names_sha256": canonical_hash(local_names),
+                "eligible_count": len(local_names),
+            }
+        )
+    names = [str(item["name"]) for item in ordered]
+    if set(membership) != set(names):
+        raise ArtifactError("predeclared prior-role membership is incomplete")
+    role_by_name = {
+        name: "calibration" if "calibration" in membership[name] else "holdout"
+        for name in names
+    }
+    calibration_blocks = sorted(
+        {
+            block_id_by_name[name]
+            for name, role in role_by_name.items()
+            if role == "calibration"
+        }
+    )
+    holdout_blocks = sorted(
+        {
+            block_id_by_name[name]
+            for name, role in role_by_name.items()
+            if role == "holdout"
+        }
+    )
+    contract_body = {
+        "schema_version": 1,
+        "method": "calibration_in_any_window_holdout_in_every_window_v1",
+        "decision_inputs": [
+            "sealed_selected_frame_ids",
+            "predeclared_window_frame_membership",
+            "immutable_raw_gnss_status_covariance_and_timestamps",
+        ],
+        "decision_inputs_exclude": [
+            "visual_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+        "physical_nonleakage_rule": (
+            "an observation is held out only when it is held out in every "
+            "predeclared optimizer window containing it"
+        ),
+        "window_count": len(predeclared_role_windows),
+        "windows": window_evidence,
+        "role_membership_sha256": canonical_hash(
+            {name: membership[name] for name in names}
+        ),
+        "calibration_names_sha256": canonical_hash(
+            [name for name in names if role_by_name[name] == "calibration"]
+        ),
+        "holdout_names_sha256": canonical_hash(
+            [name for name in names if role_by_name[name] == "holdout"]
+        ),
+    }
+    return {
+        "role_by_name": role_by_name,
+        "block_id_by_name": block_id_by_name,
+        "local_role_evidence_by_name": evidence_by_name,
+        "calibration_block_ids": calibration_blocks,
+        "holdout_block_ids": holdout_blocks,
+        "contract": {
+            **contract_body,
+            "contract_sha256": canonical_hash(contract_body),
+        },
     }
 
 
@@ -2709,6 +2905,7 @@ def _recomputed_evaluation_prior_records(
     gnss_records: Mapping[int, Mapping[str, Any]],
     config: GeodeticSubmapConfig,
     temporal_blocks: int,
+    predeclared_role_windows: Sequence[Sequence[int]] | None = None,
 ) -> dict[str, Any]:
     """Recompute sealed evaluation targets from immutable physical inputs."""
 
@@ -2795,25 +2992,30 @@ def _recomputed_evaluation_prior_records(
         raise ArtifactError(
             "fewer than four recomputed sealed evaluation priors"
         )
-    split = temporal_block_split(
-        np.asarray(
-            [item["timestamp_ns"] for item in eligible], dtype=np.int64
-        ),
-        temporal_blocks=temporal_blocks,
+    role_assignment = _prior_role_assignment(
+        eligible,
+        temporal_blocks,
+        predeclared_role_windows,
     )
     calibration_names: list[str] = []
     holdout_names: list[str] = []
-    for index, item in enumerate(eligible):
-        role = "calibration" if split.calibration_mask[index] else "holdout"
+    for item in eligible:
+        name = str(item["name"])
+        role = role_assignment["role_by_name"][name]
         item["role"] = role
-        item["block_id"] = int(split.block_ids[index])
+        item["block_id"] = role_assignment["block_id_by_name"][name]
+        if predeclared_role_windows is not None:
+            item["predeclared_local_role_evidence"] = role_assignment[
+                "local_role_evidence_by_name"
+            ][name]
         (calibration_names if role == "calibration" else holdout_names).append(
-            str(item["name"])
+            name
         )
     return {
         "calibration_names": calibration_names,
         "holdout_names": holdout_names,
         "fixed_calibration_prior_derivation": fixed_derivation,
+        "predeclared_prior_role_contract": role_assignment["contract"],
         "records": eligible,
     }
 
@@ -2829,6 +3031,8 @@ def _verify_recomputed_evaluation_prior_records(
         != recomputed.get("holdout_names")
         or prior_split.get("fixed_calibration_prior_derivation")
         != recomputed.get("fixed_calibration_prior_derivation")
+        or prior_split.get("predeclared_prior_role_contract")
+        != recomputed.get("predeclared_prior_role_contract")
     ):
         raise ArtifactError("sealed evaluation prior derivation changed")
     recorded_by_name = {
@@ -2862,7 +3066,7 @@ def _sealed_evaluation_priors(
             allowed_names,
         )
     split = _json(plan_root / "prior_split.json")
-    if split.get("schema_version") != 3:
+    if split.get("schema_version") not in {3, 4}:
         raise ArtifactError("sealed evaluation prior split schema changed")
     expected_contract = _evaluation_prior_contract(split)
     if plan.get("evaluation_prior_contract") != expected_contract:
@@ -3342,6 +3546,7 @@ def prepare_geodetic_submap_plan(
     _verified_input_context: tuple[Any, ...] | None = None,
     _defer_full_reaudit_until_execution: bool = False,
     _initial_pair_method: str = "v1",
+    _predeclared_prior_role_windows: Sequence[Sequence[int]] | None = None,
 ) -> Path:
     """Atomically publish one immutable private-database execution plan."""
     input_context = (
@@ -3374,6 +3579,9 @@ def prepare_geodetic_submap_plan(
         raise ArtifactError("unsupported initial-pair method")
     selection_path, selection = _load_frame_selection(
         frame_selection, frontend, segment_path, manifest
+    )
+    predeclared_role_windows = _normalized_prior_role_windows(
+        selection["frame_ids"], _predeclared_prior_role_windows
     )
     output = Path(destination).expanduser().resolve()
     if output.exists():
@@ -3432,6 +3640,7 @@ def prepare_geodetic_submap_plan(
             gnss_temporal_audit,
             config,
             mapper_config.alignment_temporal_blocks,
+            predeclared_role_windows,
         )
         initial_pair = _select_initial_pair_for_method(
             _initial_pair_method,
@@ -3513,6 +3722,12 @@ def prepare_geodetic_submap_plan(
             "selected_frame_ids": list(selection["frame_ids"]),
             "selected_image_names": selected_names,
             "selected_left_image_names": selected_left_names,
+            "predeclared_prior_role_windows": predeclared_role_windows,
+            "predeclared_prior_role_windows_sha256": (
+                canonical_hash(predeclared_role_windows)
+                if predeclared_role_windows is not None
+                else None
+            ),
             "n_frames": len(rows),
             "n_images": len(selected_names),
             "image_path": str(frontend / "images"),
@@ -3653,6 +3868,9 @@ def _plan_context(
     selection_path, selection = _load_frame_selection(
         plan.get("frame_selection", ""), frontend, segment, manifest
     )
+    predeclared_role_windows = _normalized_prior_role_windows(
+        selection["frame_ids"], plan.get("predeclared_prior_role_windows")
+    )
     rows = _selected_rows(manifest, selection["frame_ids"])
     metadata = _image_metadata(rows, manifest["frames"])
     expected_names = list(metadata)
@@ -3668,6 +3886,12 @@ def _plan_context(
         or plan.get("selected_frame_ids") != selection["frame_ids"]
         or plan.get("selected_image_names") != expected_names
         or plan.get("selected_left_image_names") != expected_left
+        or plan.get("predeclared_prior_role_windows_sha256")
+        != (
+            canonical_hash(predeclared_role_windows)
+            if predeclared_role_windows is not None
+            else None
+        )
         or plan.get("n_frames") != len(rows)
         or plan.get("n_images") != len(expected_names)
         or plan.get("frame_selection_sha256") != sha256_file(selection_path)
@@ -3750,6 +3974,7 @@ def _plan_context(
                 gnss_records,
                 config,
                 mapper_config.alignment_temporal_blocks,
+                predeclared_role_windows,
             )
             _verify_recomputed_evaluation_prior_records(
                 prior_split, recomputed_priors
