@@ -56,7 +56,12 @@ from rtk_splat.backends.geodetic_pairs import (
     decide_pair,
 )
 from rtk_splat.backends.mapper_config import MapperConfig
-from rtk_splat.backends.quality import quality_summary, temporal_block_split
+from rtk_splat.backends.quality import (
+    estimate_rigid_alignment,
+    quality_summary,
+    rtk_residual_quality,
+    temporal_block_split,
+)
 from rtk_splat.backends.rtk_refinement import (
     RtkRefinementConfig,
     _calibration_difference,
@@ -4556,6 +4561,101 @@ def _full_trajectory_quality(
     }
 
 
+@dataclass(frozen=True)
+class _SealedRoleEvaluation:
+    """Calibration-only SE(3) fit for an already sealed role inventory."""
+
+    alignment: Any
+    calibration_mask: np.ndarray
+    holdout_mask: np.ndarray
+    residual_vectors_m: np.ndarray
+    residuals_m: np.ndarray
+    thresholds_m: np.ndarray
+    calibration_inlier_mask: np.ndarray
+    holdout_inlier_mask: np.ndarray
+
+
+def _sealed_role_heldout_evaluation(
+    poses: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    priors: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    ordered_records: Sequence[Mapping[str, Any]],
+    mapper_config: MapperConfig,
+) -> tuple[dict[str, Any], _SealedRoleEvaluation]:
+    """Evaluate the exact sealed roles without deriving a second split.
+
+    A predeclared multi-window plan has already assigned each observation a
+    calibration or holdout role using immutable timestamps and window
+    membership.  Re-running ``temporal_block_split`` across the union would
+    create a different experiment.  This path fits only the sealed
+    calibration observations and touches the sealed holdout targets only
+    after that transform is fixed.
+    """
+
+    names = [str(record.get("name", "")) for record in ordered_records]
+    roles = [str(record.get("role", "")) for record in ordered_records]
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or set(names) != set(priors)
+        or any(name not in poses for name in names)
+        or any(role not in {"calibration", "holdout"} for role in roles)
+    ):
+        raise ArtifactError("sealed evaluator role inventory changed")
+    calibration_mask = np.asarray(
+        [role == "calibration" for role in roles], dtype=bool
+    )
+    holdout_mask = np.asarray(
+        [role == "holdout" for role in roles], dtype=bool
+    )
+    if calibration_mask.sum() < 3 or not holdout_mask.any():
+        raise ArtifactError(
+            "sealed holdout evaluation requires at least three calibration "
+            "priors and one untouched holdout prior"
+        )
+
+    source = np.stack([poses[name][1] for name in names])
+    target = np.stack([priors[name][0] for name in names])
+    covariance = np.stack([priors[name][1] for name in names])
+    alignment = estimate_rigid_alignment(
+        source[calibration_mask],
+        target[calibration_mask],
+        covariance[calibration_mask],
+        ransac_threshold_m=mapper_config.alignment_ransac_threshold_m,
+        ransac_iterations=mapper_config.alignment_ransac_iterations,
+        random_seed=mapper_config.random_seed,
+    )
+    residual_vectors = (
+        source @ alignment.rotation.T + alignment.translation - target
+    )
+    residuals = np.linalg.norm(residual_vectors, axis=1)
+    maximum_sigma = np.sqrt(
+        np.maximum(np.linalg.eigvalsh(covariance)[:, -1], 1.0e-8)
+    )
+    thresholds = np.maximum(
+        mapper_config.alignment_ransac_threshold_m, 3.0 * maximum_sigma
+    )
+    calibration_inliers = np.zeros(len(source), dtype=bool)
+    calibration_inliers[calibration_mask] = alignment.inlier_mask
+    holdout_inliers = holdout_mask & (residuals <= thresholds)
+    evaluation = _SealedRoleEvaluation(
+        alignment=alignment,
+        calibration_mask=calibration_mask,
+        holdout_mask=holdout_mask,
+        residual_vectors_m=residual_vectors,
+        residuals_m=residuals,
+        thresholds_m=thresholds,
+        calibration_inlier_mask=calibration_inliers,
+        holdout_inlier_mask=holdout_inliers,
+    )
+    quality = rtk_residual_quality(
+        residual_vectors[holdout_mask],
+        covariance[holdout_mask],
+        holdout_inliers[holdout_mask],
+        config=mapper_config,
+    )
+    return quality, evaluation
+
+
 def _quality_report(
     execution: Path,
     plan_root: Path,
@@ -4621,22 +4721,44 @@ def _quality_report(
         for name, value in evaluation_priors.items()
         if name in evaluation_names
     }
-    source_rtk, source_evaluation = _heldout_evaluation(
-        source_poses, rows, priors, mapper_config
-    )
-    refined_rtk, refined_evaluation = _heldout_evaluation(
-        refined_poses, rows, priors, mapper_config
-    )
-    if not np.array_equal(
-        source_evaluation.temporal_block_ids,
-        refined_evaluation.temporal_block_ids,
-    ):
-        raise ArtifactError("source/refined temporal GNSS splits differ")
     ordered_records = [
         item
         for item in split["records"]
         if item.get("role") in {"calibration", "holdout"}
     ]
+    role_contract = split.get("predeclared_prior_role_contract")
+    if role_contract is None:
+        source_rtk, source_evaluation = _heldout_evaluation(
+            source_poses, rows, priors, mapper_config
+        )
+        refined_rtk, refined_evaluation = _heldout_evaluation(
+            refined_poses, rows, priors, mapper_config
+        )
+        if not np.array_equal(
+            source_evaluation.temporal_block_ids,
+            refined_evaluation.temporal_block_ids,
+        ):
+            raise ArtifactError("source/refined temporal GNSS splits differ")
+        evaluation_role_method = "single_window_temporal_block_split"
+    else:
+        source_rtk, source_evaluation = _sealed_role_heldout_evaluation(
+            source_poses, priors, ordered_records, mapper_config
+        )
+        refined_rtk, refined_evaluation = _sealed_role_heldout_evaluation(
+            refined_poses, priors, ordered_records, mapper_config
+        )
+        evaluation_role_method = str(role_contract["method"])
+    if not (
+        np.array_equal(
+            source_evaluation.calibration_mask,
+            refined_evaluation.calibration_mask,
+        )
+        and np.array_equal(
+            source_evaluation.holdout_mask,
+            refined_evaluation.holdout_mask,
+        )
+    ):
+        raise ArtifactError("source/refined sealed GNSS roles differ")
     recorded_roles = [str(item["role"]) for item in ordered_records]
     expected_roles = [
         "calibration" if value else "holdout"
@@ -4864,6 +4986,7 @@ def _quality_report(
         },
         "rtk_holdout": {
             "same_temporal_split": True,
+            "evaluation_role_method": evaluation_role_method,
             "n_calibration": int(source_evaluation.calibration_mask.sum()),
             "n_holdout": int(source_evaluation.holdout_mask.sum()),
             "source_passed": source_rtk_passed,

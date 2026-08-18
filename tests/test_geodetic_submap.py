@@ -1246,9 +1246,15 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
     def test_predeclared_window_roles_are_sealed_physical_and_recomputed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            segment, frontend, backend, selection, default_plan, colmap, _ = (
-                _fixture(root)
-            )
+            (
+                segment,
+                frontend,
+                backend,
+                selection,
+                default_plan,
+                colmap,
+                selected_names,
+            ) = _fixture(root)
             role_plan = prepare_geodetic_submap_plan(
                 frontend,
                 backend,
@@ -1306,6 +1312,32 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
                 }
             self.assertEqual(optimizer_names, set(split["calibration_names"]))
             self.assertFalse(optimizer_names & set(split["holdout_names"]))
+
+            with mock.patch(
+                "rtk_splat.backends.geodetic_submap._heldout_evaluation",
+                side_effect=AssertionError(
+                    "predeclared roles must not derive a second split"
+                ),
+            ):
+                result = run_geodetic_submap_plan(
+                    role_plan,
+                    root / "role-result",
+                    colmap,
+                    runner=_Runner(selected_names),
+                )
+            self.assertTrue(result["passed"])
+            self.assertEqual(
+                result["quality"]["rtk_holdout"]["n_calibration"], 4
+            )
+            self.assertEqual(
+                result["quality"]["rtk_holdout"]["n_holdout"], 3
+            )
+            self.assertEqual(
+                result["quality"]["rtk_holdout"][
+                    "evaluation_role_method"
+                ],
+                contract["method"],
+            )
 
             contract["role_membership_sha256"] = "0" * 64
             _write_json(split_path, split)
