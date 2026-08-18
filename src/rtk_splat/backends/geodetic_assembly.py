@@ -1514,8 +1514,17 @@ def _synchronize_candidates(
     candidates: Sequence[Mapping[str, Any]],
     *,
     minimum_overlap_frames: int = 2,
+    _calibration_role_policy: str = "any_covering_optimizer_v3",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Synchronize gauges and fit one leakage-free GNSS-only SE(3)."""
+    if _calibration_role_policy not in {
+        "every_covering_optimizer_v2",
+        "any_covering_optimizer_v3",
+    }:
+        raise ValueError("unsupported synchronization calibration-role policy")
+    legacy_role_policy = (
+        _calibration_role_policy == "every_covering_optimizer_v2"
+    )
     ordered = _ordered_overlap_candidates(candidates)
     synchronized: list[dict[str, Any]] = [dict(ordered[0])]
     edges: list[dict[str, Any]] = []
@@ -1597,9 +1606,17 @@ def _synchronize_candidates(
     calibration_source: list[np.ndarray] = []
     calibration_target: list[np.ndarray] = []
     calibration_covariance: list[np.ndarray] = []
+    mixed_role_calibration_names: list[str] = []
     for name in sorted(occurrences):
         entries = occurrences[name]
-        if any(entry[0]["roles"][entry[1]] != "calibration" for entry in entries):
+        calibration_entries = [
+            entry
+            for entry in entries
+            if entry[0]["roles"][entry[1]] == "calibration"
+        ]
+        if not calibration_entries or (
+            legacy_role_policy and len(calibration_entries) != len(entries)
+        ):
             continue
         sources = np.stack(
             [np.asarray(entry[0]["centers"])[entry[1]] for entry in entries]
@@ -1607,13 +1624,13 @@ def _synchronize_candidates(
         targets = np.stack(
             [
                 np.asarray(entry[0]["prior_centers"])[entry[1]]
-                for entry in entries
+                for entry in calibration_entries
             ]
         )
         covariances = np.stack(
             [
                 np.asarray(entry[0]["prior_covariances"])[entry[1]]
-                for entry in entries
+                for entry in calibration_entries
             ]
         )
         if (
@@ -1630,9 +1647,11 @@ def _synchronize_candidates(
         calibration_source.append(sources.mean(axis=0))
         calibration_target.append(targets[0])
         calibration_covariance.append(covariances[0])
+        if len(calibration_entries) != len(entries):
+            mixed_role_calibration_names.append(name)
     if len(calibration_names) < 3:
         raise ArtifactError(
-            "submap synchronization has fewer than three shared-safe "
+            "submap synchronization has fewer than three deduplicated "
             "calibration priors"
         )
     mapper_config = synchronized[0]["mapper_config"]
@@ -1663,8 +1682,13 @@ def _synchronize_candidates(
         for candidate in synchronized
     ]
     calibration_fraction = float(global_alignment.inlier_mask.mean())
+    calibration_check_name = (
+        "shared_safe_calibration_inlier_fraction"
+        if legacy_role_policy
+        else "deduplicated_calibration_inlier_fraction"
+    )
     checks = {
-        "shared_safe_calibration_inlier_fraction": {
+        calibration_check_name: {
             "value": calibration_fraction,
             "minimum": mapper_config.min_rtk_inlier_fraction,
             "passed": calibration_fraction
@@ -1677,10 +1701,13 @@ def _synchronize_candidates(
         },
     }
     record = {
-        "schema_version": 2,
+        "schema_version": 2 if legacy_role_policy else 3,
         "method": (
             "adjacent_visual_overlap_fixed_se3_then_shared_safe_"
             "calibration_gnss_fixed_se3_v2"
+            if legacy_role_policy
+            else "adjacent_visual_overlap_fixed_se3_then_deduplicated_"
+            "calibration_in_any_covering_optimizer_gnss_fixed_se3_v3"
         ),
         "production_scale": 1.0,
         "sim3_scale_applied": False,
@@ -1693,18 +1720,63 @@ def _synchronize_candidates(
             "heldout_evaluation_result",
         ],
         "global_alignment_inputs": [
-            "calibration_position_priors",
+            (
+                "calibration_position_priors"
+                if legacy_role_policy
+                else "deduplicated_position_prior_calibration_in_any_"
+                "covering_optimizer"
+            ),
             "calibration_position_covariance",
         ],
         "global_alignment_inputs_exclude": [
             "any_prior_held_out_in_any_covering_submap",
             "temporally_rejected_gnss",
             "heldout_evaluation_result",
-        ],
+        ]
+        + (
+            []
+            if legacy_role_policy
+            else ["prior_target_from_noncalibration_occurrence"]
+        ),
         "edges": edges,
-        "shared_safe_calibration_count": len(calibration_names),
-        "shared_safe_calibration_names_sha256": canonical_hash(
-            calibration_names
+        **(
+            {
+                "shared_safe_calibration_count": len(calibration_names),
+                "shared_safe_calibration_names_sha256": canonical_hash(
+                    calibration_names
+                ),
+            }
+            if legacy_role_policy
+            else {
+                "calibration_scope": {
+                    "schema_version": 1,
+                    "method": "calibration_in_any_covering_optimizer_v1",
+                    "physical_nonleakage_rule": (
+                        "a deduplicated observation is calibration evidence "
+                        "when its prior was physically present in at least one "
+                        "covering optimizer; only observations held out in "
+                        "every covering optimizer remain evaluation holdouts"
+                    ),
+                    "target_inputs": [
+                        "sealed_calibration_role_occurrences_only"
+                    ],
+                    "target_inputs_exclude": [
+                        "heldout_role_occurrence_target",
+                        "temporally_rejected_gnss",
+                        "heldout_evaluation_result",
+                    ],
+                    "deduplicated_calibration_count": len(calibration_names),
+                    "deduplicated_calibration_names_sha256": canonical_hash(
+                        calibration_names
+                    ),
+                    "mixed_local_role_calibration_count": len(
+                        mixed_role_calibration_names
+                    ),
+                    "mixed_local_role_calibration_names_sha256": canonical_hash(
+                        mixed_role_calibration_names
+                    ),
+                }
+            }
         ),
         "synchronized_holdout_scope": {
             "schema_version": 1,
@@ -1849,6 +1921,8 @@ def _synchronized_overlap_report(
     synchronized: Sequence[Mapping[str, Any]],
     synchronization: Mapping[str, Any],
     policy: GeodeticOverlapPolicy,
+    *,
+    schema_version: int = 3,
 ) -> dict[str, Any]:
     ordered_originals = _ordered_overlap_candidates(originals)
     ordered_synchronized = _ordered_overlap_candidates(synchronized)
@@ -1870,7 +1944,7 @@ def _synchronized_overlap_report(
         }
         pairs.append(post)
     return {
-        "schema_version": 2,
+        "schema_version": schema_version,
         "kind": _OVERLAP_KIND,
         "policy": asdict(policy),
         "result_count": len(ordered_synchronized),
@@ -1892,6 +1966,25 @@ def _evaluate_overlap_candidates(
     )
     return _synchronized_overlap_report(
         candidates, synchronized, synchronization, policy
+    )
+
+
+def _evaluate_overlap_candidates_v2(
+    candidates: Sequence[Mapping[str, Any]],
+    policy: GeodeticOverlapPolicy,
+) -> dict[str, Any]:
+    """Reproduce already-sealed schema-2 overlap reports exactly."""
+    synchronized, synchronization = _synchronize_candidates(
+        candidates,
+        minimum_overlap_frames=policy.minimum_overlap_frames,
+        _calibration_role_policy="every_covering_optimizer_v2",
+    )
+    return _synchronized_overlap_report(
+        candidates,
+        synchronized,
+        synchronization,
+        policy,
+        schema_version=2,
     )
 
 
@@ -2015,6 +2108,8 @@ def audited_geodetic_overlap_report(artifact: str | Path) -> dict[str, Any]:
     if schema_version == 1:
         expected = _legacy_overlap_report(candidates, policy)
     elif schema_version == 2:
+        expected = _evaluate_overlap_candidates_v2(candidates, policy)
+    elif schema_version == 3:
         expected = _evaluate_overlap_candidates(candidates, policy)
     else:
         raise ArtifactError("unsupported geodetic overlap report schema")
@@ -2514,11 +2609,11 @@ def publish_geodetic_full_pose_artifact(
             },
         }
         alignment = {
-            "schema_version": 2,
+            "schema_version": 3,
             **status,
             "method": (
                 "overlap_synchronized_then_calibration_only_fixed_se3_"
-                "submaps_boundary_weighted_v2"
+                "submaps_boundary_weighted_v3"
             ),
             "source_frame": "independent_colmap_submap_worlds",
             "target_frame": "local_enu_cartesian_pose_priors",
@@ -2531,7 +2626,7 @@ def publish_geodetic_full_pose_artifact(
         provenance = {
             "schema_version": 1,
             **status,
-            "method": "sealed_overlapping_geodetic_submap_assembly_v2",
+            "method": "sealed_overlapping_geodetic_submap_assembly_v3",
             "assembly_plan": assembly["artifact"],
             "assembly_plan_seal_sha256": assembly["plan_seal_sha256"],
             "frontend_artifact": str(frontend),
@@ -2669,6 +2764,23 @@ def audited_geodetic_full_pose_artifact(
         )
         expected_synchronization = None
     elif method == "sealed_overlapping_geodetic_submap_assembly_v2":
+        blend_candidates, expected_synchronization = _synchronize_candidates(
+            candidates,
+            minimum_overlap_frames=(
+                assembly[
+                    "config_object"
+                ].overlap_policy.minimum_overlap_frames
+            ),
+            _calibration_role_policy="every_covering_optimizer_v2",
+        )
+        expected_overlap = _synchronized_overlap_report(
+            candidates,
+            blend_candidates,
+            expected_synchronization,
+            assembly["config_object"].overlap_policy,
+            schema_version=2,
+        )
+    elif method == "sealed_overlapping_geodetic_submap_assembly_v3":
         blend_candidates, expected_synchronization = _synchronize_candidates(
             candidates,
             minimum_overlap_frames=(

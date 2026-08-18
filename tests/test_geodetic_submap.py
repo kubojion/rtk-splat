@@ -49,6 +49,7 @@ from rtk_splat.backends.geodetic_assembly import (
     _aligned_submap_candidate,
     _assembly_evaluation_priors,
     _evaluate_overlap_candidates,
+    _evaluate_overlap_candidates_v2,
     _file_evidence,
     _legacy_overlap_report,
     _overlap_csv,
@@ -2017,6 +2018,9 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             baseline = _evaluate_overlap_candidates(
                 candidates, audited["config_object"].overlap_policy
             )
+            legacy = _evaluate_overlap_candidates_v2(
+                candidates, audited["config_object"].overlap_policy
+            )
             changed = [dict(candidate) for candidate in candidates]
             holdout_candidate, holdout_index, _ = next(
                 entry for entry in entries if entry[2] == "holdout"
@@ -2032,6 +2036,29 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             )
 
             self.assertEqual(baseline, repeated)
+            calibration_scope = baseline["synchronization"][
+                "calibration_scope"
+            ]
+            self.assertEqual(
+                calibration_scope["method"],
+                "calibration_in_any_covering_optimizer_v1",
+            )
+            self.assertEqual(
+                calibration_scope["mixed_local_role_calibration_count"], 1
+            )
+            self.assertEqual(
+                calibration_scope[
+                    "mixed_local_role_calibration_names_sha256"
+                ],
+                canonical_hash([cross_role_name]),
+            )
+            self.assertEqual(
+                calibration_scope["deduplicated_calibration_count"],
+                legacy["synchronization"][
+                    "shared_safe_calibration_count"
+                ]
+                + 1,
+            )
             scope = baseline["synchronization"][
                 "synchronized_holdout_scope"
             ]
@@ -2101,6 +2128,30 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                     ],
                     1,
                 )
+
+            schema_two = _evaluate_overlap_candidates_v2(candidates, policy)
+            schema_two_root = root / "schema-two-overlap"
+            schema_two_root.mkdir()
+            _write_json(schema_two_root / "overlap.json", schema_two)
+            (schema_two_root / "overlap.csv").write_bytes(
+                _overlap_csv(schema_two)
+            )
+            (schema_two_root / "overlap.svg").write_bytes(
+                _overlap_svg(schema_two)
+            )
+            _write_json(
+                schema_two_root / "manifest.json",
+                _file_evidence(
+                    schema_two_root,
+                    ["overlap.json", "overlap.csv", "overlap.svg"],
+                ),
+            )
+            self.assertEqual(
+                audited_geodetic_overlap_report(schema_two_root)[
+                    "schema_version"
+                ],
+                2,
+            )
 
             current_root = publish_geodetic_overlap_report(
                 results, root / "current-overlap", policy=policy
