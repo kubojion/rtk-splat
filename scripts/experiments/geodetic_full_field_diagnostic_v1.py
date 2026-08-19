@@ -16,16 +16,19 @@ from typing import Sequence
 from rtk_splat.backends.geodetic_assembly import (
     GeodeticDiagnosticPolicy,
     audited_geodetic_assembly_plan,
+    audited_geodetic_diagnostic_initialization_fallback_window,
     audited_geodetic_diagnostic_full_pose_artifact,
     audited_geodetic_diagnostic_overlap_report,
     audited_geodetic_diagnostic_result_inventory,
     audited_geodetic_diagnostic_submap_result,
     prepare_geodetic_assembly_window,
+    prepare_geodetic_diagnostic_initialization_fallback_window,
     publish_geodetic_diagnostic_full_pose_artifact,
     publish_geodetic_diagnostic_overlap_report,
     publish_geodetic_diagnostic_result_inventory,
 )
 from rtk_splat.backends.geodetic_submap import (
+    audited_geodetic_submap_failure,
     run_geodetic_submap_plan,
 )
 
@@ -60,11 +63,24 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="verify and continue an existing pilot root without overwriting outputs",
     )
+    parser.add_argument(
+        "--allow-sealed-auto-initialization-fallback",
+        action="store_true",
+        help=(
+            "diagnostic-only: after a sealed v5 initialization-exhaustion "
+            "failure, retry with COLMAP auto-initialization over the same "
+            "filtered private database"
+        ),
+    )
     return parser
 
 
 def _result_path(root: Path, window_id: str) -> Path:
     return root / "submaps" / window_id / "result"
+
+
+def _fallback_workspace(root: Path, window_id: str) -> Path:
+    return root / "diagnostic-initialization-fallbacks" / window_id
 
 
 def _publish_available_overlaps(
@@ -158,7 +174,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reuse and run-window inputs must partition every assembly window exactly"
         )
     policy = GeodeticDiagnosticPolicy(
-        median_rtk_warning_m=args.median_rtk_warning_m
+        median_rtk_warning_m=args.median_rtk_warning_m,
+        allow_sealed_auto_initialization_fallback=(
+            args.allow_sealed_auto_initialization_fallback
+        ),
     )
     results: dict[str, Path] = {}
     submap_records = []
@@ -184,8 +203,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for index, window_id in enumerate(requested, start=1):
         workspace = root / "submaps" / window_id
-        result_path = _result_path(root, window_id)
-        if result_path.exists():
+        primary_result_path = _result_path(root, window_id)
+        fallback_workspace = _fallback_workspace(root, window_id)
+        fallback_result_path = fallback_workspace / "result"
+        if primary_result_path.exists() and fallback_result_path.exists():
+            raise RuntimeError(
+                f"{window_id} has both primary and diagnostic fallback results"
+            )
+        if fallback_result_path.exists():
+            audited_geodetic_diagnostic_initialization_fallback_window(
+                args.plan,
+                fallback_workspace,
+                _audited_plan=assembly,
+            )
+            result_path = fallback_result_path
+            state = "verified-diagnostic-initialization-fallback"
+        elif primary_result_path.exists():
+            result_path = primary_result_path
             state = "verified"
         else:
             prepared = prepare_geodetic_assembly_window(
@@ -194,13 +228,78 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workspace,
                 _audited_plan=assembly,
             )
-            run_geodetic_submap_plan(
-                prepared["plan"],
-                prepared["result"],
-                args.colmap,
-                _verified_input_context=assembly["_runtime_context"],
-            )
-            state = "completed"
+            primary_failure_path = workspace / "failure"
+            if primary_failure_path.exists():
+                failure = audited_geodetic_submap_failure(
+                    primary_failure_path,
+                    _verified_input_context=assembly["_runtime_context"],
+                )
+            else:
+                try:
+                    run_geodetic_submap_plan(
+                        prepared["plan"],
+                        prepared["result"],
+                        args.colmap,
+                        failure_destination=primary_failure_path,
+                        _verified_input_context=assembly["_runtime_context"],
+                    )
+                except BaseException:
+                    failure = audited_geodetic_submap_failure(
+                        primary_failure_path,
+                        _verified_input_context=assembly["_runtime_context"],
+                    )
+                else:
+                    failure = None
+            if failure is None:
+                result_path = primary_result_path
+                state = "completed"
+            else:
+                if (
+                    not args.allow_sealed_auto_initialization_fallback
+                    or failure["failure_classification"]
+                    != "initialization_exhausted_without_sparse_model"
+                ):
+                    raise RuntimeError(
+                        f"{window_id} primary solve failed: "
+                        f"{failure['failure_classification']}"
+                    )
+                if fallback_workspace.exists():
+                    fallback = (
+                        audited_geodetic_diagnostic_initialization_fallback_window(
+                            args.plan,
+                            fallback_workspace,
+                            _audited_plan=assembly,
+                        )
+                    )
+                else:
+                    fallback = (
+                        prepare_geodetic_diagnostic_initialization_fallback_window(
+                            args.plan,
+                            window_id,
+                            primary_failure_path,
+                            fallback_workspace,
+                            _audited_plan=assembly,
+                        )
+                    )
+                fallback_failure_path = fallback_workspace / "failure"
+                if fallback_failure_path.exists():
+                    fallback_failure = audited_geodetic_submap_failure(
+                        fallback_failure_path,
+                        _verified_input_context=assembly["_runtime_context"],
+                    )
+                    raise RuntimeError(
+                        f"{window_id} diagnostic fallback failed: "
+                        f"{fallback_failure['failure_classification']}"
+                    )
+                run_geodetic_submap_plan(
+                    fallback["plan"],
+                    fallback["result"],
+                    args.colmap,
+                    failure_destination=fallback_failure_path,
+                    _verified_input_context=assembly["_runtime_context"],
+                )
+                result_path = fallback_result_path
+                state = "completed-diagnostic-initialization-fallback"
         assessment = audited_geodetic_diagnostic_submap_result(
             result_path,
             policy=policy,

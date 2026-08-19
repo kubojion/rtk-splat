@@ -47,6 +47,7 @@ from rtk_splat.backends.geodetic_submap import (
     _select_initial_pair_for_method,
     _selected_rows,
     _temporally_filtered_gnss,
+    audited_geodetic_submap_failure,
     audited_geodetic_submap_result,
     create_geodetic_frame_selection,
     prepare_geodetic_submap_plan,
@@ -147,6 +148,7 @@ class GeodeticDiagnosticPolicy:
         "heldout_median_not_worse_m",
         "heldout_rtk_absolute_gates",
     )
+    allow_sealed_auto_initialization_fallback: bool = False
 
     def __post_init__(self) -> None:
         warning = float(self.median_rtk_warning_m)
@@ -166,6 +168,10 @@ class GeodeticDiagnosticPolicy:
         if set(allowed) != expected:
             raise ValueError(
                 "diagnostic policy may waive only the two declared RTK checks"
+            )
+        if not isinstance(self.allow_sealed_auto_initialization_fallback, bool):
+            raise ValueError(
+                "allow_sealed_auto_initialization_fallback must be boolean"
             )
 
 
@@ -874,6 +880,237 @@ def prepare_geodetic_assembly_window(
     }
 
 
+_DIAGNOSTIC_FALLBACK_BINDING_KIND = (
+    "rtk_splat_geodetic_diagnostic_initialization_fallback_binding"
+)
+
+
+def _diagnostic_fallback_binding_record(
+    assembly: Mapping[str, Any],
+    window: Mapping[str, Any],
+    root: Path,
+    primary_failure: str | Path,
+) -> dict[str, Any]:
+    runtime_context = assembly.get("_runtime_context")
+    failure = audited_geodetic_submap_failure(
+        primary_failure,
+        _verified_input_context=runtime_context,
+    )
+    if (
+        failure["failure_classification"]
+        != "initialization_exhausted_without_sparse_model"
+    ):
+        raise ArtifactError(
+            "diagnostic auto-initialization fallback requires a sealed "
+            "initialization-exhaustion failure"
+        )
+    primary_plan_root = Path(failure["plan_artifact"])
+    primary_context = _plan_context(
+        primary_plan_root,
+        require_hardened=True,
+        _verified_input_context=runtime_context,
+    )
+    primary_plan = primary_context[1]
+    if (
+        primary_plan.get("selected_frame_ids") != window["frame_ids"]
+        or primary_plan.get("initial_pair", {}).get("method")
+        != "deterministic_calibration_anchor_colmap_partner_v5"
+    ):
+        raise ArtifactError(
+            "primary initialization failure does not bind the assembly window"
+        )
+    primary_split = _json(primary_plan_root / "prior_split.json")
+    if (
+        primary_split.get("calibration_names") != window["calibration_names"]
+        or primary_split.get("holdout_names") != window["holdout_names"]
+    ):
+        raise ArtifactError("primary failure prior split differs from window")
+
+    selection_path = root / "selection.json"
+    plan_path = root / "plan"
+    frontend, manifest = runtime_context[:2]
+    _, selection = _load_frame_selection(
+        selection_path,
+        frontend,
+        Path(assembly["segment"]),
+        manifest,
+    )
+    if selection.get("frame_ids") != window["frame_ids"]:
+        raise ArtifactError("fallback selection differs from assembly window")
+    fallback_context = _plan_context(
+        plan_path,
+        require_hardened=True,
+        _verified_input_context=runtime_context,
+    )
+    fallback_plan = fallback_context[1]
+    fallback_split = _json(plan_path / "prior_split.json")
+    if (
+        fallback_plan.get("selected_frame_ids") != window["frame_ids"]
+        or fallback_plan.get("initial_pair", {}).get("method")
+        != "deterministic_colmap_auto_filtered_database_v4"
+        or fallback_split.get("calibration_names")
+        != window["calibration_names"]
+        or fallback_split.get("holdout_names") != window["holdout_names"]
+        or [
+            str(name)
+            for name in fallback_plan.get("selected_left_image_names", [])
+            if name
+            not in set(fallback_split.get("calibration_names", []))
+            | set(fallback_split.get("holdout_names", []))
+        ]
+        != window.get("excluded_names", [])
+    ):
+        raise ArtifactError(
+            "diagnostic fallback plan differs from the assembly window"
+        )
+    return {
+        "schema_version": 2,
+        "kind": _DIAGNOSTIC_FALLBACK_BINDING_KIND,
+        "diagnostic_only": True,
+        "production_publication_eligible": False,
+        "assembly_plan": assembly["artifact"],
+        "assembly_plan_seal_sha256": assembly["plan_seal_sha256"],
+        "window_id": window["window_id"],
+        "frame_ids_sha256": window["frame_ids_sha256"],
+        "selection_sha256": sha256_file(selection_path),
+        "submap_plan_seal_sha256": sha256_file(plan_path / "plan_seal.json"),
+        "primary_failure_artifact": failure["artifact"],
+        "primary_failure_seal_sha256": failure["failure_seal_sha256"],
+        "primary_failure_classification": failure["failure_classification"],
+        "primary_submap_plan": str(primary_plan_root),
+        "primary_submap_plan_seal_sha256": failure["plan_seal_sha256"],
+        "primary_initialization_method": primary_plan["initial_pair"]["method"],
+        "fallback_initialization_method": fallback_plan["initial_pair"]["method"],
+        "fallback_reason": "sealed_primary_anchor_could_not_create_sparse_model",
+        "decision_inputs_exclude": [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+
+
+def prepare_geodetic_diagnostic_initialization_fallback_window(
+    assembly_plan: str | Path,
+    window_id: str,
+    primary_failure: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Prepare a sealed diagnostic-only COLMAP auto-initialization fallback."""
+    assembly_path = Path(assembly_plan).expanduser().resolve()
+    assembly = (
+        dict(_audited_plan)
+        if _audited_plan is not None
+        else audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    )
+    if Path(str(assembly.get("artifact", ""))).resolve() != assembly_path:
+        raise ArtifactError("cached assembly plan refers to another artifact")
+    if "_runtime_context" not in assembly:
+        assembly = audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    window = _window_record(assembly, window_id)
+    root = Path(workspace).expanduser().resolve()
+    if root.exists():
+        raise FileExistsError(
+            f"refusing to overwrite diagnostic fallback workspace: {root}"
+        )
+    for immutable in (
+        Path(assembly["frontend_artifact"]),
+        Path(assembly["completed_backend"]),
+        Path(assembly["segment"]),
+        Path(primary_failure).expanduser().resolve(),
+    ):
+        if root == immutable or immutable in root.parents:
+            raise ArtifactError(
+                "diagnostic fallback workspace must be outside immutable inputs"
+            )
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    try:
+        selection_path = root / "selection.json"
+        _atomic_json(
+            selection_path,
+            _selection_payload(
+                Path(assembly["frontend_artifact"]),
+                Path(assembly["segment"]),
+                window["frame_ids"],
+            ),
+        )
+        prepare_geodetic_submap_plan(
+            assembly["frontend_artifact"],
+            assembly["completed_backend"],
+            assembly["segment"],
+            selection_path,
+            root / "plan",
+            config=assembly["config_object"].submap_config,
+            _verified_input_context=assembly["_runtime_context"],
+            _defer_full_reaudit_until_execution=True,
+            _initial_pair_method="v4",
+        )
+        binding = _diagnostic_fallback_binding_record(
+            assembly, window, root, primary_failure
+        )
+        _atomic_json(root / "window_binding.json", binding)
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return {
+        "workspace": str(root),
+        "selection": str(root / "selection.json"),
+        "plan": str(root / "plan"),
+        "result": str(root / "result"),
+        "window_id": window_id,
+    }
+
+
+def audited_geodetic_diagnostic_initialization_fallback_window(
+    assembly_plan: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Verify a prepared diagnostic initialization fallback without mutation."""
+    assembly_path = Path(assembly_plan).expanduser().resolve()
+    assembly = (
+        dict(_audited_plan)
+        if _audited_plan is not None
+        else audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    )
+    if "_runtime_context" not in assembly:
+        assembly = audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    root = Path(workspace).expanduser().resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise ArtifactError("diagnostic fallback workspace is missing or unsafe")
+    binding = _json(root / "window_binding.json")
+    if binding.get("kind") != _DIAGNOSTIC_FALLBACK_BINDING_KIND:
+        raise ArtifactError("invalid diagnostic fallback binding")
+    window = _window_record(assembly, str(binding.get("window_id", "")))
+    expected = _diagnostic_fallback_binding_record(
+        assembly,
+        window,
+        root,
+        str(binding.get("primary_failure_artifact", "")),
+    )
+    if binding != expected:
+        raise ArtifactError("diagnostic fallback binding changed")
+    return {
+        "workspace": str(root),
+        "selection": str(root / "selection.json"),
+        "plan": str(root / "plan"),
+        "result": str(root / "result"),
+        "window_id": str(window["window_id"]),
+    }
+
+
 def _atomic_save_npy(path: Path, value: np.ndarray) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -1074,6 +1311,75 @@ def _failed_authoritative_checks(
     )
 
 
+def _diagnostic_initialization_override(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    result_path = Path(str(candidate["result"]["artifact"]))
+    binding_path = result_path.parent / "window_binding.json"
+    if not binding_path.is_file() or binding_path.is_symlink():
+        return None
+    binding = _json(binding_path)
+    if binding.get("schema_version") == 1:
+        return None
+    if (
+        binding.get("schema_version") != 2
+        or binding.get("kind") != _DIAGNOSTIC_FALLBACK_BINDING_KIND
+        or binding.get("diagnostic_only") is not True
+        or binding.get("production_publication_eligible") is not False
+        or binding.get("primary_failure_classification")
+        != "initialization_exhausted_without_sparse_model"
+        or binding.get("primary_initialization_method")
+        != "deterministic_calibration_anchor_colmap_partner_v5"
+        or binding.get("fallback_initialization_method")
+        != "deterministic_colmap_auto_filtered_database_v4"
+        or binding.get("fallback_reason")
+        != "sealed_primary_anchor_could_not_create_sparse_model"
+        or binding.get("decision_inputs_exclude")
+        != [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ]
+    ):
+        raise ArtifactError("diagnostic initialization override binding is invalid")
+    result_plan = candidate["plan"]
+    if (
+        result_plan.get("initial_pair", {}).get("method")
+        != binding["fallback_initialization_method"]
+        or binding.get("submap_plan_seal_sha256")
+        != candidate["result"]["plan_seal_sha256"]
+    ):
+        raise ArtifactError("diagnostic initialization override plan changed")
+    failure = audited_geodetic_submap_failure(
+        str(binding.get("primary_failure_artifact", ""))
+    )
+    primary_plan = _json(
+        Path(failure["plan_artifact"]) / "geodetic_submap_plan.json"
+    )
+    if (
+        binding.get("primary_failure_seal_sha256")
+        != failure["failure_seal_sha256"]
+        or binding.get("primary_submap_plan") != failure["plan_artifact"]
+        or binding.get("primary_submap_plan_seal_sha256")
+        != failure["plan_seal_sha256"]
+        or primary_plan.get("initial_pair", {}).get("method")
+        != binding["primary_initialization_method"]
+        or primary_plan.get("selected_frame_ids")
+        != result_plan.get("selected_frame_ids")
+    ):
+        raise ArtifactError("diagnostic initialization failure binding changed")
+    return {
+        "binding": str(binding_path.resolve()),
+        "binding_sha256": sha256_file(binding_path),
+        "primary_failure_artifact": failure["artifact"],
+        "primary_failure_seal_sha256": failure["failure_seal_sha256"],
+        "primary_failure_classification": failure["failure_classification"],
+        "primary_initialization_method": binding["primary_initialization_method"],
+        "fallback_initialization_method": binding["fallback_initialization_method"],
+        "fallback_reason": binding["fallback_reason"],
+    }
+
+
 def _diagnostic_submap_assessment(
     candidate: Mapping[str, Any],
     policy: GeodeticDiagnosticPolicy,
@@ -1082,9 +1388,9 @@ def _diagnostic_submap_assessment(
     checks = quality.get("checks")
     if not isinstance(checks, Mapping):
         raise ArtifactError("submap quality has no check inventory")
-    production_failures = _failed_authoritative_checks(checks)
+    quality_production_failures = _failed_authoritative_checks(checks)
     allowed = set(policy.allowed_submap_failure_checks)
-    structural_failures = sorted(set(production_failures) - allowed)
+    structural_failures = sorted(set(quality_production_failures) - allowed)
     refined = quality.get("rtk_holdout", {}).get("refined", {})
     residual = refined.get("residual_m", {})
     median = residual.get("median")
@@ -1094,12 +1400,25 @@ def _diagnostic_submap_assessment(
         or not math.isfinite(float(median))
     ):
         raise ArtifactError("submap has no finite refined RTK median")
-    production_passed = bool(
+    quality_production_passed = bool(
         candidate["result"].get("passed")
         and candidate["result"].get("publication_eligible")
     )
-    if production_passed != (not production_failures):
+    if quality_production_passed != (not quality_production_failures):
         raise ArtifactError("submap production state disagrees with its checks")
+    initialization_override = _diagnostic_initialization_override(candidate)
+    allowed_execution_overrides: list[str] = []
+    production_failures = list(quality_production_failures)
+    if initialization_override is not None:
+        marker = "diagnostic_auto_initialization_fallback"
+        production_failures.append(marker)
+        if policy.allow_sealed_auto_initialization_fallback:
+            allowed_execution_overrides.append(marker)
+        else:
+            structural_failures.append(marker)
+    production_failures = sorted(set(production_failures))
+    structural_failures = sorted(set(structural_failures))
+    production_passed = quality_production_passed and not production_failures
     return {
         "schema_version": 1,
         "result": candidate["result"]["artifact"],
@@ -1109,6 +1428,7 @@ def _diagnostic_submap_assessment(
         "allowed_rtk_only_failed_checks": sorted(
             set(production_failures) & allowed
         ),
+        "allowed_diagnostic_execution_overrides": allowed_execution_overrides,
         "structural_failed_checks": structural_failures,
         "structurally_safe_for_diagnostic": not structural_failures,
         "refined_holdout_median_rtk_residual_m": float(median),
@@ -1116,6 +1436,7 @@ def _diagnostic_submap_assessment(
         "median_rtk_warning_exceeded": (
             float(median) > float(policy.median_rtk_warning_m)
         ),
+        "diagnostic_initialization_override": initialization_override,
     }
 
 
@@ -2678,8 +2999,18 @@ def _diagnostic_inventory_record(
             != assembly["plan_seal_sha256"]
             or binding.get("window_id") != window_id
             or binding.get("frame_ids_sha256") != window["frame_ids_sha256"]
+            or binding.get("submap_plan_seal_sha256")
+            != candidate["result"]["plan_seal_sha256"]
         ):
             raise ArtifactError(f"{window_id} binding changed")
+        if binding.get("schema_version") == 2:
+            audited_geodetic_diagnostic_initialization_fallback_window(
+                assembly["artifact"],
+                workspace,
+                _audited_plan=assembly,
+            )
+        elif binding.get("schema_version") != 1:
+            raise ArtifactError(f"{window_id} binding schema changed")
         assessment = _diagnostic_submap_assessment(candidate, policy)
         if not assessment["structurally_safe_for_diagnostic"]:
             raise ArtifactError(
@@ -2724,6 +3055,12 @@ def _diagnostic_inventory_record(
             item["window_id"]
             for item in records
             if item["assessment"]["median_rtk_warning_exceeded"]
+        ],
+        "diagnostic_initialization_override_window_ids": [
+            item["window_id"]
+            for item in records
+            if item["assessment"]["diagnostic_initialization_override"]
+            is not None
         ],
         "windows": records,
     }

@@ -38,6 +38,7 @@ from rtk_splat.backends.geodetic_submap import (
     _select_initial_pair_v3,
     _select_initial_pair_v5,
     _similarity_scale,
+    audited_geodetic_submap_failure,
     build_geodetic_submap_command,
     create_geodetic_frame_selection,
     geodetic_submap_export_context,
@@ -60,12 +61,15 @@ from rtk_splat.backends.geodetic_assembly import (
     audited_geodetic_diagnostic_full_pose_artifact,
     audited_geodetic_diagnostic_overlap_report,
     audited_geodetic_diagnostic_result_inventory,
+    audited_geodetic_diagnostic_submap_result,
+    audited_geodetic_diagnostic_initialization_fallback_window,
     audited_geodetic_full_pose_artifact,
     audited_geodetic_overlap_report,
     audited_geodetic_submap_pose_export,
     export_geodetic_submap_poses,
     prepare_geodetic_assembly_plan,
     prepare_geodetic_assembly_window,
+    prepare_geodetic_diagnostic_initialization_fallback_window,
     publish_geodetic_diagnostic_full_pose_artifact,
     publish_geodetic_diagnostic_overlap_report,
     publish_geodetic_diagnostic_result_inventory,
@@ -1771,6 +1775,80 @@ class GeodeticSubmapArtifactTests(unittest.TestCase):
             self.assertFalse(result.exists())
             self.assertEqual(list(root.glob(".failed-result.writing-*")), [])
 
+    def test_mapper_failure_evidence_is_sealed_classified_and_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, _, _, plan, colmap, _ = _fixture(root)
+            result = root / "failed-result"
+            failure = root / "failure-evidence"
+
+            def fail_without_sparse_model(command, attempt, _config):
+                (attempt / "colmap.log").write_text(
+                    "Finding good initial image pair\n"
+                    "No good initial image pair found.\n"
+                    "Failed to create any sparse model\n",
+                    encoding="utf-8",
+                )
+                (attempt / "resource_samples.csv").write_text(
+                    "elapsed_s,pid\n0.0,1\n", encoding="utf-8"
+                )
+                _write_json(
+                    attempt / "resource_usage.json",
+                    {
+                        "schema_version": 1,
+                        "returncode": 1,
+                        "safety_aborted": False,
+                    },
+                )
+                raise subprocess.CalledProcessError(1, list(command))
+
+            with mock.patch(
+                "rtk_splat.backends.geodetic_submap._run_monitored_mapper",
+                side_effect=fail_without_sparse_model,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    run_geodetic_submap_plan(
+                        plan,
+                        result,
+                        colmap,
+                        failure_destination=failure,
+                    )
+            self.assertFalse(result.exists())
+            self.assertEqual(list(root.glob(".failed-result.writing-*")), [])
+            audited = audited_geodetic_submap_failure(failure)
+            self.assertEqual(
+                audited["failure_classification"],
+                "initialization_exhausted_without_sparse_model",
+            )
+            self.assertFalse(audited["partial_result_published"])
+            self.assertTrue(
+                (failure / "attempts" / "solve" / "attempt-0001" / "colmap.log").is_file()
+            )
+            with mock.patch(
+                "rtk_splat.backends.geodetic_submap._run_monitored_mapper"
+            ) as mapper:
+                with self.assertRaises(FileExistsError):
+                    run_geodetic_submap_plan(
+                        plan,
+                        result,
+                        colmap,
+                        failure_destination=failure,
+                    )
+                mapper.assert_not_called()
+
+            record_path = failure / "geodetic_submap_failure.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["failure_classification"] = "mapper_execution_failure"
+            _write_json(record_path, record)
+            names = sorted(
+                path.relative_to(failure).as_posix()
+                for path in failure.rglob("*")
+                if path.is_file() and path.name != "failure_seal.json"
+            )
+            _write_json(failure / "failure_seal.json", _seal_files(failure, names))
+            with self.assertRaisesRegex(ArtifactError, "binding changed"):
+                audited_geodetic_submap_failure(failure)
+
     def test_selection_and_plan_never_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2081,6 +2159,134 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 publish_geodetic_diagnostic_full_pose_artifact(
                     inventory, root / "poses", "diagnostic-assembled"
+                )
+
+    def test_diagnostic_auto_initialization_fallback_is_sealed_and_propagated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, assembly_plan, audited, _, results = self._completed_assembly(root)
+            window = audited["windows"][0]
+            primary = prepare_geodetic_assembly_window(
+                assembly_plan,
+                window["window_id"],
+                root / "primary-failed-window",
+            )
+            primary_plan = json.loads(
+                (
+                    Path(primary["plan"]) / "geodetic_submap_plan.json"
+                ).read_text(encoding="utf-8")
+            )
+            colmap = Path(primary_plan["colmap"]["executable"])
+            failure_path = Path(primary["workspace"]) / "failure"
+
+            def fail_without_sparse_model(command, attempt, _config):
+                (attempt / "colmap.log").write_text(
+                    "Finding good initial image pair\n"
+                    "No good initial image pair found.\n"
+                    "Failed to create any sparse model\n",
+                    encoding="utf-8",
+                )
+                (attempt / "resource_samples.csv").write_text(
+                    "elapsed_s,pid\n0.0,1\n", encoding="utf-8"
+                )
+                _write_json(
+                    attempt / "resource_usage.json",
+                    {
+                        "schema_version": 1,
+                        "returncode": 1,
+                        "safety_aborted": False,
+                    },
+                )
+                raise subprocess.CalledProcessError(1, list(command))
+
+            with mock.patch(
+                "rtk_splat.backends.geodetic_submap._run_monitored_mapper",
+                side_effect=fail_without_sparse_model,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    run_geodetic_submap_plan(
+                        primary["plan"],
+                        primary["result"],
+                        colmap,
+                        failure_destination=failure_path,
+                    )
+            fallback = prepare_geodetic_diagnostic_initialization_fallback_window(
+                assembly_plan,
+                window["window_id"],
+                failure_path,
+                root / "fallback-window",
+            )
+            verified = audited_geodetic_diagnostic_initialization_fallback_window(
+                assembly_plan, fallback["workspace"]
+            )
+            self.assertEqual(verified, fallback)
+            fallback_plan = json.loads(
+                (Path(fallback["plan"]) / "geodetic_submap_plan.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                fallback_plan["initial_pair"]["method"],
+                "deterministic_colmap_auto_filtered_database_v4",
+            )
+            command = build_geodetic_submap_command(
+                fallback["plan"], root / "fallback-command", colmap
+            )
+            self.assertNotIn("--Mapper.init_image_id1", command)
+            self.assertNotIn("--Mapper.init_image_id2", command)
+            runner = _Runner(list(fallback_plan["selected_image_names"]))
+            run_geodetic_submap_plan(
+                fallback["plan"],
+                fallback["result"],
+                colmap,
+                runner=runner,
+            )
+            with self.assertRaisesRegex(
+                ArtifactError, "diagnostic_auto_initialization_fallback"
+            ):
+                audited_geodetic_diagnostic_submap_result(fallback["result"])
+            policy = GeodeticDiagnosticPolicy(
+                allow_sealed_auto_initialization_fallback=True
+            )
+            assessment = audited_geodetic_diagnostic_submap_result(
+                fallback["result"], policy=policy
+            )
+            self.assertFalse(assessment["production_passed"])
+            self.assertTrue(assessment["structurally_safe_for_diagnostic"])
+            self.assertEqual(
+                assessment["allowed_diagnostic_execution_overrides"],
+                ["diagnostic_auto_initialization_fallback"],
+            )
+            inventory = publish_geodetic_diagnostic_result_inventory(
+                assembly_plan,
+                {
+                    window["window_id"]: fallback["result"],
+                    audited["windows"][1]["window_id"]: results[1],
+                },
+                root / "fallback-inventory",
+                policy=policy,
+            )
+            inventory_record = audited_geodetic_diagnostic_result_inventory(
+                inventory
+            )
+            self.assertEqual(
+                inventory_record[
+                    "diagnostic_initialization_override_window_ids"
+                ],
+                [window["window_id"]],
+            )
+            self.assertIn(
+                window["window_id"],
+                inventory_record["production_failed_window_ids"],
+            )
+
+            binding_path = Path(fallback["workspace"]) / "window_binding.json"
+            binding = json.loads(binding_path.read_text(encoding="utf-8"))
+            binding["fallback_reason"] = "tampered"
+            _write_json(binding_path, binding)
+            with self.assertRaisesRegex(ArtifactError, "binding changed"):
+                audited_geodetic_diagnostic_initialization_fallback_window(
+                    assembly_plan, fallback["workspace"]
                 )
 
     def test_diagnostic_inventory_rejects_structural_failure_and_tampering(self):

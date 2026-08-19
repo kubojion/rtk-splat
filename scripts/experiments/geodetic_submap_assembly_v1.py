@@ -88,7 +88,10 @@ def _assembly_config(args: argparse.Namespace) -> GeodeticAssemblyConfig:
 
 def _diagnostic_policy(args: argparse.Namespace) -> GeodeticDiagnosticPolicy:
     return GeodeticDiagnosticPolicy(
-        median_rtk_warning_m=args.median_rtk_warning_m
+        median_rtk_warning_m=args.median_rtk_warning_m,
+        allow_sealed_auto_initialization_fallback=(
+            args.allow_sealed_auto_initialization_fallback
+        ),
     )
 
 
@@ -97,6 +100,10 @@ def _add_diagnostic_policy(parser: argparse.ArgumentParser) -> None:
         "--median-rtk-warning-m",
         type=float,
         default=GeodeticDiagnosticPolicy().median_rtk_warning_m,
+    )
+    parser.add_argument(
+        "--allow-sealed-auto-initialization-fallback",
+        action="store_true",
     )
 
 

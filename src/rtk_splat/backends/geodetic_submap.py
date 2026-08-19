@@ -91,6 +91,7 @@ _PAIR_ID_BASE = 2_147_483_647
 _SELECTION_KIND = "rtk_splat_geodetic_submap_frame_selection"
 _PLAN_KIND = "rtk_splat_geodetic_submap_plan"
 _RESULT_KIND = "rtk_splat_geodetic_submap_result"
+_FAILURE_KIND = "rtk_splat_geodetic_submap_failure"
 _HARDENED_PLAN_SCHEMA_VERSION = 4
 _SUPPORTED_PLAN_SCHEMA_VERSIONS = {1, 2, 3, 4}
 _SEALED_EVALUATION_PRIOR_SCHEMA_VERSION = 4
@@ -3540,6 +3541,175 @@ def _verify_file_seal(
     return seal
 
 
+def _submap_failure_attempt_files(root: Path) -> list[str]:
+    attempts = root / "attempts"
+    if not attempts.exists():
+        return []
+    if not attempts.is_dir() or attempts.is_symlink():
+        raise ArtifactError("submap failure attempt inventory is unsafe")
+    files: list[str] = []
+    for path in attempts.rglob("*"):
+        if path.is_symlink():
+            raise ArtifactError("submap failure attempt contains a symlink")
+        if path.is_file():
+            files.append(path.relative_to(root).as_posix())
+    return sorted(files)
+
+
+def _submap_failure_classification(root: Path) -> str:
+    attempt_files = _submap_failure_attempt_files(root)
+    logs = [root / name for name in attempt_files if name.endswith("/colmap.log")]
+    usages = [
+        _json(root / name)
+        for name in attempt_files
+        if name.endswith("/resource_usage.json")
+    ]
+    if any(item.get("safety_aborted") is True for item in usages):
+        return "resource_safety_abort"
+    log_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace") for path in logs
+    )
+    if (
+        "Failed to create any sparse model" in log_text
+        and "Registering initial image pair" not in log_text
+    ):
+        return "initialization_exhausted_without_sparse_model"
+    if usages:
+        latest = usages[-1]
+        returncode = latest.get("returncode")
+        if returncode not in {None, 0} or latest.get("exception"):
+            return "mapper_execution_failure"
+        if returncode == 0:
+            return "post_mapper_validation_failure"
+    return "pre_mapper_execution_failure"
+
+
+def _publish_geodetic_submap_failure(
+    staging_result: Path,
+    destination: Path,
+    plan_root: Path,
+    intended_result: Path,
+    error: BaseException,
+    command: Sequence[str] | None,
+) -> Path:
+    if destination.exists():
+        raise FileExistsError(
+            f"refusing to overwrite geodetic failure evidence: {destination}"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(
+        f".{destination.name}.writing-{uuid.uuid4().hex}"
+    )
+    staging.mkdir()
+    try:
+        attempt_files = _submap_failure_attempt_files(staging_result)
+        for name in attempt_files:
+            source = staging_result / name
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        returncode = (
+            int(error.returncode)
+            if isinstance(error, subprocess.CalledProcessError)
+            else None
+        )
+        record = {
+            "schema_version": 1,
+            "kind": _FAILURE_KIND,
+            "experimental": True,
+            "artifact_class": "diagnostic_failure_evidence",
+            "plan_artifact": str(plan_root),
+            "plan_seal_sha256": sha256_file(plan_root / "plan_seal.json"),
+            "plan_sha256": sha256_file(
+                plan_root / "geodetic_submap_plan.json"
+            ),
+            "intended_result": str(intended_result),
+            "partial_result_published": False,
+            "exception_type": type(error).__name__,
+            "exception_message": str(error),
+            "subprocess_returncode": returncode,
+            "mapper_command": list(command) if command is not None else None,
+            "attempt_files": attempt_files,
+            "failure_classification": _submap_failure_classification(
+                staging_result
+            ),
+        }
+        _atomic_json(staging / "geodetic_submap_failure.json", record)
+        files = ["geodetic_submap_failure.json", *attempt_files]
+        _atomic_json(
+            staging / "failure_seal.json", _seal_files(staging, files)
+        )
+        publish_directory_noreplace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination
+
+
+def audited_geodetic_submap_failure(
+    failure_artifact: str | Path,
+    *,
+    _verified_input_context: tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
+    """Verify immutable evidence from a failed, unpublished submap solve."""
+    root = Path(failure_artifact).expanduser().resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise ArtifactError("geodetic submap failure evidence is missing or unsafe")
+    seal = _json(root / "failure_seal.json")
+    files = seal.get("files")
+    if not isinstance(files, Mapping):
+        raise ArtifactError("geodetic submap failure has no file seal")
+    actual = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "failure_seal.json"
+    }
+    if actual != set(files):
+        raise ArtifactError("geodetic submap failure file inventory changed")
+    _verify_file_seal(root, "failure_seal.json", sorted(actual))
+    record = _json(root / "geodetic_submap_failure.json")
+    if (
+        record.get("schema_version") != 1
+        or record.get("kind") != _FAILURE_KIND
+        or record.get("artifact_class") != "diagnostic_failure_evidence"
+        or record.get("partial_result_published") is not False
+    ):
+        raise ArtifactError("invalid geodetic submap failure evidence")
+    plan_root = Path(str(record.get("plan_artifact", ""))).resolve()
+    plan_context = _plan_context(
+        plan_root,
+        require_hardened=True,
+        _verified_input_context=_verified_input_context,
+    )
+    plan = plan_context[1]
+    if (
+        record.get("plan_seal_sha256")
+        != sha256_file(plan_root / "plan_seal.json")
+        or record.get("plan_sha256")
+        != sha256_file(plan_root / "geodetic_submap_plan.json")
+        or record.get("attempt_files")
+        != _submap_failure_attempt_files(root)
+        or record.get("failure_classification")
+        != _submap_failure_classification(root)
+    ):
+        raise ArtifactError("geodetic submap failure binding changed")
+    intended = Path(str(record.get("intended_result", ""))).resolve()
+    if intended.exists():
+        raise ArtifactError("failed submap unexpectedly has a published result")
+    command = record.get("mapper_command")
+    if command is not None:
+        if not isinstance(command, list) or not all(
+            isinstance(value, str) for value in command
+        ):
+            raise ArtifactError("geodetic submap failure command is invalid")
+        _verify_mapper_command(command, plan_context[2], plan["initial_pair"])
+    return {
+        **record,
+        "artifact": str(root),
+        "failure_seal_sha256": sha256_file(root / "failure_seal.json"),
+    }
+
+
 def prepare_geodetic_submap_plan(
     frontend_artifact: str | Path,
     completed_backend: str | Path,
@@ -5003,6 +5173,7 @@ def run_geodetic_submap_plan(
     executable: str | Path,
     *,
     runner: Runner = subprocess.run,
+    failure_destination: str | Path | None = None,
     _verified_input_context: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
     """Run one plan in staging and atomically publish an experimental result."""
@@ -5022,9 +5193,33 @@ def run_geodetic_submap_plan(
     )
     if any(output == item or item in output.parents for item in immutable):
         raise ArtifactError("geodetic result must be outside immutable inputs")
+    failure_output = (
+        None
+        if failure_destination is None
+        else Path(failure_destination).expanduser().resolve()
+    )
+    if failure_output is not None:
+        if failure_output.exists():
+            raise FileExistsError(
+                "refusing to overwrite geodetic failure evidence: "
+                f"{failure_output}"
+            )
+        if (
+            failure_output == output
+            or output in failure_output.parents
+            or failure_output in output.parents
+        ) or any(
+            failure_output == item or item in failure_output.parents
+            for item in immutable
+        ):
+            raise ArtifactError(
+                "geodetic failure evidence must be outside immutable inputs "
+                "and the result destination"
+            )
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = output.with_name(f".{output.name}.writing-{uuid.uuid4().hex}")
     staging.mkdir()
+    command: tuple[str, ...] | None = None
     try:
         for name in (
             "database.db",
@@ -5186,8 +5381,26 @@ def run_geodetic_submap_plan(
                 f"refusing to overwrite geodetic result: {output}"
             )
         publish_directory_noreplace(staging, output)
-    except BaseException:
+    except BaseException as exc:
+        failure_publish_error: BaseException | None = None
+        if failure_output is not None:
+            try:
+                _publish_geodetic_submap_failure(
+                    staging,
+                    failure_output,
+                    plan_root,
+                    output,
+                    exc,
+                    command,
+                )
+            except BaseException as publish_exc:
+                failure_publish_error = publish_exc
         shutil.rmtree(staging, ignore_errors=True)
+        if failure_publish_error is not None:
+            raise ArtifactError(
+                "submap failed and its requested failure evidence could not "
+                "be published"
+            ) from failure_publish_error
         raise
     return audited_geodetic_submap_result(
         output, _verified_plan_context=post_solve_plan_context
