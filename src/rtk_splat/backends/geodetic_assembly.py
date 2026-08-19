@@ -175,6 +175,16 @@ class GeodeticDiagnosticPolicy:
             )
 
 
+def _diagnostic_policy_record(
+    policy: GeodeticDiagnosticPolicy,
+) -> dict[str, Any]:
+    """Keep schema-1 diagnostic artifacts byte-semantically reproducible."""
+    record = asdict(policy)
+    if not policy.allow_sealed_auto_initialization_fallback:
+        record.pop("allow_sealed_auto_initialization_fallback")
+    return record
+
+
 @dataclass(frozen=True)
 class GeodeticAssemblyConfig:
     """Generic windowing, overlap, and final path policy."""
@@ -1419,7 +1429,7 @@ def _diagnostic_submap_assessment(
     production_failures = sorted(set(production_failures))
     structural_failures = sorted(set(structural_failures))
     production_passed = quality_production_passed and not production_failures
-    return {
+    assessment = {
         "schema_version": 1,
         "result": candidate["result"]["artifact"],
         "result_seal_sha256": candidate["result"]["result_seal_sha256"],
@@ -1428,7 +1438,6 @@ def _diagnostic_submap_assessment(
         "allowed_rtk_only_failed_checks": sorted(
             set(production_failures) & allowed
         ),
-        "allowed_diagnostic_execution_overrides": allowed_execution_overrides,
         "structural_failed_checks": structural_failures,
         "structurally_safe_for_diagnostic": not structural_failures,
         "refined_holdout_median_rtk_residual_m": float(median),
@@ -1436,8 +1445,18 @@ def _diagnostic_submap_assessment(
         "median_rtk_warning_exceeded": (
             float(median) > float(policy.median_rtk_warning_m)
         ),
-        "diagnostic_initialization_override": initialization_override,
     }
+    if initialization_override is not None:
+        assessment.update(
+            {
+                "schema_version": 2,
+                "allowed_diagnostic_execution_overrides": (
+                    allowed_execution_overrides
+                ),
+                "diagnostic_initialization_override": initialization_override,
+            }
+        )
+    return assessment
 
 
 def audited_geodetic_diagnostic_submap_result(
@@ -2609,7 +2628,7 @@ def _diagnostic_overlap_record(
         "kind": _DIAGNOSTIC_OVERLAP_KIND,
         "experimental": True,
         "artifact_class": "diagnostic_render_only",
-        "diagnostic_policy": asdict(diagnostic_policy),
+        "diagnostic_policy": _diagnostic_policy_record(diagnostic_policy),
         "production_passed": bool(production["passed"])
         and all(item["production_passed"] for item in submaps),
         "production_failed_synchronization_checks": synchronization_failures,
@@ -3042,7 +3061,7 @@ def _diagnostic_inventory_record(
         "production_publication_eligible": False,
         "assembly_plan": assembly["artifact"],
         "assembly_plan_seal_sha256": assembly["plan_seal_sha256"],
-        "policy": asdict(policy),
+        "policy": _diagnostic_policy_record(policy),
         "window_count": len(records),
         "selected_frame_count": assembly["selected_frame_count"],
         "all_windows_structurally_safe": True,
@@ -3056,14 +3075,17 @@ def _diagnostic_inventory_record(
             for item in records
             if item["assessment"]["median_rtk_warning_exceeded"]
         ],
-        "diagnostic_initialization_override_window_ids": [
-            item["window_id"]
-            for item in records
-            if item["assessment"]["diagnostic_initialization_override"]
-            is not None
-        ],
         "windows": records,
     }
+    override_ids = [
+        item["window_id"]
+        for item in records
+        if item["assessment"].get("diagnostic_initialization_override")
+        is not None
+    ]
+    if override_ids:
+        record["schema_version"] = 2
+        record["diagnostic_initialization_override_window_ids"] = override_ids
     return record, candidates
 
 
