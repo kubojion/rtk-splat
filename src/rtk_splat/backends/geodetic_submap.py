@@ -130,6 +130,13 @@ _QUALITY_WEIGHTS = (
     ("oracle", 0.00),
 )
 
+# COLMAP's default 16 degree initial triangulation angle is intentionally
+# conservative, but it can reject otherwise strong metric-rig pairs in slow,
+# forward-looking acquisitions.  This lower value is available only through
+# the explicitly sealed v6 initialization policy; normal plans retain COLMAP's
+# default and all post-solve physical trajectory gates remain authoritative.
+_LOW_PARALLAX_INITIAL_TRIANGULATION_ANGLE_DEG = 1.0
+
 
 def _fresh_refinement_config() -> RtkRefinementConfig:
     return RtkRefinementConfig(initialization_mode="fresh")
@@ -1901,6 +1908,72 @@ def _select_initial_pair_v5(
     }
 
 
+def _select_initial_pair_v6(
+    candidates: Sequence[PairCandidate],
+    selected_frame_ids: Sequence[int],
+    calibration_names: Sequence[str],
+    config: GeodeticSubmapConfig,
+    pair_sources: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal the robust v3 calibration pair with a low-parallax COLMAP gate.
+
+    The pair and angle are fixed before any solve.  Selection consumes only
+    retained two-view evidence, raw GNSS, covariance/status, and calibration
+    roles; held-out positions and finished visual-model evidence are absent.
+    """
+    source_pair = _select_initial_pair_v3(
+        candidates,
+        selected_frame_ids,
+        calibration_names,
+        config,
+        pair_sources,
+    )
+    threshold = _LOW_PARALLAX_INITIAL_TRIANGULATION_ANGLE_DEG
+    return {
+        "schema_version": 6,
+        "method": "deterministic_calibration_pair_low_parallax_v6",
+        "selection_owner": "sealed_raw_gnss_two_view_parallax_policy",
+        "explicit_image_ids": True,
+        "image_ids": list(source_pair["image_ids"]),
+        "image_names": list(source_pair["image_names"]),
+        "frame_ids": list(source_pair["frame_ids"]),
+        "frame_indices": list(source_pair["frame_indices"]),
+        "selection_indices": list(source_pair["selection_indices"]),
+        "cameras": list(source_pair["cameras"]),
+        "timestamps_ns": list(source_pair["timestamps_ns"]),
+        "pair_id": int(source_pair["pair_id"]),
+        "raw_matches": int(source_pair["raw_matches"]),
+        "verified_matches": int(source_pair["verified_matches"]),
+        "required_verified_matches": int(
+            source_pair["required_verified_matches"]
+        ),
+        "pair_retention_reason": str(source_pair["pair_retention_reason"]),
+        "required_boundary_margin_frames": int(
+            source_pair["required_boundary_margin_frames"]
+        ),
+        "actual_boundary_margin_frames": int(
+            source_pair["actual_boundary_margin_frames"]
+        ),
+        "raw_gnss_evidence": source_pair["raw_gnss_evidence"],
+        "sealed_two_view_geometry": source_pair[
+            "sealed_two_view_geometry"
+        ],
+        "sealed_parallax_evidence": source_pair[
+            "sealed_parallax_evidence"
+        ],
+        "score": source_pair["score"],
+        "mapper_init_min_tri_angle_deg": threshold,
+        "colmap_default_init_min_tri_angle_deg": 16.0,
+        "calibration_position_priors_physically_present": True,
+        "heldout_position_priors_available_to_selector": False,
+        "decision_inputs_exclude": [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+
+
 def _select_initial_pair_for_method(
     method: str,
     candidates: Sequence[PairCandidate],
@@ -1933,6 +2006,14 @@ def _select_initial_pair_for_method(
         return _select_initial_pair_v4(candidates, config)
     if method == "v5":
         return _select_initial_pair_v5(
+            candidates,
+            selected_frame_ids,
+            calibration_names,
+            config,
+            pair_sources,
+        )
+    if method == "v6":
+        return _select_initial_pair_v6(
             candidates,
             selected_frame_ids,
             calibration_names,
@@ -3750,7 +3831,7 @@ def prepare_geodetic_submap_plan(
         raise ArtifactError("cached geodetic input context path changed")
     if _defer_full_reaudit_until_execution and _verified_input_context is None:
         raise ArtifactError("deferred re-audit requires a verified input context")
-    if _initial_pair_method not in {"v1", "v2", "v3", "v4", "v5"}:
+    if _initial_pair_method not in {"v1", "v2", "v3", "v4", "v5", "v6"}:
         raise ArtifactError("unsupported initial-pair method")
     selection_path, selection = _load_frame_selection(
         frame_selection, frontend, segment_path, manifest
@@ -3849,12 +3930,13 @@ def prepare_geodetic_submap_plan(
                 "sealed initial pair lacks private verified geometry evidence"
             )
         if (
-            _initial_pair_method == "v5"
-            and initial_pair["image_names"][0]
-            not in inventory["calibration_prior_names"]
+            _initial_pair_method in {"v5", "v6"}
+            and not set(initial_pair["image_names"])
+            <= set(inventory["calibration_prior_names"])
         ):
             raise ArtifactError(
-                "sealed initialization anchor lacks a private position prior"
+                "sealed calibration initialization image lacks a private "
+                "position prior"
             )
         calibration = _calibration_contract(
             staging / "database.db",
@@ -3931,7 +4013,7 @@ def prepare_geodetic_submap_plan(
                 "implementation": "existing_rtk_refinement_pose_prior_mapper",
                 "initialization_mode": "fresh",
                 "sealed_initial_pair": _initial_pair_method
-                in {"v1", "v2", "v3"},
+                in {"v1", "v2", "v3", "v6"},
                 "sealed_initial_anchor": _initial_pair_method == "v5",
                 "sealed_initialization_policy": True,
                 "colmap_auto_initial_pair": _initial_pair_method == "v4",
@@ -3954,6 +4036,15 @@ def prepare_geodetic_submap_plan(
                 "stock_colmap_strict_se3_only": False,
                 "internal_alignment": "Sim3_then_restore_database_rig_scale",
                 "scale_restored_from_fixed_rig": True,
+                **(
+                    {
+                        "initialization_min_triangulation_angle_deg": (
+                            initial_pair["mapper_init_min_tri_angle_deg"]
+                        )
+                    }
+                    if _initial_pair_method == "v6"
+                    else {}
+                ),
             },
         }
         _atomic_json(staging / "geodetic_submap_plan.json", plan)
@@ -4169,6 +4260,7 @@ def _plan_context(
             "deterministic_interior_raw_gnss_two_view_parallax_seed_v3": "v3",
             "deterministic_colmap_auto_filtered_database_v4": "v4",
             "deterministic_calibration_anchor_colmap_partner_v5": "v5",
+            "deterministic_calibration_pair_low_parallax_v6": "v6",
         }.get(str(plan.get("initial_pair", {}).get("method", "")))
         if initial_pair_method is None:
             raise ArtifactError("optimizer initial-pair method changed")
@@ -4189,12 +4281,13 @@ def _plan_context(
         ):
             raise ArtifactError("sealed mapper initial pair has no geometry")
         if (
-            initial_pair_method == "v5"
-            and expected_initial_pair["image_names"][0]
-            not in inventory.get("calibration_prior_names", ())
+            initial_pair_method in {"v5", "v6"}
+            and not set(expected_initial_pair["image_names"])
+            <= set(inventory.get("calibration_prior_names", ()))
         ):
             raise ArtifactError(
-                "sealed initialization anchor has no private position prior"
+                "sealed calibration initialization image has no private "
+                "position prior"
             )
     calibration = plan.get("calibration_contract")
     if not isinstance(calibration, Mapping):
@@ -4271,6 +4364,21 @@ def _plan_context(
             or optimizer.get("sealed_initialization_policy") not in {None, True}
         ):
             raise ArtifactError("optimizer initial-pair contract changed")
+        low_parallax = initial_pair_method == "v6"
+        recorded_angle = optimizer.get(
+            "initialization_min_triangulation_angle_deg"
+        )
+        if low_parallax:
+            if recorded_angle != expected_initial_pair[
+                "mapper_init_min_tri_angle_deg"
+            ]:
+                raise ArtifactError(
+                    "optimizer low-parallax initialization contract changed"
+                )
+        elif recorded_angle is not None:
+            raise ArtifactError(
+                "normal optimizer unexpectedly lowers initialization angle"
+            )
     # The seal is returned so result artifacts can bind the exact plan seal.
     return root, plan, config, mapper_config, {
         "source_quality": source_quality,
@@ -4334,6 +4442,16 @@ def _verify_mapper_command(
     anchored_initialization = (
         method == "deterministic_calibration_anchor_colmap_partner_v5"
     )
+    low_parallax_initialization = (
+        method == "deterministic_calibration_pair_low_parallax_v6"
+    )
+    if (
+        not low_parallax_initialization
+        and "--Mapper.init_min_tri_angle" in command
+    ):
+        raise ArtifactError(
+            "normal geodetic command unexpectedly lowers initialization angle"
+        )
     if auto_initialization:
         if any(
             option in command
@@ -4360,6 +4478,10 @@ def _verify_mapper_command(
                 "--Mapper.init_image_id2": str(initial_pair["image_ids"][1]),
             }
         )
+        if low_parallax_initialization:
+            expected["--Mapper.init_min_tri_angle"] = str(
+                initial_pair["mapper_init_min_tri_angle_deg"]
+            )
     for name, value in expected.items():
         if _option(command, name) != value:
             raise ArtifactError(f"fixed mapper contract violated by {name}")
@@ -4413,6 +4535,11 @@ def _build_geodetic_submap_command_from_context(
             "--Mapper.init_image_id2",
             str(plan["initial_pair"]["image_ids"][1]),
         )
+        if initial_method == "deterministic_calibration_pair_low_parallax_v6":
+            command += (
+                "--Mapper.init_min_tri_angle",
+                str(plan["initial_pair"]["mapper_init_min_tri_angle_deg"]),
+            )
     _verify_mapper_command(command, config, plan["initial_pair"])
     return command
 

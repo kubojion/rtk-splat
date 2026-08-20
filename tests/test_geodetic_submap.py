@@ -37,6 +37,7 @@ from rtk_splat.backends.geodetic_submap import (
     _select_initial_pair_v2,
     _select_initial_pair_v3,
     _select_initial_pair_v5,
+    _select_initial_pair_v6,
     _similarity_scale,
     audited_geodetic_submap_failure,
     build_geodetic_submap_command,
@@ -63,6 +64,7 @@ from rtk_splat.backends.geodetic_assembly import (
     audited_geodetic_diagnostic_result_inventory,
     audited_geodetic_diagnostic_submap_result,
     audited_geodetic_diagnostic_initialization_fallback_window,
+    audited_geodetic_diagnostic_low_parallax_fallback_window,
     audited_geodetic_full_pose_artifact,
     audited_geodetic_overlap_report,
     audited_geodetic_submap_pose_export,
@@ -70,6 +72,7 @@ from rtk_splat.backends.geodetic_assembly import (
     prepare_geodetic_assembly_plan,
     prepare_geodetic_assembly_window,
     prepare_geodetic_diagnostic_initialization_fallback_window,
+    prepare_geodetic_diagnostic_low_parallax_fallback_window,
     publish_geodetic_diagnostic_full_pose_artifact,
     publish_geodetic_diagnostic_overlap_report,
     publish_geodetic_diagnostic_result_inventory,
@@ -926,6 +929,18 @@ class GeodeticPairPolicyTests(unittest.TestCase):
                 GeodeticSubmapConfig(),
                 pair_sources,
             )
+            low_parallax = _select_initial_pair_v6(
+                [high_matches, stable],
+                list(range(12)),
+                [
+                    high_matches.first_image_name,
+                    high_matches.second_image_name,
+                    stable.first_image_name,
+                    stable.second_image_name,
+                ],
+                GeodeticSubmapConfig(),
+                pair_sources,
+            )
         self.assertEqual(selected["pair_id"], stable.pair_id)
         self.assertGreater(
             selected["sealed_parallax_evidence"]["median_angle_deg"], 20.0
@@ -940,6 +955,21 @@ class GeodeticPairPolicyTests(unittest.TestCase):
         self.assertEqual(
             anchored["source_pair_image_ids"],
             [stable.first_image_id, stable.second_image_id],
+        )
+        self.assertEqual(
+            low_parallax["image_ids"],
+            [stable.first_image_id, stable.second_image_id],
+        )
+        self.assertEqual(
+            low_parallax["method"],
+            "deterministic_calibration_pair_low_parallax_v6",
+        )
+        self.assertEqual(low_parallax["mapper_init_min_tri_angle_deg"], 1.0)
+        self.assertTrue(
+            low_parallax["calibration_position_priors_physically_present"]
+        )
+        self.assertFalse(
+            low_parallax["heldout_position_priors_available_to_selector"]
         )
 
 
@@ -2018,6 +2048,7 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                 str(local_plan["initial_pair"]["image_ids"][0]),
             )
             self.assertNotIn("--Mapper.init_image_id2", command)
+            self.assertNotIn("--Mapper.init_min_tri_angle", command)
             self.assertEqual(
                 local_plan["initial_pair"]["method"],
                 "deterministic_calibration_anchor_colmap_partner_v5",
@@ -2286,6 +2317,154 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
             _write_json(binding_path, binding)
             with self.assertRaisesRegex(ArtifactError, "binding changed"):
                 audited_geodetic_diagnostic_initialization_fallback_window(
+                    assembly_plan, fallback["workspace"]
+                )
+
+    def test_diagnostic_low_parallax_fallback_is_calibration_only_and_sealed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, assembly_plan, audited, _, results = self._completed_assembly(root)
+            window = audited["windows"][0]
+            primary = prepare_geodetic_assembly_window(
+                assembly_plan,
+                window["window_id"],
+                root / "low-parallax-primary-failed-window",
+            )
+            primary_plan = json.loads(
+                (
+                    Path(primary["plan"]) / "geodetic_submap_plan.json"
+                ).read_text(encoding="utf-8")
+            )
+            colmap = Path(primary_plan["colmap"]["executable"])
+            failure_path = Path(primary["workspace"]) / "failure"
+
+            def fail_without_sparse_model(command, attempt, _config):
+                (attempt / "colmap.log").write_text(
+                    "Finding good initial image pair\n"
+                    "No good initial image pair found.\n"
+                    "Failed to create any sparse model\n",
+                    encoding="utf-8",
+                )
+                (attempt / "resource_samples.csv").write_text(
+                    "elapsed_s,pid\n0.0,1\n", encoding="utf-8"
+                )
+                _write_json(
+                    attempt / "resource_usage.json",
+                    {
+                        "schema_version": 1,
+                        "returncode": 1,
+                        "safety_aborted": False,
+                    },
+                )
+                raise subprocess.CalledProcessError(1, list(command))
+
+            with mock.patch(
+                "rtk_splat.backends.geodetic_submap._run_monitored_mapper",
+                side_effect=fail_without_sparse_model,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    run_geodetic_submap_plan(
+                        primary["plan"],
+                        primary["result"],
+                        colmap,
+                        failure_destination=failure_path,
+                    )
+            fallback = (
+                prepare_geodetic_diagnostic_low_parallax_fallback_window(
+                    assembly_plan,
+                    window["window_id"],
+                    failure_path,
+                    root / "low-parallax-fallback-window",
+                )
+            )
+            verified = (
+                audited_geodetic_diagnostic_low_parallax_fallback_window(
+                    assembly_plan, fallback["workspace"]
+                )
+            )
+            self.assertEqual(verified, fallback)
+            fallback_plan = json.loads(
+                (Path(fallback["plan"]) / "geodetic_submap_plan.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            initial = fallback_plan["initial_pair"]
+            self.assertEqual(
+                initial["method"],
+                "deterministic_calibration_pair_low_parallax_v6",
+            )
+            self.assertEqual(initial["mapper_init_min_tri_angle_deg"], 1.0)
+            self.assertTrue(
+                set(initial["image_names"])
+                <= set(window["calibration_names"])
+            )
+            self.assertFalse(
+                set(initial["image_names"]) & set(window["holdout_names"])
+            )
+            command = build_geodetic_submap_command(
+                fallback["plan"], root / "low-parallax-command", colmap
+            )
+            self.assertEqual(
+                command[command.index("--Mapper.init_min_tri_angle") + 1],
+                "1.0",
+            )
+            self.assertEqual(
+                command[command.index("--Mapper.init_image_id1") + 1],
+                str(initial["image_ids"][0]),
+            )
+            self.assertEqual(
+                command[command.index("--Mapper.init_image_id2") + 1],
+                str(initial["image_ids"][1]),
+            )
+            runner = _Runner(list(fallback_plan["selected_image_names"]))
+            run_geodetic_submap_plan(
+                fallback["plan"],
+                fallback["result"],
+                colmap,
+                runner=runner,
+            )
+            with self.assertRaisesRegex(
+                ArtifactError,
+                "diagnostic_low_parallax_initialization_fallback",
+            ):
+                audited_geodetic_diagnostic_submap_result(fallback["result"])
+            policy = GeodeticDiagnosticPolicy(
+                allow_sealed_low_parallax_initialization_fallback=True
+            )
+            assessment = audited_geodetic_diagnostic_submap_result(
+                fallback["result"], policy=policy
+            )
+            self.assertFalse(assessment["production_passed"])
+            self.assertTrue(assessment["structurally_safe_for_diagnostic"])
+            self.assertEqual(
+                assessment["allowed_diagnostic_execution_overrides"],
+                ["diagnostic_low_parallax_initialization_fallback"],
+            )
+            inventory = publish_geodetic_diagnostic_result_inventory(
+                assembly_plan,
+                {
+                    window["window_id"]: fallback["result"],
+                    audited["windows"][1]["window_id"]: results[1],
+                },
+                root / "low-parallax-fallback-inventory",
+                policy=policy,
+            )
+            inventory_record = audited_geodetic_diagnostic_result_inventory(
+                inventory
+            )
+            self.assertEqual(
+                inventory_record[
+                    "diagnostic_initialization_override_window_ids"
+                ],
+                [window["window_id"]],
+            )
+
+            binding_path = Path(fallback["workspace"]) / "window_binding.json"
+            binding = json.loads(binding_path.read_text(encoding="utf-8"))
+            binding["fallback_mapper_init_min_tri_angle_deg"] = 2.0
+            _write_json(binding_path, binding)
+            with self.assertRaisesRegex(ArtifactError, "binding changed"):
+                audited_geodetic_diagnostic_low_parallax_fallback_window(
                     assembly_plan, fallback["workspace"]
                 )
 
@@ -2712,6 +2891,10 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
         diagnostic_help = launcher_help[paths[2]]
         self.assertIn("--reuse", diagnostic_help)
         self.assertIn("--resume", diagnostic_help)
+        self.assertIn(
+            "--allow-sealed-low-parallax-initialization-fallback",
+            diagnostic_help,
+        )
         launcher = paths[1].read_text(encoding="utf-8")
         self.assertIn("ProcessPoolExecutor", launcher)
         self.assertIn('get_context("spawn")', launcher)

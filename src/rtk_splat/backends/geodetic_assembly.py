@@ -149,6 +149,7 @@ class GeodeticDiagnosticPolicy:
         "heldout_rtk_absolute_gates",
     )
     allow_sealed_auto_initialization_fallback: bool = False
+    allow_sealed_low_parallax_initialization_fallback: bool = False
 
     def __post_init__(self) -> None:
         warning = float(self.median_rtk_warning_m)
@@ -173,6 +174,13 @@ class GeodeticDiagnosticPolicy:
             raise ValueError(
                 "allow_sealed_auto_initialization_fallback must be boolean"
             )
+        if not isinstance(
+            self.allow_sealed_low_parallax_initialization_fallback, bool
+        ):
+            raise ValueError(
+                "allow_sealed_low_parallax_initialization_fallback must be "
+                "boolean"
+            )
 
 
 def _diagnostic_policy_record(
@@ -182,6 +190,8 @@ def _diagnostic_policy_record(
     record = asdict(policy)
     if not policy.allow_sealed_auto_initialization_fallback:
         record.pop("allow_sealed_auto_initialization_fallback")
+    if not policy.allow_sealed_low_parallax_initialization_fallback:
+        record.pop("allow_sealed_low_parallax_initialization_fallback")
     return record
 
 
@@ -900,6 +910,8 @@ def _diagnostic_fallback_binding_record(
     window: Mapping[str, Any],
     root: Path,
     primary_failure: str | Path,
+    *,
+    expected_fallback_method: str | None = None,
 ) -> dict[str, Any]:
     runtime_context = assembly.get("_runtime_context")
     failure = audited_geodetic_submap_failure(
@@ -954,10 +966,20 @@ def _diagnostic_fallback_binding_record(
     )
     fallback_plan = fallback_context[1]
     fallback_split = _json(plan_path / "prior_split.json")
+    fallback_method = str(
+        fallback_plan.get("initial_pair", {}).get("method", "")
+    )
+    allowed_fallback_methods = {
+        "deterministic_colmap_auto_filtered_database_v4",
+        "deterministic_calibration_pair_low_parallax_v6",
+    }
     if (
         fallback_plan.get("selected_frame_ids") != window["frame_ids"]
-        or fallback_plan.get("initial_pair", {}).get("method")
-        != "deterministic_colmap_auto_filtered_database_v4"
+        or fallback_method not in allowed_fallback_methods
+        or (
+            expected_fallback_method is not None
+            and fallback_method != expected_fallback_method
+        )
         or fallback_split.get("calibration_names")
         != window["calibration_names"]
         or fallback_split.get("holdout_names") != window["holdout_names"]
@@ -973,7 +995,7 @@ def _diagnostic_fallback_binding_record(
         raise ArtifactError(
             "diagnostic fallback plan differs from the assembly window"
         )
-    return {
+    binding = {
         "schema_version": 2,
         "kind": _DIAGNOSTIC_FALLBACK_BINDING_KIND,
         "diagnostic_only": True,
@@ -990,7 +1012,7 @@ def _diagnostic_fallback_binding_record(
         "primary_submap_plan": str(primary_plan_root),
         "primary_submap_plan_seal_sha256": failure["plan_seal_sha256"],
         "primary_initialization_method": primary_plan["initial_pair"]["method"],
-        "fallback_initialization_method": fallback_plan["initial_pair"]["method"],
+        "fallback_initialization_method": fallback_method,
         "fallback_reason": "sealed_primary_anchor_could_not_create_sparse_model",
         "decision_inputs_exclude": [
             "finished_visual_model_pose",
@@ -998,17 +1020,37 @@ def _diagnostic_fallback_binding_record(
             "heldout_evaluation_result",
         ],
     }
+    if fallback_method == "deterministic_calibration_pair_low_parallax_v6":
+        initial_pair = fallback_plan["initial_pair"]
+        binding.update(
+            {
+                "schema_version": 3,
+                "fallback_reason": (
+                    "sealed_primary_anchor_could_not_create_sparse_model_"
+                    "calibration_pair_low_parallax_retry"
+                ),
+                "fallback_pair_id": int(initial_pair["pair_id"]),
+                "fallback_pair_image_ids": list(initial_pair["image_ids"]),
+                "fallback_pair_frame_ids": list(initial_pair["frame_ids"]),
+                "fallback_mapper_init_min_tri_angle_deg": float(
+                    initial_pair["mapper_init_min_tri_angle_deg"]
+                ),
+                "fallback_pair_calibration_priors_physically_present": True,
+            }
+        )
+    return binding
 
 
-def prepare_geodetic_diagnostic_initialization_fallback_window(
+def _prepare_geodetic_diagnostic_initialization_fallback_window(
     assembly_plan: str | Path,
     window_id: str,
     primary_failure: str | Path,
     workspace: str | Path,
     *,
+    _initial_pair_method: str,
     _audited_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
-    """Prepare a sealed diagnostic-only COLMAP auto-initialization fallback."""
+    """Prepare one sealed diagnostic-only initialization fallback."""
     assembly_path = Path(assembly_plan).expanduser().resolve()
     assembly = (
         dict(_audited_plan)
@@ -1060,10 +1102,17 @@ def prepare_geodetic_diagnostic_initialization_fallback_window(
             config=assembly["config_object"].submap_config,
             _verified_input_context=assembly["_runtime_context"],
             _defer_full_reaudit_until_execution=True,
-            _initial_pair_method="v4",
+            _initial_pair_method=_initial_pair_method,
         )
         binding = _diagnostic_fallback_binding_record(
-            assembly, window, root, primary_failure
+            assembly,
+            window,
+            root,
+            primary_failure,
+            expected_fallback_method={
+                "v4": "deterministic_colmap_auto_filtered_database_v4",
+                "v6": "deterministic_calibration_pair_low_parallax_v6",
+            }.get(_initial_pair_method),
         )
         _atomic_json(root / "window_binding.json", binding)
     except BaseException:
@@ -1078,10 +1127,49 @@ def prepare_geodetic_diagnostic_initialization_fallback_window(
     }
 
 
-def audited_geodetic_diagnostic_initialization_fallback_window(
+def prepare_geodetic_diagnostic_initialization_fallback_window(
+    assembly_plan: str | Path,
+    window_id: str,
+    primary_failure: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Prepare the legacy sealed diagnostic COLMAP-auto fallback."""
+    return _prepare_geodetic_diagnostic_initialization_fallback_window(
+        assembly_plan,
+        window_id,
+        primary_failure,
+        workspace,
+        _initial_pair_method="v4",
+        _audited_plan=_audited_plan,
+    )
+
+
+def prepare_geodetic_diagnostic_low_parallax_fallback_window(
+    assembly_plan: str | Path,
+    window_id: str,
+    primary_failure: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Prepare a sealed calibration-only low-parallax pair fallback."""
+    return _prepare_geodetic_diagnostic_initialization_fallback_window(
+        assembly_plan,
+        window_id,
+        primary_failure,
+        workspace,
+        _initial_pair_method="v6",
+        _audited_plan=_audited_plan,
+    )
+
+
+def _audited_geodetic_diagnostic_initialization_fallback_window(
     assembly_plan: str | Path,
     workspace: str | Path,
     *,
+    _expected_fallback_method: str,
     _audited_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     """Verify a prepared diagnostic initialization fallback without mutation."""
@@ -1109,6 +1197,7 @@ def audited_geodetic_diagnostic_initialization_fallback_window(
         window,
         root,
         str(binding.get("primary_failure_artifact", "")),
+        expected_fallback_method=_expected_fallback_method,
     )
     if binding != expected:
         raise ArtifactError("diagnostic fallback binding changed")
@@ -1119,6 +1208,40 @@ def audited_geodetic_diagnostic_initialization_fallback_window(
         "result": str(root / "result"),
         "window_id": str(window["window_id"]),
     }
+
+
+def audited_geodetic_diagnostic_initialization_fallback_window(
+    assembly_plan: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Verify the sealed diagnostic COLMAP-auto fallback without mutation."""
+    return _audited_geodetic_diagnostic_initialization_fallback_window(
+        assembly_plan,
+        workspace,
+        _expected_fallback_method=(
+            "deterministic_colmap_auto_filtered_database_v4"
+        ),
+        _audited_plan=_audited_plan,
+    )
+
+
+def audited_geodetic_diagnostic_low_parallax_fallback_window(
+    assembly_plan: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Verify the sealed low-parallax calibration-pair fallback."""
+    return _audited_geodetic_diagnostic_initialization_fallback_window(
+        assembly_plan,
+        workspace,
+        _expected_fallback_method=(
+            "deterministic_calibration_pair_low_parallax_v6"
+        ),
+        _audited_plan=_audited_plan,
+    )
 
 
 def _atomic_save_npy(path: Path, value: np.ndarray) -> None:
@@ -1331,19 +1454,28 @@ def _diagnostic_initialization_override(
     binding = _json(binding_path)
     if binding.get("schema_version") == 1:
         return None
+    fallback_method = str(binding.get("fallback_initialization_method", ""))
+    if binding.get("schema_version") == 2:
+        expected_method = "deterministic_colmap_auto_filtered_database_v4"
+        expected_reason = "sealed_primary_anchor_could_not_create_sparse_model"
+    elif binding.get("schema_version") == 3:
+        expected_method = "deterministic_calibration_pair_low_parallax_v6"
+        expected_reason = (
+            "sealed_primary_anchor_could_not_create_sparse_model_"
+            "calibration_pair_low_parallax_retry"
+        )
+    else:
+        raise ArtifactError("diagnostic initialization override binding is invalid")
     if (
-        binding.get("schema_version") != 2
-        or binding.get("kind") != _DIAGNOSTIC_FALLBACK_BINDING_KIND
+        binding.get("kind") != _DIAGNOSTIC_FALLBACK_BINDING_KIND
         or binding.get("diagnostic_only") is not True
         or binding.get("production_publication_eligible") is not False
         or binding.get("primary_failure_classification")
         != "initialization_exhausted_without_sparse_model"
         or binding.get("primary_initialization_method")
         != "deterministic_calibration_anchor_colmap_partner_v5"
-        or binding.get("fallback_initialization_method")
-        != "deterministic_colmap_auto_filtered_database_v4"
-        or binding.get("fallback_reason")
-        != "sealed_primary_anchor_could_not_create_sparse_model"
+        or fallback_method != expected_method
+        or binding.get("fallback_reason") != expected_reason
         or binding.get("decision_inputs_exclude")
         != [
             "finished_visual_model_pose",
@@ -1355,11 +1487,35 @@ def _diagnostic_initialization_override(
     result_plan = candidate["plan"]
     if (
         result_plan.get("initial_pair", {}).get("method")
-        != binding["fallback_initialization_method"]
+        != fallback_method
         or binding.get("submap_plan_seal_sha256")
         != candidate["result"]["plan_seal_sha256"]
     ):
         raise ArtifactError("diagnostic initialization override plan changed")
+    if binding.get("schema_version") == 3:
+        initial_pair = result_plan["initial_pair"]
+        if (
+            binding.get("fallback_pair_id") != initial_pair.get("pair_id")
+            or binding.get("fallback_pair_image_ids")
+            != initial_pair.get("image_ids")
+            or binding.get("fallback_pair_frame_ids")
+            != initial_pair.get("frame_ids")
+            or binding.get("fallback_mapper_init_min_tri_angle_deg")
+            != initial_pair.get("mapper_init_min_tri_angle_deg")
+            or binding.get(
+                "fallback_pair_calibration_priors_physically_present"
+            )
+            is not True
+            or initial_pair.get(
+                "calibration_position_priors_physically_present"
+            )
+            is not True
+            or initial_pair.get("heldout_position_priors_available_to_selector")
+            is not False
+        ):
+            raise ArtifactError(
+                "diagnostic low-parallax initialization binding changed"
+            )
     failure = audited_geodetic_submap_failure(
         str(binding.get("primary_failure_artifact", ""))
     )
@@ -1385,7 +1541,7 @@ def _diagnostic_initialization_override(
         "primary_failure_seal_sha256": failure["failure_seal_sha256"],
         "primary_failure_classification": failure["failure_classification"],
         "primary_initialization_method": binding["primary_initialization_method"],
-        "fallback_initialization_method": binding["fallback_initialization_method"],
+        "fallback_initialization_method": fallback_method,
         "fallback_reason": binding["fallback_reason"],
     }
 
@@ -1420,9 +1576,19 @@ def _diagnostic_submap_assessment(
     allowed_execution_overrides: list[str] = []
     production_failures = list(quality_production_failures)
     if initialization_override is not None:
-        marker = "diagnostic_auto_initialization_fallback"
+        marker = (
+            "diagnostic_auto_initialization_fallback"
+            if initialization_override["fallback_initialization_method"]
+            == "deterministic_colmap_auto_filtered_database_v4"
+            else "diagnostic_low_parallax_initialization_fallback"
+        )
         production_failures.append(marker)
-        if policy.allow_sealed_auto_initialization_fallback:
+        allowed_by_policy = (
+            policy.allow_sealed_auto_initialization_fallback
+            if marker == "diagnostic_auto_initialization_fallback"
+            else policy.allow_sealed_low_parallax_initialization_fallback
+        )
+        if allowed_by_policy:
             allowed_execution_overrides.append(marker)
         else:
             structural_failures.append(marker)
@@ -3024,6 +3190,12 @@ def _diagnostic_inventory_record(
             raise ArtifactError(f"{window_id} binding changed")
         if binding.get("schema_version") == 2:
             audited_geodetic_diagnostic_initialization_fallback_window(
+                assembly["artifact"],
+                workspace,
+                _audited_plan=assembly,
+            )
+        elif binding.get("schema_version") == 3:
+            audited_geodetic_diagnostic_low_parallax_fallback_window(
                 assembly["artifact"],
                 workspace,
                 _audited_plan=assembly,
