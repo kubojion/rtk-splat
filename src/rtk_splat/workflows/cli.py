@@ -480,6 +480,8 @@ def cmd_tiles_plan(cfg, args) -> None:
     if getattr(args, "pose_artifact_root", None) is not None:
         cfg.pose.artifact_root = args.pose_artifact_root.expanduser()
     tiles = _section(cfg, "tiles")
+    if getattr(args, "tile_max_tiles", None) is not None:
+        tiles.max_tiles = int(args.tile_max_tiles)
     name = str(
         args.tile_plan_name
         or getattr(tiles, "name", None)
@@ -758,6 +760,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="explicit tile count for a controlled tiles-plan experiment",
     )
+    parser.add_argument(
+        "--tile-max-tiles",
+        type=int,
+        help=(
+            "explicit audited ceiling for automatic tiles-plan partitioning; "
+            "does not change per-tile training capacity"
+        ),
+    )
     parser.add_argument("--run-name")
     parser.add_argument(
         "--scene-tile-run",
@@ -818,7 +828,7 @@ def _stage_overrides(args) -> dict[str, Any]:
         "feature_profile", "keyframe_preset", "backend", "backend_name",
         "refinement_name", "initialization_mode", "prior_position_loss",
         "pose_name", "run_name", "train_iters", "expected_frames",
-        "pose_artifact_root", "tile_plan_name", "tile_count",
+        "pose_artifact_root", "tile_plan_name", "tile_count", "tile_max_tiles",
         "tile_plan", "tile_id",
         "scene_tile_run", "scene_name", "scene_mode", "reference_run",
         "reference_params_sha256", "reference_metrics_sha256",
@@ -883,6 +893,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--expected-frames must be positive")
     if args.tile_count is not None and args.tile_count <= 0:
         raise ValueError("--tile-count must be positive")
+    if args.tile_max_tiles is not None and not 1 <= args.tile_max_tiles <= 4096:
+        raise ValueError("--tile-max-tiles must be in [1, 4096]")
     if args.stage == "segment-materialize" and args.portable_segment is None:
         raise ValueError("segment-materialize requires --portable-segment")
     if args.stage != "segment-materialize" and args.portable_segment is not None:
@@ -891,12 +903,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.stage != "segment-materialize" and args.link_mode is not None:
         raise ValueError("--link-mode is valid only for segment-materialize")
-    plan_only = ("tile_plan_name", "tile_count")
+    plan_only = ("tile_plan_name", "tile_count", "tile_max_tiles")
     if args.stage != "tiles-plan" and any(
         getattr(args, name) is not None for name in plan_only
     ):
         raise ValueError(
-            "--tile-plan-name and --tile-count are "
+            "--tile-plan-name, --tile-count, and --tile-max-tiles are "
             "valid only for tiles-plan"
         )
     if (
