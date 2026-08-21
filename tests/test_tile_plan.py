@@ -15,6 +15,7 @@ from rtk_splat.core.segment import (
 )
 from rtk_splat.workflows.tiles import (
     _complete_core_training_coverage,
+    _training_core_support,
     build_tile_plan,
     load_tile_execution,
     owner_tile_indices,
@@ -280,6 +281,24 @@ def _diagnostic_pose(reader: SegmentReader, parent: Path, name: str) -> Path:
 
 
 class TilePlanTests(unittest.TestCase):
+    def test_training_coverage_excludes_heldout_only_support(self):
+        support = [
+            np.asarray([[0.5, 0.5]], dtype=np.float64),
+            np.asarray([[1.5, 0.5]], dtype=np.float64),
+        ]
+        core = np.asarray([[0.0, 0.0], [2.0, 1.0]], dtype=np.float64)
+        selected = np.asarray([True, True])
+        split_codes = np.asarray([0, 1], dtype=np.uint8)
+        all_core, train_coverable, covered, coverage = (
+            _training_core_support(
+                support, core, selected, split_codes
+            )
+        )
+        self.assertEqual(len(all_core), 2)
+        self.assertEqual(train_coverable.tolist(), [[0.5, 0.5]])
+        self.assertEqual(covered.tolist(), [[0.5, 0.5]])
+        self.assertEqual(coverage, 1.0)
+
     def test_core_coverage_completion_is_bounded_and_deterministic(self):
         support = [
             np.asarray([[0.5, 0.5]], dtype=np.float64),
@@ -486,6 +505,29 @@ class TilePlanTests(unittest.TestCase):
             np.savez_compressed(visibility_path, **arrays)
             _reseal(artifact, "visibility.npz")
             with self.assertRaisesRegex(ValueError, "coverage-completion"):
+                verify_tile_plan(artifact)
+
+    def test_resealed_training_coverage_reference_tampering_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reader = _segment(root / "segment")
+            artifact = build_tile_plan(
+                reader,
+                _cfg(root / "work"),
+                name="coverage-reference",
+                output_root=root / "work",
+                tile_count=2,
+            )
+            plan_path = artifact / "tile_plan.json"
+            plan = json.loads(plan_path.read_text())
+            plan["tiles"][0]["summary"][
+                "n_train_coverable_core_support_cells"
+            ] += 1
+            plan_path.write_text(
+                json.dumps(plan, indent=2, sort_keys=True) + "\n"
+            )
+            _reseal(artifact, "tile_plan.json")
+            with self.assertRaisesRegex(ValueError, "tile summary"):
                 verify_tile_plan(artifact)
 
     def test_live_depth_mutation_is_detected(self):

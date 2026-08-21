@@ -673,13 +673,54 @@ def _support_coverage(reference: np.ndarray, covered: np.ndarray) -> float:
     )
 
 
-_COVERAGE_COMPLETION = {
+_COVERAGE_COMPLETION_V1 = {
     "method": "greedy_missing_core_support_v1",
     "split": "train",
     "candidate_scope": "unselected_training_frames_with_core_support",
     "ranking": "maximum_new_core_cells_then_lowest_frame_id",
     "capacity": "never_exceed_max_training_frames",
 }
+
+_COVERAGE_COMPLETION = {
+    "method": "greedy_missing_train_coverable_core_support_v2",
+    "split": "train",
+    "reference_scope": (
+        "unique_core_support_cells_observable_by_source_train_split"
+    ),
+    "heldout_support": "audited_but_never_required_for_training_coverage",
+    "candidate_scope": "unselected_training_frames_with_core_support",
+    "ranking": "maximum_new_core_cells_then_lowest_frame_id",
+    "capacity": "never_exceed_max_training_frames",
+}
+
+
+def _training_core_support(
+    support: Sequence[np.ndarray],
+    core: np.ndarray,
+    selected: np.ndarray,
+    split_codes: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Return all, train-coverable, selected-train support and its coverage.
+
+    Validation/test observations must remain useful for evaluation without
+    making a training-coverage gate mathematically impossible.  The coverage
+    denominator is therefore exactly the core support observable by at least
+    one source-training frame; held-out-only cells remain separately auditable.
+    """
+    chosen = np.asarray(selected, dtype=bool)
+    codes = np.asarray(split_codes, dtype=np.uint8)
+    if chosen.shape != codes.shape or chosen.shape != (len(support),):
+        raise ValueError("training-support inputs have inconsistent shapes")
+    train = codes == _SPLIT_CODE["train"]
+    all_core = _unique_support(support, core)
+    train_coverable = _unique_support(support, core, train)
+    selected_train = _unique_support(support, core, chosen & train)
+    return (
+        all_core,
+        train_coverable,
+        selected_train,
+        _support_coverage(train_coverable, selected_train),
+    )
 
 
 def _complete_core_training_coverage(
@@ -690,6 +731,7 @@ def _complete_core_training_coverage(
     *,
     max_training_frames: int,
     minimum_coverage: float,
+    train_coverable_reference: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add the fewest greedily useful train views needed for core coverage.
 
@@ -704,15 +746,18 @@ def _complete_core_training_coverage(
     if result.shape != codes.shape or result.shape != (len(support),):
         raise ValueError("coverage completion inputs have inconsistent shapes")
     added = np.zeros(len(support), dtype=bool)
-    reference_array = _unique_support(support, core)
+    train = codes == _SPLIT_CODE["train"]
+    reference_array = _unique_support(
+        support,
+        core,
+        train if train_coverable_reference else None,
+    )
     if len(reference_array) == 0:
         return result, added
     reference = {tuple(row) for row in reference_array.tolist()}
     required = int(
         math.ceil(float(minimum_coverage) * len(reference) - 1e-12)
     )
-    train = codes == _SPLIT_CODE["train"]
-
     def core_cells(frame_id: int) -> set[tuple[float, float]]:
         points = support[frame_id]
         if len(points) == 0:
@@ -1050,10 +1095,15 @@ def verify_tile_plan(
     ):
         raise ArtifactError("tile-plan schema or quality status is invalid")
     selection_record = plan.get("selection")
-    coverage_completion = selection_record == {
+    coverage_completion_v1 = selection_record == {
+        "primary": "configured_visibility_threshold_v1",
+        "coverage_completion": _COVERAGE_COMPLETION_V1,
+    }
+    coverage_completion_v2 = selection_record == {
         "primary": "configured_visibility_threshold_v1",
         "coverage_completion": _COVERAGE_COMPLETION,
     }
+    coverage_completion = coverage_completion_v1 or coverage_completion_v2
     if selection_record is not None and not coverage_completion:
         raise ArtifactError("tile-plan selection policy is unsupported")
     plan_name = str(plan.get("name", ""))
@@ -1286,6 +1336,7 @@ def verify_tile_plan(
                     minimum_coverage=(
                         policy.min_core_train_support_coverage
                     ),
+                    train_coverable_reference=coverage_completion_v2,
                 )
             )
         else:
@@ -1330,15 +1381,39 @@ def verify_tile_plan(
                 & (arrays["split_code"][rows] == _SPLIT_CODE["train"])
             )
         )
+        coverage_reference = unique_core
         summary_expected = {
             "n_core_visible_frames": int(np.sum(expected_core >= thresholds)),
             "n_core_visible_train_frames": core_visible_train,
             "n_unique_core_support_cells": int(len(unique_core)),
             "n_train_covered_core_support_cells": int(len(train_core)),
-            "train_core_support_coverage": _support_coverage(
-                unique_core, train_core
-            ),
         }
+        if coverage_completion_v2:
+            (
+                _,
+                train_coverable_core,
+                train_core,
+                train_support_coverage,
+            ) = _training_core_support(
+                support,
+                bounds,
+                expected_selected,
+                arrays["split_code"][rows],
+            )
+            coverage_reference = train_coverable_core
+            summary_expected.update({
+                "n_train_coverable_core_support_cells": int(
+                    len(train_coverable_core)
+                ),
+                "n_heldout_only_core_support_cells": int(
+                    len(unique_core) - len(train_coverable_core)
+                ),
+                "train_core_support_coverage": train_support_coverage,
+            })
+        else:
+            summary_expected["train_core_support_coverage"] = (
+                _support_coverage(coverage_reference, train_core)
+            )
         if coverage_completion:
             summary_expected.update({
                 "n_visibility_selected_train": int(np.sum(
@@ -1656,10 +1731,17 @@ def build_tile_plan(
             split: frame_ids[selected & (split_codes == code)].astype(int).tolist()
             for split, code in _SPLIT_CODE.items()
         }
-        unique_core = _unique_support(support, core)
-        selected_train = selected & (split_codes == _SPLIT_CODE["train"])
-        train_core = _unique_support(support, core, selected_train)
-        train_support_coverage = _support_coverage(unique_core, train_core)
+        (
+            unique_core,
+            train_coverable_core,
+            train_core,
+            train_support_coverage,
+        ) = _training_core_support(
+            support,
+            core,
+            selected,
+            split_codes,
+        )
         core_visible_train = int(
             np.sum(
                 (core_count >= thresholds)
@@ -1683,6 +1765,12 @@ def build_tile_plan(
                 "n_core_visible_frames": int(np.sum(core_count >= thresholds)),
                 "n_core_visible_train_frames": core_visible_train,
                 "n_unique_core_support_cells": int(len(unique_core)),
+                "n_train_coverable_core_support_cells": int(
+                    len(train_coverable_core)
+                ),
+                "n_heldout_only_core_support_cells": int(
+                    len(unique_core) - len(train_coverable_core)
+                ),
                 "n_train_covered_core_support_cells": int(len(train_core)),
                 "train_core_support_coverage": train_support_coverage,
             },
