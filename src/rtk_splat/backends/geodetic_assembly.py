@@ -81,6 +81,15 @@ _DIAGNOSTIC_INVENTORY_KIND = (
     "rtk_splat_geodetic_diagnostic_result_inventory"
 )
 _DIAGNOSTIC_OVERLAP_KIND = "rtk_splat_geodetic_diagnostic_overlap_report"
+_DIAGNOSTIC_ABSOLUTE_RTK_ONLY_SYNCHRONIZATION_FAILURES = frozenset(
+    {
+        "all_synchronized_heldout_rtk_absolute_gates",
+        "deduplicated_calibration_inlier_fraction",
+    }
+)
+_DIAGNOSTIC_ABSOLUTE_RTK_ONLY_TRAJECTORY_FAILURES = frozenset(
+    {"consecutive_calibration_prior_outliers"}
+)
 _PLAN_FILES = (
     "frame_selection.json",
     "geodetic_assembly_plan.json",
@@ -1996,6 +2005,16 @@ def _failed_authoritative_checks(
     )
 
 
+def _diagnostic_failure_partition(
+    checks: Mapping[str, Any],
+    absolute_rtk_only: frozenset[str],
+) -> tuple[list[str], list[str]]:
+    """Separate diagnostic-only absolute RTK failures from safety failures."""
+    failed = set(_failed_authoritative_checks(checks))
+    allowed = set(absolute_rtk_only)
+    return sorted(failed & allowed), sorted(failed - allowed)
+
+
 def _diagnostic_initialization_override(
     candidate: Mapping[str, Any],
 ) -> dict[str, Any] | None:
@@ -3312,7 +3331,11 @@ def _diagnostic_overlap_record(
     candidates: Sequence[Mapping[str, Any]],
     overlap_policy: GeodeticOverlapPolicy,
     diagnostic_policy: GeodeticDiagnosticPolicy,
+    *,
+    _diagnostic_acceptance_schema_version: int = 2,
 ) -> dict[str, Any]:
+    if _diagnostic_acceptance_schema_version not in {1, 2}:
+        raise ArtifactError("unsupported diagnostic overlap acceptance schema")
     production = _evaluate_overlap_candidates(candidates, overlap_policy)
     submaps = [
         _diagnostic_submap_assessment(candidate, diagnostic_policy)
@@ -3331,9 +3354,15 @@ def _diagnostic_overlap_record(
     synchronization_failures = _failed_authoritative_checks(
         synchronization["checks"]
     )
-    allowed_sync_failure = "all_synchronized_heldout_rtk_absolute_gates"
-    structural_sync_failures = sorted(
-        set(synchronization_failures) - {allowed_sync_failure}
+    absolute_rtk_only_sync_failures, structural_sync_failures = (
+        _diagnostic_failure_partition(
+            synchronization["checks"],
+            (
+                frozenset({"all_synchronized_heldout_rtk_absolute_gates"})
+                if _diagnostic_acceptance_schema_version == 1
+                else _DIAGNOSTIC_ABSOLUTE_RTK_ONLY_SYNCHRONIZATION_FAILURES
+            ),
+        )
     )
     fixed_metric_contract = bool(
         synchronization.get("production_scale") == 1.0
@@ -3395,8 +3424,8 @@ def _diagnostic_overlap_record(
             }
         )
     structurally_safe = _authoritative_checks_pass(structural_checks)
-    return {
-        "schema_version": 1,
+    record = {
+        "schema_version": _diagnostic_acceptance_schema_version,
         "kind": _DIAGNOSTIC_OVERLAP_KIND,
         "experimental": True,
         "artifact_class": "diagnostic_render_only",
@@ -3411,6 +3440,11 @@ def _diagnostic_overlap_record(
         "structurally_safe_for_diagnostic": structurally_safe,
         "production_evaluation": production,
     }
+    if _diagnostic_acceptance_schema_version >= 2:
+        record[
+            "diagnostic_absolute_rtk_only_synchronization_failed_checks"
+        ] = absolute_rtk_only_sync_failures
+    return record
 
 
 def publish_geodetic_diagnostic_overlap_report(
@@ -3515,6 +3549,9 @@ def audited_geodetic_diagnostic_overlap_report(
     recorded = _json(root / "diagnostic_overlap.json")
     if recorded.get("kind") != _DIAGNOSTIC_OVERLAP_KIND:
         raise ArtifactError("invalid diagnostic overlap report")
+    schema_version = recorded.get("schema_version")
+    if schema_version not in {1, 2}:
+        raise ArtifactError("unsupported diagnostic overlap report schema")
     production = recorded.get("production_evaluation", {})
     paths: list[str] = []
     for pair in production.get("pairs", []):
@@ -3550,6 +3587,7 @@ def audited_geodetic_diagnostic_overlap_report(
         GeodeticDiagnosticPolicy(
             **dict(recorded.get("diagnostic_policy", {}))
         ),
+        _diagnostic_acceptance_schema_version=schema_version,
     )
     if expected != recorded:
         raise ArtifactError("diagnostic overlap report content changed")
@@ -4056,7 +4094,11 @@ def _direct_rtk_evaluation(
 
 def _diagnostic_full_pose_evidence(
     inventory: Mapping[str, Any],
+    *,
+    _diagnostic_acceptance_schema_version: int = 2,
 ) -> dict[str, Any]:
+    if _diagnostic_acceptance_schema_version not in {1, 2}:
+        raise ArtifactError("unsupported diagnostic pose acceptance schema")
     assembly = inventory["_assembly"]
     candidates = inventory["_candidates"]
     synchronized, synchronization = _synchronize_candidates(
@@ -4075,6 +4117,9 @@ def _diagnostic_full_pose_evidence(
         candidates,
         assembly["config_object"].overlap_policy,
         GeodeticDiagnosticPolicy(**dict(inventory["policy"])),
+        _diagnostic_acceptance_schema_version=(
+            _diagnostic_acceptance_schema_version
+        ),
     )
     (
         frontend,
@@ -4277,11 +4322,18 @@ def _diagnostic_full_pose_evidence(
         )
         for candidate in candidates
     ]
-    trajectory_structural_passed = all(
-        check.get("passed") is True
-        for check in trajectory["checks"].values()
-        if check.get("authoritative", True)
+    (
+        absolute_rtk_only_trajectory_failures,
+        structural_trajectory_failures,
+    ) = _diagnostic_failure_partition(
+        trajectory["checks"],
+        (
+            frozenset()
+            if _diagnostic_acceptance_schema_version == 1
+            else _DIAGNOSTIC_ABSOLUTE_RTK_ONLY_TRAJECTORY_FAILURES
+        ),
     )
+    trajectory_structural_passed = not structural_trajectory_failures
     structural_checks = {
         "all_submaps_structurally_safe": {
             "value": all(
@@ -4358,6 +4410,15 @@ def _diagnostic_full_pose_evidence(
         "synchronization": synchronization,
         "production_overlap": production_overlap,
         "diagnostic_overlap": diagnostic_overlap,
+        "diagnostic_acceptance_schema_version": (
+            _diagnostic_acceptance_schema_version
+        ),
+        "diagnostic_absolute_rtk_only_trajectory_failed_checks": (
+            absolute_rtk_only_trajectory_failures
+        ),
+        "diagnostic_structural_trajectory_failed_checks": (
+            structural_trajectory_failures
+        ),
         "production_checks": production_checks,
         "structural_checks": structural_checks,
         "submap_assessments": submap_assessments,
@@ -4400,8 +4461,9 @@ def _diagnostic_pose_quality_record(
     status: Mapping[str, Any],
 ) -> dict[str, Any]:
     counts = np.asarray(evidence["contributor_counts"], dtype=np.int64)
-    return {
-        "schema_version": 3,
+    acceptance_schema = int(evidence["diagnostic_acceptance_schema_version"])
+    record = {
+        "schema_version": 3 if acceptance_schema == 1 else 4,
         **status,
         "stage": "geodetic_submap_diagnostic_assembly_quality",
         "passed": bool(evidence["production_passed"]),
@@ -4436,6 +4498,16 @@ def _diagnostic_pose_quality_record(
             "maximum": int(counts.max()),
         },
     }
+    if acceptance_schema >= 2:
+        record[
+            "diagnostic_absolute_rtk_only_trajectory_failed_checks"
+        ] = evidence[
+            "diagnostic_absolute_rtk_only_trajectory_failed_checks"
+        ]
+        record["diagnostic_structural_trajectory_failed_checks"] = evidence[
+            "diagnostic_structural_trajectory_failed_checks"
+        ]
+    return record
 
 
 def _diagnostic_pose_alignment_record(
@@ -5017,6 +5089,14 @@ def audited_geodetic_diagnostic_full_pose_artifact(
 ) -> dict[str, Any]:
     root = Path(artifact).expanduser().resolve()
     manifest = _verify_pose_artifact(root)
+    recorded_quality = _json(root / "quality.json")
+    quality_schema = recorded_quality.get("schema_version")
+    if quality_schema == 3:
+        acceptance_schema = 1
+    elif quality_schema == 4:
+        acceptance_schema = 2
+    else:
+        raise ArtifactError("unsupported diagnostic pose quality schema")
     georeferencing = verify_pose_georeferencing_artifact(
         root, expected_name=root.name
     )
@@ -5038,7 +5118,10 @@ def audited_geodetic_diagnostic_full_pose_artifact(
     inventory = audited_geodetic_diagnostic_result_inventory(
         inventory_root, _include_candidates=True
     )
-    evidence = _diagnostic_full_pose_evidence(inventory)
+    evidence = _diagnostic_full_pose_evidence(
+        inventory,
+        _diagnostic_acceptance_schema_version=acceptance_schema,
+    )
     if not evidence["structurally_safe"]:
         raise ArtifactError("diagnostic pose is no longer structurally safe")
     status = _diagnostic_status_record(evidence["production_passed"])
@@ -5060,7 +5143,7 @@ def audited_geodetic_diagnostic_full_pose_artifact(
         or not np.array_equal(frame_ids, evidence["frame_ids"])
         or not np.array_equal(timestamps, evidence["timestamps_ns"])
         or names != evidence["names"]
-        or _json(root / "quality.json") != expected_quality
+        or recorded_quality != expected_quality
         or _json(root / "alignment.json") != expected_alignment
         or provenance != expected_provenance
         or _json(root / "overlap.json") != evidence["diagnostic_overlap"]

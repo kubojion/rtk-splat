@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import rtk_splat.backends.geodetic_assembly as geodetic_assembly_module
 
 from rtk_splat.backends.geodetic_gnss import GeodeticGnssTemporalPolicy
 from rtk_splat.backends.geodetic_pairs import (
@@ -53,9 +54,13 @@ from rtk_splat.backends.geodetic_assembly import (
     GeodeticDiagnosticPolicy,
     GeodeticOverlapPolicy,
     _CALIBRATION_SEED_RECOVERY_REQUIRED_PASSES,
+    _DIAGNOSTIC_ABSOLUTE_RTK_ONLY_SYNCHRONIZATION_FAILURES,
+    _DIAGNOSTIC_ABSOLUTE_RTK_ONLY_TRAJECTORY_FAILURES,
     _aligned_submap_candidate,
     _assembly_evaluation_priors,
     _calibration_seed_pathology_record,
+    _diagnostic_failure_partition,
+    _diagnostic_overlap_record,
     _evaluate_overlap_candidates,
     _evaluate_overlap_candidates_v2,
     _file_evidence,
@@ -2197,6 +2202,190 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                 publish_geodetic_diagnostic_full_pose_artifact(
                     inventory, root / "poses", "diagnostic-assembled"
                 )
+
+    def test_diagnostic_full_pose_preserves_absolute_drift_without_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, plan, audited, submaps, results = self._completed_assembly(root)
+            inventory = publish_geodetic_diagnostic_result_inventory(
+                plan,
+                {
+                    window["window_id"]: result
+                    for window, result in zip(
+                        audited["windows"], results, strict=True
+                    )
+                },
+                root / "diagnostic-inventory",
+            )
+            original_synchronize = geodetic_assembly_module._synchronize_candidates
+            original_trajectory = geodetic_assembly_module._full_trajectory_quality
+
+            def absolute_sync_failure(*args, **kwargs):
+                synchronized, record = original_synchronize(*args, **kwargs)
+                record = copy.deepcopy(record)
+                check = record["checks"][
+                    "deduplicated_calibration_inlier_fraction"
+                ]
+                check["value"] = 0.5
+                check["passed"] = False
+                record["passed"] = False
+                return synchronized, record
+
+            def absolute_trajectory_failure(*args, **kwargs):
+                record = copy.deepcopy(original_trajectory(*args, **kwargs))
+                check = record["checks"][
+                    "consecutive_calibration_prior_outliers"
+                ]
+                check["value"] = int(check["maximum"]) + 1
+                check["passed"] = False
+                record["calibration_outlier_indices"] = list(
+                    range(int(check["value"]))
+                )
+                return record
+
+            with mock.patch(
+                "rtk_splat.backends.geodetic_assembly._synchronize_candidates",
+                side_effect=absolute_sync_failure,
+            ), mock.patch(
+                "rtk_splat.backends.geodetic_assembly._full_trajectory_quality",
+                side_effect=absolute_trajectory_failure,
+            ):
+                with self.assertRaisesRegex(
+                    ArtifactError, "full geodetic pose failed acceptance gates"
+                ):
+                    publish_geodetic_full_pose_artifact(
+                        plan,
+                        submaps,
+                        root / "production-poses",
+                        "production-refused",
+                    )
+                pose = publish_geodetic_diagnostic_full_pose_artifact(
+                    inventory,
+                    root / "diagnostic-poses",
+                    "absolute-drift-diagnostic",
+                )
+                final = audited_geodetic_diagnostic_full_pose_artifact(pose)
+
+            quality = final["quality"]
+            self.assertEqual(quality["schema_version"], 4)
+            self.assertFalse(quality["passed"])
+            self.assertTrue(quality["diagnostic_structurally_safe"])
+            self.assertEqual(
+                quality[
+                    "diagnostic_absolute_rtk_only_trajectory_failed_checks"
+                ],
+                ["consecutive_calibration_prior_outliers"],
+            )
+            self.assertEqual(
+                quality["diagnostic_structural_trajectory_failed_checks"], []
+            )
+            overlap = json.loads((pose / "overlap.json").read_text())
+            self.assertEqual(overlap["schema_version"], 2)
+            self.assertEqual(
+                overlap[
+                    "diagnostic_absolute_rtk_only_synchronization_failed_checks"
+                ],
+                ["deduplicated_calibration_inlier_fraction"],
+            )
+            self.assertTrue(
+                overlap["structural_checks"][
+                    "calibration_synchronization_gates_passed"
+                ]["passed"]
+            )
+            self.assertEqual(
+                final["georeferencing"]["georeferencing_status"], "FAILED"
+            )
+            self.assertFalse(
+                final["georeferencing"][
+                    "metric_georeferencing_claim_eligible"
+                ]
+            )
+            self.assertFalse((root / "production-poses" / "production-refused").exists())
+
+    def test_diagnostic_absolute_drift_partition_remains_fail_closed(self):
+        synchronization_checks = {
+            "all_synchronized_heldout_rtk_absolute_gates": {
+                "authoritative": True,
+                "passed": False,
+            },
+            "deduplicated_calibration_inlier_fraction": {
+                "authoritative": True,
+                "passed": False,
+            },
+            "overlap_graph_rank": {
+                "authoritative": True,
+                "passed": False,
+            },
+        }
+        absolute, structural = _diagnostic_failure_partition(
+            synchronization_checks,
+            _DIAGNOSTIC_ABSOLUTE_RTK_ONLY_SYNCHRONIZATION_FAILURES,
+        )
+        self.assertEqual(
+            absolute,
+            [
+                "all_synchronized_heldout_rtk_absolute_gates",
+                "deduplicated_calibration_inlier_fraction",
+            ],
+        )
+        self.assertEqual(structural, ["overlap_graph_rank"])
+
+        trajectory_checks = {
+            "consecutive_calibration_prior_outliers": {
+                "authoritative": True,
+                "passed": False,
+            },
+            "adjacent_raw_gnss_step_error_m": {
+                "authoritative": True,
+                "passed": False,
+            },
+            "diagnostic_covariance_note": {
+                "authoritative": False,
+                "passed": False,
+            },
+        }
+        absolute, structural = _diagnostic_failure_partition(
+            trajectory_checks,
+            _DIAGNOSTIC_ABSOLUTE_RTK_ONLY_TRAJECTORY_FAILURES,
+        )
+        self.assertEqual(
+            absolute, ["consecutive_calibration_prior_outliers"]
+        )
+        self.assertEqual(structural, ["adjacent_raw_gnss_step_error_m"])
+
+    def test_legacy_diagnostic_overlap_schema_remains_auditable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, audited, _, results = self._completed_assembly(root)
+            candidates = [_aligned_submap_candidate(path) for path in results]
+            report = _diagnostic_overlap_record(
+                candidates,
+                audited["config_object"].overlap_policy,
+                GeodeticDiagnosticPolicy(),
+                _diagnostic_acceptance_schema_version=1,
+            )
+            artifact = root / "legacy-diagnostic-overlap"
+            artifact.mkdir()
+            _write_json(artifact / "diagnostic_overlap.json", report)
+            (artifact / "overlap.csv").write_bytes(
+                _overlap_csv(report["production_evaluation"])
+            )
+            (artifact / "overlap.svg").write_bytes(
+                _overlap_svg(report["production_evaluation"])
+            )
+            _write_json(
+                artifact / "manifest.json",
+                _file_evidence(
+                    artifact,
+                    ["diagnostic_overlap.json", "overlap.csv", "overlap.svg"],
+                ),
+            )
+            verified = audited_geodetic_diagnostic_overlap_report(artifact)
+            self.assertEqual(verified["schema_version"], 1)
+            self.assertNotIn(
+                "diagnostic_absolute_rtk_only_synchronization_failed_checks",
+                verified,
+            )
 
     def test_diagnostic_auto_initialization_fallback_is_sealed_and_propagated(self):
         with tempfile.TemporaryDirectory() as tmp:
