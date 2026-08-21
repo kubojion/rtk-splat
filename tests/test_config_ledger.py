@@ -212,6 +212,7 @@ class ConfigLedgerTests(unittest.TestCase):
             "tiles-plan", "--config", "/unused.yaml",
             "--pose-artifact-root", "/poses", "--tile-plan-name", "two-v1",
             "--tile-count", "2", "--tile-max-tiles", "128",
+            "--tile-min-visibility-fraction", "0.075",
         ])
         self.assertEqual(args.tile_count, 2)
         self.assertEqual(args.tile_max_tiles, 128)
@@ -220,6 +221,10 @@ class ConfigLedgerTests(unittest.TestCase):
         )
         self.assertEqual(
             cli._stage_overrides(args)["tile_max_tiles"], 128
+        )
+        self.assertEqual(
+            cli._stage_overrides(args)["tile_min_visibility_fraction"],
+            0.075,
         )
         with self.assertRaisesRegex(ValueError, "valid only for tiles-plan"):
             cli.main([
@@ -241,6 +246,16 @@ class ConfigLedgerTests(unittest.TestCase):
                 "validate", "--config", "/does/not/exist.yaml",
                 "--tile-max-tiles", "128",
             ])
+        with self.assertRaisesRegex(ValueError, r"must be in \[0, 1\]"):
+            cli.main([
+                "tiles-plan", "--config", "/does/not/exist.yaml",
+                "--tile-min-visibility-fraction", "1.01",
+            ])
+        with self.assertRaisesRegex(ValueError, "valid only for tiles-plan"):
+            cli.main([
+                "validate", "--config", "/does/not/exist.yaml",
+                "--tile-min-visibility-fraction", "0.075",
+            ])
         tiled = cli.build_parser().parse_args([
             "train", "--config", "/unused.yaml",
             "--tile-plan", "/plans/two-v1", "--tile-id", "tile-0000",
@@ -260,7 +275,7 @@ class ConfigLedgerTests(unittest.TestCase):
                 "--tile-plan", "/plans/two-v1", "--tile-id", "tile-0000",
             ])
 
-    def test_tile_plan_max_tiles_override_reaches_builder(self):
+    def test_tile_plan_policy_overrides_reach_builder(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifact = root / "tile_plan_artifacts" / "automatic-v1"
@@ -277,6 +292,7 @@ class ConfigLedgerTests(unittest.TestCase):
                 pose_name=None,
                 pose_artifact_root=None,
                 tile_max_tiles=128,
+                tile_min_visibility_fraction=0.075,
                 tile_plan_name=None,
                 tile_count=None,
                 allow_failed_georeferencing_for_render=False,
@@ -284,6 +300,9 @@ class ConfigLedgerTests(unittest.TestCase):
 
             def build(_reader, received_cfg, **_kwargs):
                 self.assertEqual(received_cfg.tiles.max_tiles, 128)
+                self.assertEqual(
+                    received_cfg.tiles.min_visibility_fraction, 0.075
+                )
                 return artifact
 
             with mock.patch.object(cli, "_reader", return_value=object()), \
