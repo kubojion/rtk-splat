@@ -904,6 +904,340 @@ _DIAGNOSTIC_FALLBACK_BINDING_KIND = (
     "rtk_splat_geodetic_diagnostic_initialization_fallback_binding"
 )
 
+_CALIBRATION_SEED_PATHOLOGY_CHECKS = {
+    "adjacent_camera_prior_displacement_error_m",
+    "adjacent_raw_gnss_step_error_m",
+    "consecutive_calibration_prior_outliers",
+    "sliding_local_window_path_consistency",
+}
+_CALIBRATION_SEED_RECOVERY_REQUIRED_PASSES = {
+    "calibration_parameter_max_change",
+    "eligible_pair_track_evidence_retention",
+    "fresh_mean_observations_per_image_absolute",
+    "fresh_mean_track_length_absolute",
+    "raw_gnss_temporal_filter_audit",
+    "rejected_and_heldout_priors_physically_absent",
+    "reprojection_regression_px",
+    "selected_image_inventory_exact",
+    "selected_visual_quality",
+    "source_visual_quality",
+    "stereo_baseline_max_change_m",
+}
+
+
+def _calibration_seed_pathology_record(
+    primary_result: str | Path,
+    window: Mapping[str, Any],
+    *,
+    _verified_input_context: tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
+    """Prove an initialization kink without consulting held-out results."""
+    result = audited_geodetic_submap_result(
+        primary_result,
+        _include_internal_plan_context=True,
+        _verified_input_context=_verified_input_context,
+    )
+    (
+        plan_root,
+        plan,
+        submap_config,
+        mapper_config,
+        context,
+    ) = result.pop("_internal_plan_context")
+    plan_root = Path(plan_root)
+    initial = plan.get("initial_pair", {})
+    if (
+        plan.get("selected_frame_ids") != window["frame_ids"]
+        or initial.get("method")
+        != "deterministic_calibration_anchor_colmap_partner_v5"
+    ):
+        raise ArtifactError(
+            "calibration seed recovery requires the matching v5 primary result"
+        )
+    checks = result.get("quality", {}).get("checks")
+    if not isinstance(checks, Mapping):
+        raise ArtifactError("primary result lacks sealed quality evidence")
+    required_checks = {
+        name: checks.get(name) for name in _CALIBRATION_SEED_RECOVERY_REQUIRED_PASSES
+    }
+    if any(
+        not isinstance(check, Mapping) or check.get("passed") is not True
+        for check in required_checks.values()
+    ):
+        raise ArtifactError(
+            "primary result has non-initialization calibration/visual failures"
+        )
+    ignored_result_checks = _CALIBRATION_SEED_PATHOLOGY_CHECKS | {
+        "full_trajectory_raw_gnss_coverage",
+        "heldout_median_not_worse_m",
+        "heldout_rtk_absolute_gates",
+    }
+    if set(_failed_authoritative_checks(checks)) - ignored_result_checks:
+        raise ArtifactError(
+            "primary result has non-seed structural failures"
+        )
+
+    split = _json(plan_root / "prior_split.json")
+    records = split.get("records")
+    if not isinstance(records, list) or len(records) != len(window["frame_ids"]):
+        raise ArtifactError("primary prior-role inventory is invalid")
+    frame_ids = [int(item.get("frame_id", -1)) for item in records]
+    names = [str(item.get("name", "")) for item in records]
+    roles = [str(item.get("role", "")) for item in records]
+    rows = context.get("rows")
+    if not isinstance(rows, list):
+        raise ArtifactError("primary result has no selected-row inventory")
+    selected_names = [str(row["left_image"]["name"]) for row in rows]
+    selected_frame_ids = [int(row["frame_id"]) for row in rows]
+    if (
+        frame_ids != window["frame_ids"]
+        or frame_ids != selected_frame_ids
+        or names != selected_names
+    ):
+        raise ArtifactError("primary prior-role frame inventory changed")
+    calibration = set(split.get("calibration_names", ()))
+    holdout = set(split.get("holdout_names", ()))
+    if (
+        any(role not in {"calibration", "holdout", "excluded"} for role in roles)
+        or calibration
+        != {
+            name
+            for name, role in zip(names, roles, strict=True)
+            if role == "calibration"
+        }
+        or holdout
+        != {
+            name
+            for name, role in zip(names, roles, strict=True)
+            if role == "holdout"
+        }
+        or (
+            "calibration_names" in window
+            and list(split.get("calibration_names", ()))
+            != window["calibration_names"]
+        )
+        or (
+            "holdout_names" in window
+            and list(split.get("holdout_names", ())) != window["holdout_names"]
+        )
+    ):
+        raise ArtifactError("primary calibration-role inventory changed")
+    source_pair_names = [str(name) for name in initial["source_pair_image_names"]]
+    if not set(source_pair_names) <= calibration:
+        raise ArtifactError("sealed recovery pair is not calibration-only")
+    anchor = int(initial["selection_indices"][0])
+    if not 0 <= anchor < len(roles) or roles[anchor] != "calibration":
+        raise ArtifactError("sealed initialization anchor is not calibration")
+
+    refined_poses = _poses_from_images_txt(
+        Path(result["artifact"]) / "refined_text" / "images.txt"
+    )
+    if any(name not in refined_poses for name in names):
+        raise ArtifactError("primary result lacks selected calibration poses")
+    calibration_indices_array = np.asarray(
+        [index for index, role in enumerate(roles) if role == "calibration"],
+        dtype=np.int64,
+    )
+    if calibration_indices_array.size < 3:
+        raise ArtifactError("seed recovery requires three calibration priors")
+    calibration_records = [records[index] for index in calibration_indices_array]
+    calibration_source = np.stack(
+        [refined_poses[str(record["name"])][1] for record in calibration_records]
+    )
+    calibration_target = np.stack(
+        [
+            np.asarray(record.get("position_m"), dtype=np.float64)
+            for record in calibration_records
+        ]
+    )
+    calibration_covariance = np.stack(
+        [
+            np.asarray(
+                record.get("optimizer_covariance_m2"), dtype=np.float64
+            )
+            for record in calibration_records
+        ]
+    )
+    if (
+        calibration_source.shape != calibration_target.shape
+        or calibration_target.shape != (len(calibration_records), 3)
+        or calibration_covariance.shape != (len(calibration_records), 3, 3)
+        or not np.isfinite(calibration_source).all()
+        or not np.isfinite(calibration_target).all()
+        or not np.isfinite(calibration_covariance).all()
+    ):
+        raise ArtifactError("calibration-only seed inputs are invalid")
+    alignment = estimate_rigid_alignment(
+        calibration_source,
+        calibration_target,
+        calibration_covariance,
+        ransac_threshold_m=mapper_config.alignment_ransac_threshold_m,
+        ransac_iterations=mapper_config.alignment_ransac_iterations,
+        random_seed=mapper_config.random_seed,
+    )
+    refined_centers = np.stack([refined_poses[name][1] for name in names])
+    aligned_refined_centers = (
+        refined_centers @ alignment.rotation.T + alignment.translation
+    )
+    nan_position = np.full(3, np.nan, dtype=np.float64)
+    camera_prior_centers = np.stack(
+        [
+            np.asarray(record.get("position_m"), dtype=np.float64)
+            if role == "calibration"
+            else nan_position
+            for record, role in zip(records, roles, strict=True)
+        ]
+    )
+    raw_endpoints = _raw_gnss_endpoints(context["reader"])
+    raw_gnss_centers = np.stack(
+        [
+            np.asarray(raw_endpoints[frame_id].position_m, dtype=np.float64)
+            if role == "calibration"
+            and raw_endpoints[frame_id].trusted_std_m() is not None
+            else nan_position
+            for frame_id, role in zip(frame_ids, roles, strict=True)
+        ]
+    )
+    calibration_inliers = np.zeros(len(frame_ids), dtype=bool)
+    calibration_inliers[calibration_indices_array] = alignment.inlier_mask
+    decision_roles = [
+        "calibration" if role == "calibration" else "excluded"
+        for role in roles
+    ]
+    trajectory = _full_trajectory_quality(
+        aligned_refined_centers,
+        camera_prior_centers,
+        raw_gnss_centers,
+        decision_roles,
+        calibration_inliers,
+        names,
+        frame_ids,
+        submap_config.trajectory_policy,
+    )
+    trajectory_checks = trajectory.get("checks")
+    if (
+        not isinstance(trajectory_checks, Mapping)
+        or trajectory_checks.get(
+            "full_trajectory_raw_gnss_coverage", {}
+        ).get("passed")
+        is not True
+        or {
+            name
+            for name, check in trajectory_checks.items()
+            if isinstance(check, Mapping)
+            and check.get("authoritative", True) is True
+            and check.get("passed") is not True
+        }
+        != _CALIBRATION_SEED_PATHOLOGY_CHECKS
+    ):
+        raise ArtifactError(
+            "primary result does not have the complete calibration-only "
+            "seed pathology"
+        )
+
+    def calibration_indices(
+        item: Any, label: str, *, adjacent: bool = False
+    ) -> list[int]:
+        if not isinstance(item, Mapping):
+            raise ArtifactError(f"primary result lacks {label} evidence")
+        values = item.get("selection_indices")
+        if (
+            not isinstance(values, list)
+            or len(values) != 2
+            or any(isinstance(value, bool) for value in values)
+        ):
+            raise ArtifactError(f"invalid {label} selection indices")
+        first, second = (int(values[0]), int(values[1]))
+        if (
+            not 0 <= first <= second < len(roles)
+            or (adjacent and second != first + 1)
+            or any(role != "calibration" for role in roles[first : second + 1])
+        ):
+            raise ArtifactError(f"{label} is not calibration-only")
+        return [first, second]
+
+    camera_pair = calibration_indices(
+        trajectory.get("worst_adjacent_camera_prior_pair"),
+        "worst adjacent camera-prior pair",
+        adjacent=True,
+    )
+    raw_pair = calibration_indices(
+        trajectory.get("worst_adjacent_raw_gnss_pair"),
+        "worst adjacent raw-GNSS pair",
+        adjacent=True,
+    )
+    local_window = calibration_indices(
+        trajectory.get("worst_local_window"),
+        "worst local trajectory window",
+    )
+    outliers = trajectory.get("calibration_outlier_indices")
+    if (
+        not isinstance(outliers, list)
+        or any(isinstance(index, bool) for index in outliers)
+        or anchor not in {int(index) for index in outliers}
+        or anchor not in camera_pair
+        or anchor not in raw_pair
+        or not local_window[0] <= anchor <= local_window[1]
+    ):
+        raise ArtifactError(
+            "calibration-only path failure is not localized at the seed anchor"
+        )
+    if any(
+        not 0 <= int(index) < len(roles)
+        or roles[int(index)] != "calibration"
+        for index in outliers
+    ):
+        raise ArtifactError("recorded seed outliers are not calibration-only")
+
+    evidence = {
+        "schema_version": 1,
+        "classification": "calibration_only_v5_seed_pathology",
+        "primary_result": result["artifact"],
+        "primary_result_seal_sha256": result["result_seal_sha256"],
+        "primary_plan": str(plan_root),
+        "primary_plan_seal_sha256": result["plan_seal_sha256"],
+        "primary_initialization_method": initial["method"],
+        "anchor_selection_index": anchor,
+        "anchor_frame_id": int(window["frame_ids"][anchor]),
+        "source_pair_image_ids": list(initial["source_pair_image_ids"]),
+        "source_pair_frame_ids": list(initial["source_pair_frame_ids"]),
+        "source_pair_verified_matches": int(
+            initial["source_pair_verified_matches"]
+        ),
+        "source_pair_raw_gnss_evidence": initial[
+            "source_pair_raw_gnss_evidence"
+        ],
+        "source_pair_parallax_evidence": initial[
+            "source_pair_parallax_evidence"
+        ],
+        "failed_calibration_only_checks": sorted(
+            _CALIBRATION_SEED_PATHOLOGY_CHECKS
+        ),
+        "worst_adjacent_camera_prior_pair": trajectory[
+            "worst_adjacent_camera_prior_pair"
+        ],
+        "worst_adjacent_raw_gnss_pair": trajectory[
+            "worst_adjacent_raw_gnss_pair"
+        ],
+        "worst_local_window": trajectory["worst_local_window"],
+        "calibration_outlier_indices_sha256": canonical_hash(
+            [int(index) for index in outliers]
+        ),
+        "decision_inputs_used": [
+            "sealed_calibration_prior_roles",
+            "sealed_raw_gnss_motion",
+            "sealed_two_view_geometry_and_matches",
+            "finished_visual_pose_local_motion",
+        ],
+        "decision_inputs_exclude": [
+            "heldout_position",
+            "heldout_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+    evidence["evidence_sha256"] = canonical_hash(evidence)
+    return evidence
+
 
 def _diagnostic_fallback_binding_record(
     assembly: Mapping[str, Any],
@@ -1244,6 +1578,224 @@ def audited_geodetic_diagnostic_low_parallax_fallback_window(
     )
 
 
+def _diagnostic_structural_recovery_binding_record(
+    assembly: Mapping[str, Any],
+    window: Mapping[str, Any],
+    root: Path,
+    primary_result: str | Path,
+) -> dict[str, Any]:
+    evidence = _calibration_seed_pathology_record(
+        primary_result,
+        window,
+        _verified_input_context=assembly.get("_runtime_context"),
+    )
+    selection_path = root / "selection.json"
+    plan_path = root / "plan"
+    frontend, manifest = assembly["_runtime_context"][:2]
+    _, selection = _load_frame_selection(
+        selection_path,
+        frontend,
+        Path(assembly["segment"]),
+        manifest,
+    )
+    fallback_context = _plan_context(
+        plan_path,
+        require_hardened=True,
+        _verified_input_context=assembly["_runtime_context"],
+    )
+    fallback_plan = fallback_context[1]
+    fallback_split = _json(plan_path / "prior_split.json")
+    initial = fallback_plan.get("initial_pair", {})
+    if (
+        selection.get("frame_ids") != window["frame_ids"]
+        or fallback_plan.get("selected_frame_ids") != window["frame_ids"]
+        or initial.get("method")
+        != "deterministic_calibration_pair_low_parallax_v6"
+        or fallback_split.get("calibration_names")
+        != window["calibration_names"]
+        or fallback_split.get("holdout_names") != window["holdout_names"]
+        or initial.get("image_ids") != evidence["source_pair_image_ids"]
+        or initial.get("frame_ids") != evidence["source_pair_frame_ids"]
+    ):
+        raise ArtifactError(
+            "diagnostic structural recovery differs from its primary window"
+        )
+    return {
+        "schema_version": 4,
+        "kind": _DIAGNOSTIC_FALLBACK_BINDING_KIND,
+        "diagnostic_only": True,
+        "production_publication_eligible": False,
+        "assembly_plan": assembly["artifact"],
+        "assembly_plan_seal_sha256": assembly["plan_seal_sha256"],
+        "window_id": window["window_id"],
+        "frame_ids_sha256": window["frame_ids_sha256"],
+        "selection_sha256": sha256_file(selection_path),
+        "submap_plan_seal_sha256": sha256_file(
+            plan_path / "plan_seal.json"
+        ),
+        "primary_result_artifact": evidence["primary_result"],
+        "primary_result_seal_sha256": evidence[
+            "primary_result_seal_sha256"
+        ],
+        "primary_submap_plan": evidence["primary_plan"],
+        "primary_submap_plan_seal_sha256": evidence[
+            "primary_plan_seal_sha256"
+        ],
+        "primary_initialization_method": evidence[
+            "primary_initialization_method"
+        ],
+        "fallback_initialization_method": initial["method"],
+        "fallback_reason": "sealed_calibration_only_v5_seed_pathology",
+        "fallback_pair_id": int(initial["pair_id"]),
+        "fallback_pair_image_ids": list(initial["image_ids"]),
+        "fallback_pair_frame_ids": list(initial["frame_ids"]),
+        "fallback_mapper_init_min_tri_angle_deg": float(
+            initial["mapper_init_min_tri_angle_deg"]
+        ),
+        "fallback_pair_calibration_priors_physically_present": True,
+        "calibration_only_pathology": evidence,
+        "decision_inputs_exclude": [
+            "heldout_position",
+            "heldout_residual",
+            "heldout_evaluation_result",
+        ],
+    }
+
+
+def prepare_geodetic_diagnostic_low_parallax_recovery_window(
+    assembly_plan: str | Path,
+    window_id: str,
+    primary_result: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Prepare a v6 retry after a calibration-only v5 seed pathology."""
+    assembly_path = Path(assembly_plan).expanduser().resolve()
+    assembly = (
+        dict(_audited_plan)
+        if _audited_plan is not None
+        else audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    )
+    if Path(str(assembly.get("artifact", ""))).resolve() != assembly_path:
+        raise ArtifactError("cached assembly plan refers to another artifact")
+    if "_runtime_context" not in assembly:
+        assembly = audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    window = _window_record(assembly, window_id)
+    root = Path(workspace).expanduser().resolve()
+    if root.exists():
+        raise FileExistsError(
+            f"refusing to overwrite diagnostic recovery workspace: {root}"
+        )
+    immutable = (
+        Path(assembly["frontend_artifact"]),
+        Path(assembly["completed_backend"]),
+        Path(assembly["segment"]),
+        Path(primary_result).expanduser().resolve(),
+    )
+    if any(root == item or item in root.parents for item in immutable):
+        raise ArtifactError(
+            "diagnostic recovery workspace must be outside immutable inputs"
+        )
+    # Prove eligibility before creating or materializing any recovery files.
+    # The binding builder repeats this audit after plan creation so a changed
+    # primary result cannot cross the publication boundary unnoticed.
+    _calibration_seed_pathology_record(
+        primary_result,
+        window,
+        _verified_input_context=assembly.get("_runtime_context"),
+    )
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    try:
+        selection_path = root / "selection.json"
+        _atomic_json(
+            selection_path,
+            _selection_payload(
+                Path(assembly["frontend_artifact"]),
+                Path(assembly["segment"]),
+                window["frame_ids"],
+            ),
+        )
+        prepare_geodetic_submap_plan(
+            assembly["frontend_artifact"],
+            assembly["completed_backend"],
+            assembly["segment"],
+            selection_path,
+            root / "plan",
+            config=assembly["config_object"].submap_config,
+            _verified_input_context=assembly["_runtime_context"],
+            _defer_full_reaudit_until_execution=True,
+            _initial_pair_method="v6",
+        )
+        _atomic_json(
+            root / "window_binding.json",
+            _diagnostic_structural_recovery_binding_record(
+                assembly, window, root, primary_result
+            ),
+        )
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return {
+        "workspace": str(root),
+        "selection": str(root / "selection.json"),
+        "plan": str(root / "plan"),
+        "result": str(root / "result"),
+        "window_id": window_id,
+    }
+
+
+def audited_geodetic_diagnostic_low_parallax_recovery_window(
+    assembly_plan: str | Path,
+    workspace: str | Path,
+    *,
+    _audited_plan: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Verify a sealed calibration-only structural recovery workspace."""
+    assembly_path = Path(assembly_plan).expanduser().resolve()
+    assembly = (
+        dict(_audited_plan)
+        if _audited_plan is not None
+        else audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    )
+    if "_runtime_context" not in assembly:
+        assembly = audited_geodetic_assembly_plan(
+            assembly_path, _include_runtime_context=True
+        )
+    root = Path(workspace).expanduser().resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise ArtifactError("diagnostic recovery workspace is missing or unsafe")
+    binding = _json(root / "window_binding.json")
+    if (
+        binding.get("schema_version") != 4
+        or binding.get("kind") != _DIAGNOSTIC_FALLBACK_BINDING_KIND
+    ):
+        raise ArtifactError("invalid diagnostic structural recovery binding")
+    window = _window_record(assembly, str(binding.get("window_id", "")))
+    expected = _diagnostic_structural_recovery_binding_record(
+        assembly,
+        window,
+        root,
+        str(binding.get("primary_result_artifact", "")),
+    )
+    if binding != expected:
+        raise ArtifactError("diagnostic structural recovery binding changed")
+    return {
+        "workspace": str(root),
+        "selection": str(root / "selection.json"),
+        "plan": str(root / "plan"),
+        "result": str(root / "result"),
+        "window_id": str(window["window_id"]),
+    }
+
+
 def _atomic_save_npy(path: Path, value: np.ndarray) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -1454,34 +2006,51 @@ def _diagnostic_initialization_override(
     binding = _json(binding_path)
     if binding.get("schema_version") == 1:
         return None
+    schema = binding.get("schema_version")
     fallback_method = str(binding.get("fallback_initialization_method", ""))
-    if binding.get("schema_version") == 2:
+    if schema == 2:
         expected_method = "deterministic_colmap_auto_filtered_database_v4"
         expected_reason = "sealed_primary_anchor_could_not_create_sparse_model"
-    elif binding.get("schema_version") == 3:
+        expected_excluded_inputs = [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ]
+    elif schema == 3:
         expected_method = "deterministic_calibration_pair_low_parallax_v6"
         expected_reason = (
             "sealed_primary_anchor_could_not_create_sparse_model_"
             "calibration_pair_low_parallax_retry"
         )
+        expected_excluded_inputs = [
+            "finished_visual_model_pose",
+            "finished_visual_model_residual",
+            "heldout_evaluation_result",
+        ]
+    elif schema == 4:
+        expected_method = "deterministic_calibration_pair_low_parallax_v6"
+        expected_reason = "sealed_calibration_only_v5_seed_pathology"
+        expected_excluded_inputs = [
+            "heldout_position",
+            "heldout_residual",
+            "heldout_evaluation_result",
+        ]
     else:
         raise ArtifactError("diagnostic initialization override binding is invalid")
     if (
         binding.get("kind") != _DIAGNOSTIC_FALLBACK_BINDING_KIND
         or binding.get("diagnostic_only") is not True
         or binding.get("production_publication_eligible") is not False
-        or binding.get("primary_failure_classification")
-        != "initialization_exhausted_without_sparse_model"
         or binding.get("primary_initialization_method")
         != "deterministic_calibration_anchor_colmap_partner_v5"
         or fallback_method != expected_method
         or binding.get("fallback_reason") != expected_reason
-        or binding.get("decision_inputs_exclude")
-        != [
-            "finished_visual_model_pose",
-            "finished_visual_model_residual",
-            "heldout_evaluation_result",
-        ]
+        or binding.get("decision_inputs_exclude") != expected_excluded_inputs
+        or (
+            schema in {2, 3}
+            and binding.get("primary_failure_classification")
+            != "initialization_exhausted_without_sparse_model"
+        )
     ):
         raise ArtifactError("diagnostic initialization override binding is invalid")
     result_plan = candidate["plan"]
@@ -1492,7 +2061,7 @@ def _diagnostic_initialization_override(
         != candidate["result"]["plan_seal_sha256"]
     ):
         raise ArtifactError("diagnostic initialization override plan changed")
-    if binding.get("schema_version") == 3:
+    if schema in {3, 4}:
         initial_pair = result_plan["initial_pair"]
         if (
             binding.get("fallback_pair_id") != initial_pair.get("pair_id")
@@ -1516,6 +2085,43 @@ def _diagnostic_initialization_override(
             raise ArtifactError(
                 "diagnostic low-parallax initialization binding changed"
             )
+    if schema == 4:
+        selected_frame_ids = result_plan.get("selected_frame_ids")
+        if not isinstance(selected_frame_ids, list):
+            raise ArtifactError(
+                "diagnostic structural recovery frame inventory changed"
+            )
+        evidence = _calibration_seed_pathology_record(
+            str(binding.get("primary_result_artifact", "")),
+            {"frame_ids": selected_frame_ids},
+        )
+        if (
+            binding.get("calibration_only_pathology") != evidence
+            or binding.get("primary_result_seal_sha256")
+            != evidence["primary_result_seal_sha256"]
+            or binding.get("primary_submap_plan") != evidence["primary_plan"]
+            or binding.get("primary_submap_plan_seal_sha256")
+            != evidence["primary_plan_seal_sha256"]
+        ):
+            raise ArtifactError(
+                "diagnostic structural recovery binding changed"
+            )
+        return {
+            "binding": str(binding_path.resolve()),
+            "binding_sha256": sha256_file(binding_path),
+            "primary_result_artifact": evidence["primary_result"],
+            "primary_result_seal_sha256": evidence[
+                "primary_result_seal_sha256"
+            ],
+            "primary_initialization_method": binding[
+                "primary_initialization_method"
+            ],
+            "fallback_initialization_method": fallback_method,
+            "fallback_reason": binding["fallback_reason"],
+            "calibration_only_pathology_evidence_sha256": evidence[
+                "evidence_sha256"
+            ],
+        }
     failure = audited_geodetic_submap_failure(
         str(binding.get("primary_failure_artifact", ""))
     )
@@ -3196,6 +3802,12 @@ def _diagnostic_inventory_record(
             )
         elif binding.get("schema_version") == 3:
             audited_geodetic_diagnostic_low_parallax_fallback_window(
+                assembly["artifact"],
+                workspace,
+                _audited_plan=assembly,
+            )
+        elif binding.get("schema_version") == 4:
+            audited_geodetic_diagnostic_low_parallax_recovery_window(
                 assembly["artifact"],
                 workspace,
                 _audited_plan=assembly,

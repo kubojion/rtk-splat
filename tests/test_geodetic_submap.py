@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import pickle
@@ -40,6 +41,7 @@ from rtk_splat.backends.geodetic_submap import (
     _select_initial_pair_v6,
     _similarity_scale,
     audited_geodetic_submap_failure,
+    audited_geodetic_submap_result,
     build_geodetic_submap_command,
     create_geodetic_frame_selection,
     geodetic_submap_export_context,
@@ -50,8 +52,10 @@ from rtk_splat.backends.geodetic_assembly import (
     GeodeticAssemblyConfig,
     GeodeticDiagnosticPolicy,
     GeodeticOverlapPolicy,
+    _CALIBRATION_SEED_RECOVERY_REQUIRED_PASSES,
     _aligned_submap_candidate,
     _assembly_evaluation_priors,
+    _calibration_seed_pathology_record,
     _evaluate_overlap_candidates,
     _evaluate_overlap_candidates_v2,
     _file_evidence,
@@ -65,6 +69,7 @@ from rtk_splat.backends.geodetic_assembly import (
     audited_geodetic_diagnostic_submap_result,
     audited_geodetic_diagnostic_initialization_fallback_window,
     audited_geodetic_diagnostic_low_parallax_fallback_window,
+    audited_geodetic_diagnostic_low_parallax_recovery_window,
     audited_geodetic_full_pose_artifact,
     audited_geodetic_overlap_report,
     audited_geodetic_submap_pose_export,
@@ -73,6 +78,7 @@ from rtk_splat.backends.geodetic_assembly import (
     prepare_geodetic_assembly_window,
     prepare_geodetic_diagnostic_initialization_fallback_window,
     prepare_geodetic_diagnostic_low_parallax_fallback_window,
+    prepare_geodetic_diagnostic_low_parallax_recovery_window,
     publish_geodetic_diagnostic_full_pose_artifact,
     publish_geodetic_diagnostic_overlap_report,
     publish_geodetic_diagnostic_result_inventory,
@@ -2467,6 +2473,360 @@ class GeodeticAssemblyArtifactTests(unittest.TestCase):
                 audited_geodetic_diagnostic_low_parallax_fallback_window(
                     assembly_plan, fallback["workspace"]
                 )
+
+    def test_calibration_seed_pathology_is_recomputed_without_heldout_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame_ids = list(range(100, 106))
+            names = [f"left_{frame_id:06d}.jpg" for frame_id in frame_ids]
+            roles = ["calibration"] * len(frame_ids)
+            camera = np.asarray(
+                [
+                    [0.00, 0.00, 0.00],
+                    [0.10, 0.03, 0.01],
+                    [0.20, 0.09, 0.03],
+                    [0.30, 0.18, 0.02],
+                    [0.40, 0.30, 0.04],
+                    [0.50, 0.45, 0.03],
+                ],
+                dtype=np.float64,
+            )
+            refined = camera.copy()
+            refined[1, 1] += 0.7
+            trajectory_policy = GeodeticTrajectoryPolicy(
+                max_consecutive_calibration_outliers=0,
+                local_window_frames=3,
+            )
+            checks = {
+                name: {"authoritative": True, "passed": True}
+                for name in _CALIBRATION_SEED_RECOVERY_REQUIRED_PASSES
+            }
+            checks.update(
+                {
+                    name: {"authoritative": True, "passed": False}
+                    for name in (
+                        "adjacent_camera_prior_displacement_error_m",
+                        "adjacent_raw_gnss_step_error_m",
+                        "consecutive_calibration_prior_outliers",
+                        "sliding_local_window_path_consistency",
+                    )
+                }
+            )
+            checks.update(
+                {
+                    "full_trajectory_raw_gnss_coverage": {
+                        "authoritative": True,
+                        "passed": False,
+                        "value": "ignored-heldout-coverage",
+                    },
+                    "heldout_median_not_worse_m": {
+                        "authoritative": True,
+                        "passed": False,
+                        "value": 999.0,
+                    },
+                    "heldout_rtk_absolute_gates": {
+                        "authoritative": True,
+                        "passed": False,
+                        "value": 888.0,
+                    },
+                }
+            )
+            plan_root = root / "primary-plan"
+            plan_root.mkdir()
+            split = {
+                "calibration_names": list(names),
+                "holdout_names": [],
+                "records": [
+                    {
+                        "frame_id": frame_id,
+                        "name": name,
+                        "role": role,
+                        "position_m": camera[index].tolist(),
+                        "optimizer_covariance_m2": (
+                            np.eye(3, dtype=np.float64) * 0.0004
+                        ).tolist(),
+                    }
+                    for index, (frame_id, name, role) in enumerate(
+                        zip(frame_ids, names, roles, strict=True)
+                    )
+                ],
+            }
+            _write_json(plan_root / "prior_split.json", split)
+            initial = {
+                "method": "deterministic_calibration_anchor_colmap_partner_v5",
+                "selection_indices": [1],
+                "source_pair_image_ids": [3, 7],
+                "source_pair_image_names": [names[1], names[3]],
+                "source_pair_frame_ids": [frame_ids[1], frame_ids[3]],
+                "source_pair_verified_matches": 321,
+                "source_pair_raw_gnss_evidence": {"sealed": True},
+                "source_pair_parallax_evidence": {"sealed": True},
+            }
+            result = {
+                "artifact": str(root / "primary-result"),
+                "result_seal_sha256": "a" * 64,
+                "plan_seal_sha256": "b" * 64,
+                "quality": {
+                    "checks": checks,
+                    "rtk_holdout": {
+                        "refined": {"residual_m": {"median": 999.0}}
+                    },
+                },
+            }
+            plan = {
+                "selected_frame_ids": frame_ids,
+                "initial_pair": initial,
+            }
+            submap_config = GeodeticSubmapConfig(
+                trajectory_policy=trajectory_policy
+            )
+            mapper_config = MapperConfig()
+            rows = [
+                {
+                    "frame_id": frame_id,
+                    "left_image": {"name": name},
+                }
+                for frame_id, name in zip(frame_ids, names, strict=True)
+            ]
+            poses = {
+                name: (np.eye(4, dtype=np.float64), refined[index])
+                for index, name in enumerate(names)
+            }
+            covariance = tuple(
+                tuple(float(value) for value in row)
+                for row in np.eye(3, dtype=np.float64) * 0.0004
+            )
+            raw_endpoints = {
+                frame_id: RawGnssEndpoint(
+                    position_m=tuple(float(value) for value in camera[index]),
+                    covariance_m2=covariance,
+                    position_valid=True,
+                    position_quality="rtk_fixed",
+                    fix_status=1,
+                    carrier_status=2,
+                )
+                for index, frame_id in enumerate(frame_ids)
+            }
+
+            def audited_value(value):
+                return {
+                    **copy.deepcopy(value),
+                    "_internal_plan_context": (
+                        plan_root,
+                        plan,
+                        submap_config,
+                        mapper_config,
+                        {"rows": rows, "reader": object()},
+                    ),
+                }
+
+            changed_heldout = copy.deepcopy(result)
+            changed_heldout["quality"]["checks"][
+                "heldout_median_not_worse_m"
+            ]["value"] = -12345.0
+            changed_heldout["quality"]["checks"][
+                "heldout_rtk_absolute_gates"
+            ]["passed"] = True
+            changed_heldout["quality"]["checks"][
+                "full_trajectory_raw_gnss_coverage"
+            ]["passed"] = True
+            changed_heldout["quality"]["rtk_holdout"] = {
+                "refined": {"residual_m": {"median": -54321.0}}
+            }
+            with mock.patch(
+                "rtk_splat.backends.geodetic_assembly.audited_geodetic_submap_result",
+                side_effect=[audited_value(result), audited_value(changed_heldout)],
+            ), mock.patch(
+                "rtk_splat.backends.geodetic_assembly._poses_from_images_txt",
+                return_value=poses,
+            ), mock.patch(
+                "rtk_splat.backends.geodetic_assembly._raw_gnss_endpoints",
+                return_value=raw_endpoints,
+            ):
+                first = _calibration_seed_pathology_record(
+                    result["artifact"], {"frame_ids": frame_ids}
+                )
+                second = _calibration_seed_pathology_record(
+                    result["artifact"], {"frame_ids": frame_ids}
+                )
+            self.assertEqual(first, second)
+            self.assertEqual(
+                first["classification"],
+                "calibration_only_v5_seed_pathology",
+            )
+            self.assertEqual(first["anchor_frame_id"], frame_ids[1])
+            self.assertNotIn("rtk_holdout", json.dumps(first))
+
+            split["calibration_names"] = [
+                name for name in names if name != names[3]
+            ]
+            split["holdout_names"] = [names[3]]
+            split["records"][3]["role"] = "holdout"
+            _write_json(plan_root / "prior_split.json", split)
+            with mock.patch(
+                "rtk_splat.backends.geodetic_assembly.audited_geodetic_submap_result",
+                return_value=audited_value(result),
+            ), mock.patch(
+                "rtk_splat.backends.geodetic_assembly._poses_from_images_txt",
+                return_value=poses,
+            ), mock.patch(
+                "rtk_splat.backends.geodetic_assembly._raw_gnss_endpoints",
+                return_value=raw_endpoints,
+            ):
+                with self.assertRaisesRegex(
+                    ArtifactError, "not calibration-only"
+                ):
+                    _calibration_seed_pathology_record(
+                        result["artifact"], {"frame_ids": frame_ids}
+                    )
+
+    def test_diagnostic_low_parallax_recovery_is_sealed_and_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, assembly_plan, audited, _, results = self._completed_assembly(root)
+            window = audited["windows"][0]
+            primary = results[0]
+            ineligible_workspace = root / "ineligible-recovery-window"
+            with self.assertRaisesRegex(
+                ArtifactError, "calibration-only seed pathology"
+            ):
+                prepare_geodetic_diagnostic_low_parallax_recovery_window(
+                    assembly_plan,
+                    window["window_id"],
+                    primary,
+                    ineligible_workspace,
+                )
+            self.assertFalse(ineligible_workspace.exists())
+            primary_result = audited_geodetic_submap_result(primary)
+            primary_plan_root = primary.parent / "plan"
+            primary_plan = json.loads(
+                (primary_plan_root / "geodetic_submap_plan.json").read_text()
+            )
+            initial = primary_plan["initial_pair"]
+            pathology = {
+                "schema_version": 1,
+                "classification": "calibration_only_v5_seed_pathology",
+                "primary_result": str(primary.resolve()),
+                "primary_result_seal_sha256": primary_result[
+                    "result_seal_sha256"
+                ],
+                "primary_plan": str(primary_plan_root.resolve()),
+                "primary_plan_seal_sha256": primary_result[
+                    "plan_seal_sha256"
+                ],
+                "primary_initialization_method": initial["method"],
+                "anchor_selection_index": initial["selection_indices"][0],
+                "source_pair_image_ids": initial["source_pair_image_ids"],
+                "source_pair_frame_ids": initial["source_pair_frame_ids"],
+                "decision_inputs_exclude": [
+                    "heldout_position",
+                    "heldout_residual",
+                    "heldout_evaluation_result",
+                ],
+            }
+            pathology["evidence_sha256"] = canonical_hash(pathology)
+            recovery_workspace = root / "low-parallax-recovery-window"
+            with mock.patch(
+                "rtk_splat.backends.geodetic_assembly._calibration_seed_pathology_record",
+                return_value=pathology,
+            ):
+                recovery = (
+                    prepare_geodetic_diagnostic_low_parallax_recovery_window(
+                        assembly_plan,
+                        window["window_id"],
+                        primary,
+                        recovery_workspace,
+                    )
+                )
+                self.assertEqual(
+                    audited_geodetic_diagnostic_low_parallax_recovery_window(
+                        assembly_plan, recovery_workspace
+                    ),
+                    recovery,
+                )
+                with self.assertRaises(FileExistsError):
+                    prepare_geodetic_diagnostic_low_parallax_recovery_window(
+                        assembly_plan,
+                        window["window_id"],
+                        primary,
+                        recovery_workspace,
+                    )
+                recovery_plan = json.loads(
+                    (
+                        Path(recovery["plan"]) / "geodetic_submap_plan.json"
+                    ).read_text()
+                )
+                self.assertEqual(
+                    recovery_plan["initial_pair"]["method"],
+                    "deterministic_calibration_pair_low_parallax_v6",
+                )
+                self.assertEqual(
+                    recovery_plan["initial_pair"]["image_ids"],
+                    initial["source_pair_image_ids"],
+                )
+                binding_path = recovery_workspace / "window_binding.json"
+                binding = json.loads(binding_path.read_text())
+                self.assertEqual(binding["schema_version"], 4)
+                self.assertEqual(
+                    binding["fallback_reason"],
+                    "sealed_calibration_only_v5_seed_pathology",
+                )
+                colmap = Path(recovery_plan["colmap"]["executable"])
+                run_geodetic_submap_plan(
+                    recovery["plan"],
+                    recovery["result"],
+                    colmap,
+                    runner=_Runner(recovery_plan["selected_image_names"]),
+                )
+                with self.assertRaisesRegex(
+                    ArtifactError,
+                    "diagnostic_low_parallax_initialization_fallback",
+                ):
+                    audited_geodetic_diagnostic_submap_result(
+                        recovery["result"]
+                    )
+                policy = GeodeticDiagnosticPolicy(
+                    allow_sealed_low_parallax_initialization_fallback=True
+                )
+                assessment = audited_geodetic_diagnostic_submap_result(
+                    recovery["result"], policy=policy
+                )
+                self.assertTrue(
+                    assessment["structurally_safe_for_diagnostic"]
+                )
+                self.assertEqual(
+                    assessment["diagnostic_initialization_override"][
+                        "calibration_only_pathology_evidence_sha256"
+                    ],
+                    pathology["evidence_sha256"],
+                )
+                inventory = publish_geodetic_diagnostic_result_inventory(
+                    assembly_plan,
+                    {
+                        window["window_id"]: recovery["result"],
+                        audited["windows"][1]["window_id"]: results[1],
+                    },
+                    root / "low-parallax-recovery-inventory",
+                    policy=policy,
+                )
+                inventory_record = (
+                    audited_geodetic_diagnostic_result_inventory(inventory)
+                )
+                self.assertEqual(
+                    inventory_record[
+                        "diagnostic_initialization_override_window_ids"
+                    ],
+                    [window["window_id"]],
+                )
+
+                binding["calibration_only_pathology"][
+                    "classification"
+                ] = "tampered"
+                _write_json(binding_path, binding)
+                with self.assertRaisesRegex(ArtifactError, "binding changed"):
+                    audited_geodetic_diagnostic_low_parallax_recovery_window(
+                        assembly_plan, recovery_workspace
+                    )
 
     def test_diagnostic_inventory_rejects_structural_failure_and_tampering(self):
         with tempfile.TemporaryDirectory() as tmp:
