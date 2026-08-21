@@ -122,6 +122,45 @@ class TileSceneTests(unittest.TestCase):
         tile["effective_training_config"]["train"]["iterations"] = 64_000
         self.assertNotEqual(_training_identity(base), _training_identity(tile))
 
+    def test_training_identity_ignores_checkout_locators_but_not_content(self):
+        def provenance(prefix: str):
+            return {
+                "training_implementation_sha256": "a" * 64,
+                "effective_training_config": {
+                    "train": {"run_name": prefix, "iterations": 65_000},
+                    "runtime_resolution": {
+                        "config_sources": {
+                            "profile": f"{prefix}/configs/profile.yaml"
+                        },
+                        "source_files": [{
+                            "path": f"{prefix}/configs/profile.yaml",
+                            "role": "profile",
+                            "sha256": "b" * 64,
+                        }],
+                        "origins": {"train_iterations": {
+                            "source_path": f"{prefix}/configs/profile.yaml",
+                            "source_sha256": "b" * 64,
+                            "authored_value": 65_000,
+                        }},
+                        "derivations": {"train_iterations": {
+                            "chosen_value": 65_000,
+                            "origin": {
+                                "source_path": f"{prefix}/configs/profile.yaml",
+                                "source_sha256": "b" * 64,
+                            },
+                        }},
+                    },
+                },
+            }
+
+        first = provenance("/checkout/one")
+        second = provenance("/checkout/two")
+        self.assertEqual(_training_identity(first), _training_identity(second))
+        second["effective_training_config"]["runtime_resolution"][
+            "source_files"
+        ][0]["sha256"] = "c" * 64
+        self.assertNotEqual(_training_identity(first), _training_identity(second))
+
     def test_scene_cli_accepts_explicit_repeatable_tile_runs(self):
         args = build_parser().parse_args([
             "scene-publish", "--config", "/tmp/config.yaml",
@@ -298,6 +337,41 @@ class TileSceneTests(unittest.TestCase):
             )
             self.assertEqual(
                 [item["core_owned_gaussians"] for item in records], [1, 2]
+            )
+
+    def test_core_concatenation_uses_global_indices_for_nonconsecutive_subset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            plan["partition"]["scene_bounds_uv_m"] = [[0.0, 0.0], [3.0, 1.0]]
+            plan["tiles"].append({
+                "tile_id": "tile-0002",
+                "core_bounds_uv_m": [[2.0, 0.0], [3.0, 1.0]],
+                "context_bounds_uv_m": [[1.75, -0.25], [3.25, 1.25]],
+                "frame_ids": {"train": [3], "val": [0], "test": []},
+            })
+            paths = [root / "a.pt", root / "c.pt"]
+            for path in paths:
+                path.write_bytes(path.name.encode())
+            loaded = {
+                paths[0]: _params([[0.5, 0.5, 0], [1.5, 0.5, 0]]),
+                paths[1]: _params([[1.5, 0.5, 0], [2.5, 0.5, 0]]),
+            }
+            completed = [
+                (plan["tiles"][0], paths[0], _sha(paths[0])),
+                (plan["tiles"][2], paths[1], _sha(paths[1])),
+            ]
+            with mock.patch(
+                "rtk_splat.backends.gsplat._load_checkpoint_gaussians",
+                side_effect=lambda path, _device: loaded[Path(path)],
+            ):
+                combined, records = _concatenate_core_params(plan, completed)
+            np.testing.assert_allclose(
+                combined["means"].numpy(),
+                [[0.5, 0.5, 0], [2.5, 0.5, 0]],
+            )
+            self.assertEqual(
+                [item["core_owned_gaussians"] for item in records], [1, 1]
             )
 
     def test_frozen_reference_requires_hashes_and_exact_source_validation(self):

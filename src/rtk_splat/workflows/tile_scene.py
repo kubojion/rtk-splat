@@ -310,7 +310,7 @@ def _selected_reference_metrics(
 
 
 def _training_identity(provenance: Mapping[str, Any]) -> dict[str, str]:
-    """Return the causal trainer identity, ignoring only the output run name."""
+    """Return trainer identity without output names or source-file locators."""
     implementation = provenance.get("training_implementation_sha256")
     config = provenance.get("effective_training_config")
     if (
@@ -322,6 +322,33 @@ def _training_identity(provenance: Mapping[str, Any]) -> dict[str, str]:
         raise ArtifactError("training run has no comparable implementation/config")
     comparable = copy.deepcopy(config)
     comparable["train"].pop("run_name", None)
+    # Layer locators prove where an authored file was loaded from, but their
+    # absolute checkout paths do not change the resolved scientific settings.
+    # Keep every content hash, role, authored value, derivation, and chosen
+    # value while removing only these non-causal locators.  This lets a sealed
+    # historical tile be compared with an identical tile trained from a fresh
+    # isolated worktree without weakening any configuration check.
+    runtime = comparable.get("runtime_resolution")
+    if isinstance(runtime, dict):
+        runtime.pop("config_sources", None)
+        source_files = runtime.get("source_files")
+        if isinstance(source_files, list):
+            for record in source_files:
+                if isinstance(record, dict):
+                    record.pop("path", None)
+        origins = runtime.get("origins")
+        if isinstance(origins, dict):
+            for record in origins.values():
+                if isinstance(record, dict):
+                    record.pop("source_path", None)
+        derivations = runtime.get("derivations")
+        if isinstance(derivations, dict):
+            for record in derivations.values():
+                if not isinstance(record, dict):
+                    continue
+                origin = record.get("origin")
+                if isinstance(origin, dict):
+                    origin.pop("source_path", None)
     return {
         "training_implementation_sha256": implementation,
         "comparable_training_config_sha256": canonical_hash(comparable),
@@ -500,7 +527,19 @@ def _concatenate_core_params(
 
     pieces: dict[str, list[Any]] = {name: [] for name in _PARAMETERS}
     records = []
-    for index, (tile, params_path, expected_hash) in enumerate(completed):
+    plan_indices = {
+        str(tile["tile_id"]): index
+        for index, tile in enumerate(plan["tiles"])
+    }
+    if len(plan_indices) != len(plan["tiles"]):
+        raise ArtifactError("TilePlan contains duplicate tile IDs")
+    completed_ids = [str(tile["tile_id"]) for tile, _, _ in completed]
+    if len(completed_ids) != len(set(completed_ids)):
+        raise ArtifactError("completed tile inputs contain duplicate tile IDs")
+    for tile, params_path, expected_hash in completed:
+        tile_id = str(tile["tile_id"])
+        if tile_id not in plan_indices:
+            raise ArtifactError(f"completed tile is absent from TilePlan: {tile_id}")
         params = _load_checkpoint_gaussians(params_path, "cpu")
         if sha256_file(params_path) != expected_hash:
             raise ArtifactError(f"tile params changed while loading: {params_path}")
@@ -508,7 +547,7 @@ def _concatenate_core_params(
         if means.ndim != 2 or means.shape[1] != 3 or not np.isfinite(means).all():
             raise ArtifactError(f"tile means are invalid: {params_path}")
         owners = owner_tile_indices(plan, means)
-        keep = torch.from_numpy(owners == index)
+        keep = torch.from_numpy(owners == plan_indices[tile_id])
         retained = int(keep.sum().item())
         if retained <= 0:
             raise ArtifactError(f"{tile['tile_id']} owns no final Gaussians")
@@ -527,6 +566,103 @@ def _concatenate_core_params(
         })
     combined = {name: torch.cat(values, dim=0) for name, values in pieces.items()}
     return combined, records
+
+
+def _shared_core_seam_segment(
+    first: Mapping[str, Any],
+    second: Mapping[str, Any],
+    *,
+    tolerance_m: float = 1e-9,
+) -> tuple[int, float, float, float]:
+    """Return the positive-length core edge shared by two adjacent tiles."""
+    a = np.asarray(first["core_bounds_uv_m"], dtype=np.float64)
+    b = np.asarray(second["core_bounds_uv_m"], dtype=np.float64)
+    if (
+        a.shape != (2, 2)
+        or b.shape != (2, 2)
+        or not np.isfinite(a).all()
+        or not np.isfinite(b).all()
+        or np.any(a[1] <= a[0])
+        or np.any(b[1] <= b[0])
+    ):
+        raise ArtifactError("tile core geometry is invalid")
+    segments = []
+    for axis in (0, 1):
+        other = 1 - axis
+        if math.isclose(
+            float(a[1, axis]),
+            float(b[0, axis]),
+            rel_tol=0.0,
+            abs_tol=tolerance_m,
+        ):
+            coordinate = float((a[1, axis] + b[0, axis]) / 2.0)
+        elif math.isclose(
+            float(b[1, axis]),
+            float(a[0, axis]),
+            rel_tol=0.0,
+            abs_tol=tolerance_m,
+        ):
+            coordinate = float((b[1, axis] + a[0, axis]) / 2.0)
+        else:
+            continue
+        low = float(max(a[0, other], b[0, other]))
+        high = float(min(a[1, other], b[1, other]))
+        if high - low > tolerance_m:
+            segments.append((axis, coordinate, low, high))
+    if len(segments) != 1:
+        raise ArtifactError("tiles do not share exactly one positive-length core edge")
+    return segments[0]
+
+
+def select_geometric_tile_neighbor(
+    plan: Mapping[str, Any],
+    anchor_tile_id: str,
+) -> dict[str, Any]:
+    """Select a neighbor using sealed core geometry only.
+
+    The longest shared edge wins; a tile-ID tie break makes the choice stable.
+    No images, validation metrics, or finished-model evidence are consulted.
+    """
+    tiles = plan.get("tiles")
+    if not isinstance(tiles, list) or len(tiles) < 2:
+        raise ArtifactError("TilePlan needs at least two tiles")
+    by_id = {str(tile.get("tile_id")): tile for tile in tiles}
+    if len(by_id) != len(tiles) or anchor_tile_id not in by_id:
+        raise ArtifactError("anchor tile is unknown or TilePlan IDs are invalid")
+    candidates = []
+    anchor = by_id[anchor_tile_id]
+    for tile_id, tile in by_id.items():
+        if tile_id == anchor_tile_id:
+            continue
+        try:
+            axis, coordinate, low, high = _shared_core_seam_segment(anchor, tile)
+        except ArtifactError:
+            continue
+        candidates.append({
+            "tile_id": tile_id,
+            "axis": int(axis),
+            "coordinate_m": float(coordinate),
+            "span_m": [float(low), float(high)],
+            "shared_edge_length_m": float(high - low),
+        })
+    if not candidates:
+        raise ArtifactError(f"tile has no edge-adjacent neighbor: {anchor_tile_id}")
+    ranked = sorted(
+        candidates,
+        key=lambda item: (-item["shared_edge_length_m"], item["tile_id"]),
+    )
+    return {
+        "policy": "maximum_shared_core_edge_then_tile_id_v1",
+        "uses_heldout_evidence": False,
+        "anchor_tile_id": anchor_tile_id,
+        "selected_tile_id": ranked[0]["tile_id"],
+        "selected_segment_uv": [
+            ranked[0]["axis"],
+            ranked[0]["coordinate_m"],
+            *ranked[0]["span_m"],
+        ],
+        "candidates": ranked,
+    }
 
 
 def _internal_seam_segments(plan: Mapping[str, Any]) -> list[tuple[int, float, float, float]]:
@@ -565,6 +701,7 @@ def _build_seam_masks(
     *,
     band_m: float = 1.0,
     minimum_pixels_per_frame: int = 256,
+    segments: Sequence[Sequence[float]] | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     """Project held-out metric depth and retain pixels near internal seams."""
     if not math.isfinite(band_m) or band_m <= 0:
@@ -578,7 +715,29 @@ def _build_seam_masks(
     basis = np.asarray(
         plan["coordinate_frame"]["R_enu_from_partition"], dtype=np.float64
     )
-    segments = _internal_seam_segments(plan)
+    if segments is None:
+        selected_segments = _internal_seam_segments(plan)
+        policy = "projected_metric_depth_internal_core_edges_v1"
+    else:
+        selected_segments = []
+        for item in segments:
+            if len(item) != 4:
+                raise ValueError("seam segment must be axis/coordinate/low/high")
+            axis, coordinate, low, high = item
+            if (
+                isinstance(axis, bool)
+                or int(axis) not in (0, 1)
+                or float(axis) != int(axis)
+                or not all(math.isfinite(float(value)) for value in (coordinate, low, high))
+                or float(high) <= float(low)
+            ):
+                raise ValueError("seam segment geometry is invalid")
+            selected_segments.append(
+                (int(axis), float(coordinate), float(low), float(high))
+            )
+        if not selected_segments:
+            raise ValueError("at least one seam segment is required")
+        policy = "projected_metric_depth_selected_core_edges_v1"
     masks: dict[int, np.ndarray] = {}
     records = []
     for frame_id in validation_ids:
@@ -600,7 +759,7 @@ def _build_seam_masks(
         world = camera_points @ c2w[:3, :3].T + c2w[:3, 3]
         uv = ((world - origin) @ basis)[:, :2]
         minimum_sq = np.full(len(uv), np.inf, dtype=np.float64)
-        for axis, coordinate, span_low, span_high in segments:
+        for axis, coordinate, span_low, span_high in selected_segments:
             other = 1 - axis
             across = uv[:, axis] - coordinate
             along = uv[:, other] - np.clip(
@@ -624,12 +783,12 @@ def _build_seam_masks(
             "held-out source split has insufficient metric-depth support at seams"
         )
     return masks, {
-        "policy": "projected_metric_depth_internal_core_edges_v1",
+        "policy": policy,
         "band_m": float(band_m),
         "minimum_pixels_per_frame": int(minimum_pixels_per_frame),
         "n_validation_frames": len(records),
         "metric_depth_pixels_in_band": total,
-        "internal_segments_uv": [list(item) for item in segments],
+        "internal_segments_uv": [list(item) for item in selected_segments],
         "frames": records,
     }
 
