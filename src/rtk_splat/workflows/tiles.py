@@ -673,6 +673,92 @@ def _support_coverage(reference: np.ndarray, covered: np.ndarray) -> float:
     )
 
 
+_COVERAGE_COMPLETION = {
+    "method": "greedy_missing_core_support_v1",
+    "split": "train",
+    "candidate_scope": "unselected_training_frames_with_core_support",
+    "ranking": "maximum_new_core_cells_then_lowest_frame_id",
+    "capacity": "never_exceed_max_training_frames",
+}
+
+
+def _complete_core_training_coverage(
+    support: Sequence[np.ndarray],
+    core: np.ndarray,
+    selected: np.ndarray,
+    split_codes: np.ndarray,
+    *,
+    max_training_frames: int,
+    minimum_coverage: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Add the fewest greedily useful train views needed for core coverage.
+
+    Visibility remains the primary selection rule.  This deterministic second
+    pass admits only an otherwise-unselected training frame that covers core
+    support cells still missing from the selected training set.  It never
+    changes validation/test membership or exceeds the sealed training-view
+    capacity.
+    """
+    result = np.asarray(selected, dtype=bool).copy()
+    codes = np.asarray(split_codes, dtype=np.uint8)
+    if result.shape != codes.shape or result.shape != (len(support),):
+        raise ValueError("coverage completion inputs have inconsistent shapes")
+    added = np.zeros(len(support), dtype=bool)
+    reference_array = _unique_support(support, core)
+    if len(reference_array) == 0:
+        return result, added
+    reference = {tuple(row) for row in reference_array.tolist()}
+    required = int(
+        math.ceil(float(minimum_coverage) * len(reference) - 1e-12)
+    )
+    train = codes == _SPLIT_CODE["train"]
+
+    def core_cells(frame_id: int) -> set[tuple[float, float]]:
+        points = support[frame_id]
+        if len(points) == 0:
+            return set()
+        return {
+            tuple(row)
+            for row in points[_in_bounds(points, core)].tolist()
+        }
+
+    covered: set[tuple[float, float]] = set()
+    for frame_id in np.flatnonzero(result & train):
+        covered.update(core_cells(int(frame_id)))
+    if len(covered) >= required:
+        return result, added
+    capacity = int(max_training_frames) - int(np.sum(result & train))
+    if capacity <= 0:
+        return result, added
+
+    import heapq
+
+    candidates: dict[int, set[tuple[float, float]]] = {}
+    heap: list[tuple[int, int]] = []
+    uncovered = reference - covered
+    for frame_id in np.flatnonzero(train & ~result):
+        cells = core_cells(int(frame_id))
+        gain = len(cells & uncovered)
+        if gain:
+            frame = int(frame_id)
+            candidates[frame] = cells
+            heapq.heappush(heap, (-gain, frame))
+    while heap and capacity > 0 and len(reference) - len(uncovered) < required:
+        negative_gain, frame_id = heapq.heappop(heap)
+        cells = candidates[frame_id]
+        gain = len(cells & uncovered)
+        if gain == 0:
+            continue
+        if gain != -negative_gain:
+            heapq.heappush(heap, (-gain, frame_id))
+            continue
+        result[frame_id] = True
+        added[frame_id] = True
+        uncovered.difference_update(cells)
+        capacity -= 1
+    return result, added
+
+
 def _selected(
     support: Sequence[np.ndarray], core: np.ndarray, halo: float,
     thresholds: np.ndarray,
@@ -963,6 +1049,13 @@ def verify_tile_plan(
         or not quality.get("passed")
     ):
         raise ArtifactError("tile-plan schema or quality status is invalid")
+    selection_record = plan.get("selection")
+    coverage_completion = selection_record == {
+        "primary": "configured_visibility_threshold_v1",
+        "coverage_completion": _COVERAGE_COMPLETION,
+    }
+    if selection_record is not None and not coverage_completion:
+        raise ArtifactError("tile-plan selection policy is unsupported")
     plan_name = str(plan.get("name", ""))
     valid_directory = root.name == plan_name or root.name.startswith(
         f".{plan_name}.writing-"
@@ -1102,6 +1195,8 @@ def verify_tile_plan(
         "core_cell_count",
         "context_cell_count",
     }
+    if coverage_completion:
+        row_fields |= {"visibility_selected", "coverage_selected"}
     required = row_fields | {
         "support_frame_ptr",
         "support_uv_m",
@@ -1126,6 +1221,11 @@ def verify_tile_plan(
         "support_uv_m": np.dtype("float64"),
         "sampled_depth_m": np.dtype("float32"),
     }
+    if coverage_completion:
+        exact_dtypes.update({
+            "visibility_selected": np.dtype("bool"),
+            "coverage_selected": np.dtype("bool"),
+        })
     if any(arrays[name].dtype != dtype for name, dtype in exact_dtypes.items()):
         raise ArtifactError("visibility evidence dtypes or split codes are invalid")
     if np.any(~np.isin(arrays["split_code"], [0, 1, 2])) or np.any(
@@ -1172,9 +1272,25 @@ def verify_tile_plan(
         ):
             raise ArtifactError("visibility tile rows do not cover canonical frame IDs")
         bounds = np.asarray(tile["core_bounds_uv_m"], dtype=np.float64)
-        expected_core, expected_context, expected_selected = _selected(
+        expected_core, expected_context, expected_visibility = _selected(
             support, bounds, policy.context_halo_m, thresholds
         )
+        if coverage_completion:
+            expected_selected, expected_coverage = (
+                _complete_core_training_coverage(
+                    support,
+                    bounds,
+                    expected_visibility,
+                    arrays["split_code"][rows],
+                    max_training_frames=policy.max_training_frames,
+                    minimum_coverage=(
+                        policy.min_core_train_support_coverage
+                    ),
+                )
+            )
+        else:
+            expected_selected = expected_visibility
+            expected_coverage = np.zeros(n_frames, dtype=bool)
         if (
             not np.array_equal(arrays["core_cell_count"][rows], expected_core)
             or not np.array_equal(
@@ -1183,6 +1299,19 @@ def verify_tile_plan(
             or not np.array_equal(arrays["selected"][rows], expected_selected)
         ):
             raise ArtifactError("visibility counts or selection semantics changed")
+        if coverage_completion and (
+            not np.array_equal(
+                arrays["visibility_selected"][rows], expected_visibility
+            )
+            or not np.array_equal(
+                arrays["coverage_selected"][rows], expected_coverage
+            )
+            or np.any(
+                arrays["coverage_selected"][rows]
+                & arrays["visibility_selected"][rows]
+            )
+        ):
+            raise ArtifactError("coverage-completion selection evidence changed")
         for split in _SPLITS:
             code = _SPLIT_CODE[split]
             actual = arrays["frame_id"][rows & (arrays["split_code"] == code) & arrays["selected"]].astype(int).tolist()
@@ -1210,6 +1339,19 @@ def verify_tile_plan(
                 unique_core, train_core
             ),
         }
+        if coverage_completion:
+            summary_expected.update({
+                "n_visibility_selected_train": int(np.sum(
+                    expected_visibility
+                    & (
+                        arrays["split_code"][rows]
+                        == _SPLIT_CODE["train"]
+                    )
+                )),
+                "n_coverage_selected_train": int(
+                    np.sum(expected_coverage)
+                ),
+            })
         for key, value in summary_expected.items():
             stored = tile["summary"].get(key)
             if isinstance(value, float):
@@ -1225,6 +1367,10 @@ def verify_tile_plan(
         raise ArtifactError("visibility split labels differ between tiles")
     if int(arrays["selected"].sum()) != plan["summary"]["n_selected_frame_occurrences"]:
         raise ArtifactError("tile-plan selected occurrence summary disagrees")
+    if coverage_completion and int(
+        arrays["coverage_selected"].sum()
+    ) != plan["summary"].get("n_coverage_selected_training_occurrences"):
+        raise ArtifactError("tile-plan coverage-completion summary disagrees")
     selected_matrix = arrays["selected"].reshape(len(tiles), n_frames)
     maximum_train = max(len(tile["frame_ids"]["train"]) for tile in tiles)
     minimum_core_train = min(
@@ -1488,13 +1634,22 @@ def build_tile_plan(
     frame_ids = reader.frames["frame_id"].astype(np.int64)
     evidence = {name: [] for name in (
         "tile_index", "frame_id", "split_code", "selected",
+        "visibility_selected", "coverage_selected",
         "core_cell_count", "context_cell_count",
     )}
     tiles = []
     selected_any = np.zeros(len(frame_ids), dtype=bool)
     for tile_index, core in enumerate(cores):
-        core_count, context_count, selected = _selected(
+        core_count, context_count, visibility_selected = _selected(
             support, core, halo, thresholds
+        )
+        selected, coverage_selected = _complete_core_training_coverage(
+            support,
+            core,
+            visibility_selected,
+            split_codes,
+            max_training_frames=policy.max_training_frames,
+            minimum_coverage=policy.min_core_train_support_coverage,
         )
         selected_any |= selected
         selections = {
@@ -1520,6 +1675,11 @@ def build_tile_plan(
                 "n_train": len(selections["train"]),
                 "n_val": len(selections["val"]),
                 "n_test": len(selections["test"]),
+                "n_visibility_selected_train": int(np.sum(
+                    visibility_selected
+                    & (split_codes == _SPLIT_CODE["train"])
+                )),
+                "n_coverage_selected_train": int(np.sum(coverage_selected)),
                 "n_core_visible_frames": int(np.sum(core_count >= thresholds)),
                 "n_core_visible_train_frames": core_visible_train,
                 "n_unique_core_support_cells": int(len(unique_core)),
@@ -1532,6 +1692,8 @@ def build_tile_plan(
             ("frame_id", frame_ids),
             ("split_code", split_codes),
             ("selected", selected),
+            ("visibility_selected", visibility_selected),
+            ("coverage_selected", coverage_selected),
             ("core_cell_count", core_count),
             ("context_cell_count", context_count),
         ):
@@ -1595,6 +1757,10 @@ def build_tile_plan(
             "z_ownership": "unbounded",
             "context_halo_m": halo,
         },
+        "selection": {
+            "primary": "configured_visibility_threshold_v1",
+            "coverage_completion": _COVERAGE_COMPLETION,
+        },
         "source_binding": {
             "inventory_sha256": canonical_hash(inventory),
             "pose_fingerprint": pose_fingerprint(viewmats),
@@ -1610,6 +1776,9 @@ def build_tile_plan(
             "n_source_frames": len(frame_ids),
             "n_train_source_frames": int(np.sum(split_codes == 0)),
             "n_selected_frame_occurrences": int(evidence_arrays["selected"].sum()),
+            "n_coverage_selected_training_occurrences": int(
+                evidence_arrays["coverage_selected"].sum()
+            ),
             "n_support_cell_observations": len(all_support),
             "n_unique_support_cells": len(unique_scene_support),
         },

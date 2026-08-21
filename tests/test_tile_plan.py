@@ -14,6 +14,7 @@ from rtk_splat.core.segment import (
     SegmentWriter,
 )
 from rtk_splat.workflows.tiles import (
+    _complete_core_training_coverage,
     build_tile_plan,
     load_tile_execution,
     owner_tile_indices,
@@ -279,6 +280,36 @@ def _diagnostic_pose(reader: SegmentReader, parent: Path, name: str) -> Path:
 
 
 class TilePlanTests(unittest.TestCase):
+    def test_core_coverage_completion_is_bounded_and_deterministic(self):
+        support = [
+            np.asarray([[0.5, 0.5]], dtype=np.float64),
+            np.asarray([[1.5, 0.5]], dtype=np.float64),
+            np.asarray([[1.5, 0.5]], dtype=np.float64),
+        ]
+        core = np.asarray([[0.0, 0.0], [2.0, 1.0]], dtype=np.float64)
+        selected = np.asarray([True, False, False])
+        split_codes = np.zeros(3, dtype=np.uint8)
+        completed, added = _complete_core_training_coverage(
+            support,
+            core,
+            selected,
+            split_codes,
+            max_training_frames=2,
+            minimum_coverage=1.0,
+        )
+        self.assertEqual(completed.tolist(), [True, True, False])
+        self.assertEqual(added.tolist(), [False, True, False])
+        capped, capped_added = _complete_core_training_coverage(
+            support,
+            core,
+            selected,
+            split_codes,
+            max_training_frames=1,
+            minimum_coverage=1.0,
+        )
+        self.assertEqual(capped.tolist(), selected.tolist())
+        self.assertFalse(capped_added.any())
+
     def test_diagnostic_pose_requires_permission_and_status_is_propagated(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -433,6 +464,29 @@ class TilePlanTests(unittest.TestCase):
                     output_root=root / "small", tile_count=1,
                 )
             self.assertFalse((root / "small" / "tile_plan_artifacts" / "too-small").exists())
+
+    def test_resealed_coverage_completion_tampering_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reader = _segment(root / "segment")
+            artifact = build_tile_plan(
+                reader,
+                _cfg(root / "work"),
+                name="coverage-selection",
+                output_root=root / "work",
+                tile_count=2,
+            )
+            visibility_path = artifact / "visibility.npz"
+            with np.load(visibility_path, allow_pickle=False) as archive:
+                arrays = {name: archive[name].copy() for name in archive.files}
+            self.assertIn("coverage_selected", arrays)
+            arrays["coverage_selected"][0] = ~arrays[
+                "coverage_selected"
+            ][0]
+            np.savez_compressed(visibility_path, **arrays)
+            _reseal(artifact, "visibility.npz")
+            with self.assertRaisesRegex(ValueError, "coverage-completion"):
+                verify_tile_plan(artifact)
 
     def test_live_depth_mutation_is_detected(self):
         with tempfile.TemporaryDirectory() as temporary:
