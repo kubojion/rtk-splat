@@ -62,7 +62,7 @@ class TiledGsCampaignLauncherTests(unittest.TestCase):
             self.assertIn("--pose-artifact-root", command)
             self.assertIn("--allow-failed-georeferencing-for-render", command)
         self.assertNotIn("--run-name", cloud)
-        self.assertEqual(train[train.index("--train-iters") + 1], "65000")
+        self.assertNotIn("--train-iters", train)
         self.assertEqual(
             train[train.index("--run-name") + 1],
             "diagnostic-tile-a-v1",
@@ -75,6 +75,14 @@ class TiledGsCampaignLauncherTests(unittest.TestCase):
             ),
             Path("/work/tile_runs/plan-v1/tile-a/run-v1"),
         )
+
+    def test_train_iteration_contract_checks_authored_value_without_override(self):
+        cfg = SimpleNamespace(train=SimpleNamespace(iterations=65_000))
+        MODULE._verify_authored_train_iterations(cfg, 65_000)
+        for value in (64_999, True, "65000", None):
+            cfg.train.iterations = value
+            with self.assertRaisesRegex(ValueError, "authored numeric config"):
+                MODULE._verify_authored_train_iterations(cfg, 65_000)
 
 
 if __name__ == "__main__":

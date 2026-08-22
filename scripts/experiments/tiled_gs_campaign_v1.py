@@ -60,7 +60,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--passed-seam-probe", required=True, type=Path)
     parser.add_argument("--campaign-name", required=True)
     parser.add_argument("--run-name-template", required=True)
-    parser.add_argument("--train-iters", required=True, type=int)
+    parser.add_argument(
+        "--train-iters",
+        required=True,
+        type=int,
+        help=(
+            "expected authored iteration count; verified but never injected as "
+            "a provenance-changing CLI override"
+        ),
+    )
     parser.add_argument(
         "--reuse-tile-run", action="append", type=_binding, default=[]
     )
@@ -71,6 +79,11 @@ def _parser() -> argparse.ArgumentParser:
         help="tile to launch in this order; default is every non-reused tile",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--reuse-existing-clouds",
+        action="store_true",
+        help="verify and reuse sealed tile clouds without re-materializing them",
+    )
     parser.add_argument(
         "--allow-failed-georeferencing-for-render",
         action="store_true",
@@ -148,12 +161,7 @@ def _stage_command(
     if stage == "train":
         if run_name is None:
             raise ValueError("train stage needs a run name")
-        command.extend([
-            "--run-name",
-            run_name,
-            "--train-iters",
-            str(args.train_iters),
-        ])
+        command.extend(["--run-name", run_name])
     return command
 
 
@@ -170,6 +178,18 @@ def _run_subprocess(command: Sequence[str], log: Path) -> None:
     if result.returncode:
         raise RuntimeError(
             f"command failed with exit {result.returncode}; inspect {log}"
+        )
+
+
+def _verify_authored_train_iterations(cfg: Any, expected: int) -> None:
+    authored = getattr(cfg.train, "iterations", None)
+    if (
+        isinstance(authored, bool)
+        or not isinstance(authored, int)
+        or authored != expected
+    ):
+        raise ValueError(
+            "expected train iterations disagree with the authored numeric config"
         )
 
 
@@ -191,6 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ArtifactError("campaign requires a sealed passing seam probe")
 
     cfg = load_config(args.config)
+    _verify_authored_train_iterations(cfg, args.train_iters)
     cfg.paths.workdir = args.workdir
     cfg.paths.segment = args.segment
     cfg.pose.artifact = args.pose_name
@@ -247,6 +268,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tile_ids": tile_ids,
         "reused_tile_ids": list(reuse),
         "requested_tile_ids": requested,
+        "expected_train_iterations": args.train_iters,
         "completed": {},
         "state": "running",
     }
@@ -258,6 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for key in (
             "campaign_name", "tile_plan_name", "tile_ids",
             "reused_tile_ids", "requested_tile_ids",
+            "expected_train_iterations",
         ):
             if previous.get(key) != progress[key]:
                 raise RuntimeError(f"campaign resume identity changed: {key}")
@@ -336,8 +359,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _atomic_json(progress_path, progress)
             continue
         if cloud.exists():
-            if not args.resume:
-                raise FileExistsError(f"refusing existing tile cloud: {cloud}")
+            if not args.resume and not args.reuse_existing_clouds:
+                raise FileExistsError(
+                    f"existing tile cloud needs --reuse-existing-clouds: {cloud}"
+                )
             verify_tile_cloud(
                 cloud,
                 execution,
