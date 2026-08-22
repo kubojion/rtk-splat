@@ -368,6 +368,10 @@ def publish_tile_seam_probe(
         raise ArtifactError(
             "non-production georeferencing requires an explicit diagnostic seam probe"
         )
+    diagnostic_render_permission = bool(
+        diagnostic_nonproduction
+        and allow_nonproduction_georeferencing_for_diagnostic
+    )
 
     selection = select_geometric_tile_neighbor(plan, str(anchor_tile_id))
     tile_ids = [
@@ -459,6 +463,7 @@ def publish_tile_seam_probe(
             validation_ids,
             band_m=1.0,
             segments=[selection["selected_segment_uv"]],
+            allow_failed_georeferencing_for_render=diagnostic_render_permission,
         )
         seam_ids = sorted(seam_masks)
         candidate = _evaluate_combined(
@@ -472,6 +477,7 @@ def publish_tile_seam_probe(
             maximum_render_depth_m=None,
             context_masks=seam_masks,
             context_mask_dilate_px=1,
+            allow_failed_georeferencing_for_render=diagnostic_render_permission,
         )
         components = {}
         for tile_id in tile_ids:
@@ -486,6 +492,9 @@ def publish_tile_seam_probe(
                 maximum_render_depth_m=None,
                 context_masks=seam_masks,
                 context_mask_dilate_px=1,
+                allow_failed_georeferencing_for_render=(
+                    diagnostic_render_permission
+                ),
             )
         expected_fingerprint = plan["source_binding"]["pose_fingerprint"]
         if any(
@@ -566,7 +575,13 @@ def publish_tile_seam_probe(
                 "core_owned_gaussians": int(len(combined["means"])),
             },
         }
-        viewmats, _ = load_pose_artifact(reader.root, cfg)
+        viewmats, _ = load_pose_artifact(
+            reader.root,
+            cfg,
+            allow_failed_georeferencing_for_render=(
+                diagnostic_render_permission
+            ),
+        )
         if pose_fingerprint(viewmats) != expected_fingerprint:
             raise ArtifactError("configured seam-probe pose disagrees with TilePlan")
         provenance_record = {

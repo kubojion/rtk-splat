@@ -836,7 +836,12 @@ class TileSceneTests(unittest.TestCase):
                 ),
                 mock.patch(
                     "rtk_splat.workflows.tile_scene._evaluate_combined",
-                    side_effect=[absolute, seam_absolute],
+                    side_effect=[
+                        absolute,
+                        seam_absolute,
+                        absolute,
+                        seam_absolute,
+                    ],
                 ) as evaluation,
                 mock.patch(
                     "rtk_splat.workflows.tile_scene._build_seam_masks",
@@ -852,11 +857,11 @@ class TileSceneTests(unittest.TestCase):
                             "frames": [],
                         },
                     ),
-                ),
+                ) as mask_builder,
                 mock.patch(
                     "rtk_splat.workflows.tile_scene.load_pose_artifact",
                     return_value=(viewmats, np.zeros((2, 3))),
-                ),
+                ) as pose_loader,
                 mock.patch(
                     "rtk_splat.backends.gsplat.export_splat_tensors",
                     side_effect=export,
@@ -877,8 +882,51 @@ class TileSceneTests(unittest.TestCase):
                     maximum_combined_gaussians=2,
                     device="cpu",
                 )
-            self.assertEqual(evaluation.call_count, 2)
-            self.assertEqual(plan_verifier.call_count, 2)
+                plan["provisional"] = True
+                plan["metric_georeferencing_claim_eligible"] = False
+                diagnostic_georeferencing = {
+                    **georeferencing,
+                    "artifact_class": "diagnostic_render_only",
+                    "georeferencing_status": "FAILED",
+                    "metric_georeferencing_claim_eligible": False,
+                }
+                _write_json(plan_root / "provenance.json", {
+                    "georeferencing": diagnostic_georeferencing
+                })
+                diagnostic_result = publish_production_tiled_scene(
+                    segment=segment,
+                    cfg=cfg,
+                    tile_plan_root=plan_root,
+                    pose_root=root / "pose",
+                    tile_runs=runs,
+                    output_root=root / "output",
+                    scene_name="diagnostic-scene-v1",
+                    maximum_combined_gaussians=2,
+                    device="cpu",
+                    allow_nonproduction_georeferencing_for_diagnostic=True,
+                )
+            self.assertEqual(evaluation.call_count, 4)
+            self.assertEqual(plan_verifier.call_count, 4)
+            self.assertFalse(
+                mask_builder.call_args_list[0].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(
+                mask_builder.call_args_list[1].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertFalse(
+                pose_loader.call_args_list[0].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(
+                pose_loader.call_args_list[1].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
             self.assertTrue(result["quality_passed"])
             self.assertFalse(result["provisional"])
             self.assertEqual(result["n_tiles"], 2)
@@ -886,6 +934,17 @@ class TileSceneTests(unittest.TestCase):
             self.assertTrue((scene_root / "scene.ply").is_file())
             verified = verify_tiled_scene(scene_root)
             self.assertEqual(verified["publication_mode"], "production")
+            self.assertTrue(diagnostic_result["quality_passed"])
+            self.assertTrue(diagnostic_result["provisional"])
+            self.assertFalse(
+                diagnostic_result["metric_georeferencing_claim_eligible"]
+            )
+            self.assertTrue(
+                (
+                    Path(diagnostic_result["scene"])
+                    / "scene.DIAGNOSTIC_ONLY.ply"
+                ).is_file()
+            )
             metrics = json.loads((scene_root / "metrics.json").read_text())
             self.assertEqual(
                 metrics["evaluation"]["comparison"],

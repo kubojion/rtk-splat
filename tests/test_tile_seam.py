@@ -250,15 +250,15 @@ class TileSeamTests(unittest.TestCase):
                             ],
                         },
                     ),
-                ),
+                ) as mask_builder,
                 mock.patch(
                     "rtk_splat.workflows.tile_seam._evaluate_combined",
                     side_effect=[candidate, first, second],
-                ),
+                ) as evaluator,
                 mock.patch(
                     "rtk_splat.workflows.tile_seam.load_pose_artifact",
                     return_value=(viewmats, np.zeros((2, 3))),
-                ),
+                ) as pose_loader,
                 mock.patch(
                     "rtk_splat.workflows.tile_seam.collect_package_state",
                     return_value={"python_tree_sha256": "c" * 64},
@@ -278,6 +278,20 @@ class TileSeamTests(unittest.TestCase):
                     allow_nonproduction_georeferencing_for_diagnostic=True,
                 )
             self.assertTrue(result["quality_passed"])
+            self.assertTrue(
+                mask_builder.call_args.kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(all(
+                call.kwargs["allow_failed_georeferencing_for_render"]
+                for call in evaluator.call_args_list
+            ))
+            self.assertTrue(
+                pose_loader.call_args.kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
             probe = Path(result["probe"])
             self.assertTrue(probe.is_dir())
             self.assertTrue(verify_tile_seam_probe(probe)["provisional"])

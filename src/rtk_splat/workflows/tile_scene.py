@@ -708,11 +708,18 @@ def _build_seam_masks(
     band_m: float = 1.0,
     minimum_pixels_per_frame: int = 256,
     segments: Sequence[Sequence[float]] | None = None,
+    allow_failed_georeferencing_for_render: bool = False,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     """Project held-out metric depth and retain pixels near internal seams."""
     if not math.isfinite(band_m) or band_m <= 0:
         raise ValueError("seam band must be finite and positive")
-    viewmats, _ = load_pose_artifact(reader.root, cfg)
+    viewmats, _ = load_pose_artifact(
+        reader.root,
+        cfg,
+        allow_failed_georeferencing_for_render=bool(
+            allow_failed_georeferencing_for_render
+        ),
+    )
     camera = reader.calibration["cameras"]["left"]
     intr = np.asarray(camera["K"], dtype=np.float64)
     origin = np.asarray(
@@ -812,6 +819,7 @@ def _evaluate_combined(
     frustum_sigma: float = 3.0,
     context_masks: Mapping[int, np.ndarray] | None = None,
     context_mask_dilate_px: int | None = None,
+    allow_failed_georeferencing_for_render: bool = False,
 ) -> dict[str, Any]:
     """Render once per held-out view with a conservative CPU frustum cull.
 
@@ -824,7 +832,13 @@ def _evaluate_combined(
     import torch
     from rtk_splat.backends.gsplat import evaluate
 
-    viewmats, _ = load_pose_artifact(reader.root, cfg)
+    viewmats, _ = load_pose_artifact(
+        reader.root,
+        cfg,
+        allow_failed_georeferencing_for_render=bool(
+            allow_failed_georeferencing_for_render
+        ),
+    )
     expected_fingerprint = pose_fingerprint(viewmats)
     camera = reader.calibration["cameras"]["left"]
     intr = np.asarray(camera["K"], dtype=np.float64)
@@ -1497,7 +1511,15 @@ def publish_production_tiled_scene(
         or any(item["core_owned_gaussians"] <= 0 for item in ownership_records)
     ):
         raise ArtifactError("final Gaussian ownership accounting is incomplete")
-    viewmats, _ = load_pose_artifact(reader.root, cfg)
+    diagnostic_render_permission = bool(
+        diagnostic_nonproduction
+        and allow_nonproduction_georeferencing_for_diagnostic
+    )
+    viewmats, _ = load_pose_artifact(
+        reader.root,
+        cfg,
+        allow_failed_georeferencing_for_render=diagnostic_render_permission,
+    )
     if pose_fingerprint(viewmats) != plan["source_binding"]["pose_fingerprint"]:
         raise ArtifactError("configured evaluation pose disagrees with the TilePlan")
 
@@ -1515,9 +1537,15 @@ def publish_production_tiled_scene(
             device=device,
             maximum_visible_gaussians=int(maximum_combined_gaussians),
             maximum_render_depth_m=None,
+            allow_failed_georeferencing_for_render=diagnostic_render_permission,
         )
         seam_masks, seam_evidence = _build_seam_masks(
-            reader, cfg, plan, validation_ids, band_m=1.0
+            reader,
+            cfg,
+            plan,
+            validation_ids,
+            band_m=1.0,
+            allow_failed_georeferencing_for_render=diagnostic_render_permission,
         )
         seam_ids = sorted(seam_masks)
         seam_root = staging / "seam_absolute"
@@ -1533,6 +1561,7 @@ def publish_production_tiled_scene(
             maximum_render_depth_m=None,
             context_masks=seam_masks,
             context_mask_dilate_px=1,
+            allow_failed_georeferencing_for_render=diagnostic_render_permission,
         )
         expected_fingerprint = plan["source_binding"]["pose_fingerprint"]
         if (
