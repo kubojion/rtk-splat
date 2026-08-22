@@ -18,6 +18,7 @@ from rtk_splat.workflows.tile_scene import (
     _compose_depth_projected_layers,
     _evaluate_combined,
     _expected_tile_binding,
+    _manifest,
     _reference_run_evidence,
     _training_identity,
     publish_production_tiled_scene,
@@ -223,10 +224,15 @@ class TileSceneTests(unittest.TestCase):
             "--scene-tile-run", "tile-0000=/tmp/run-a",
             "--scene-tile-run", "tile-0001=/tmp/run-b",
             "--scene-name", "scene-v2", "--scene-mode", "production",
+            "--scene-assembly-policy", "depth_projected_context_composite_v1",
             "--diagnostic-scene",
         ])
         self.assertEqual(production.scene_mode, "production")
         self.assertTrue(production.diagnostic_scene)
+        self.assertEqual(
+            production.scene_assembly_policy,
+            "depth_projected_context_composite_v1",
+        )
         self.assertIsNone(production.reference_run)
 
         seam = build_parser().parse_args([
@@ -250,6 +256,7 @@ class TileSceneTests(unittest.TestCase):
             "--scene-tile-run", "tile-0000=/tmp/run-a",
             "--scene-tile-run", "tile-0001=/tmp/run-b",
             "--scene-name", "scene-v2", "--scene-mode", "production",
+            "--scene-assembly-policy", "depth_projected_context_composite_v1",
             "--diagnostic-scene", "--max-combined-gaussians", "123",
             "--scene-device", "cpu",
         ])
@@ -267,6 +274,10 @@ class TileSceneTests(unittest.TestCase):
         self.assertNotIn("reference_hashes", kwargs)
         self.assertTrue(
             kwargs["allow_nonproduction_georeferencing_for_diagnostic"]
+        )
+        self.assertEqual(
+            kwargs["assembly_policy"],
+            "depth_projected_context_composite_v1",
         )
         self.assertEqual(kwargs["maximum_combined_gaussians"], 123)
 
@@ -938,6 +949,18 @@ class TileSceneTests(unittest.TestCase):
                 "ssim": 0.58,
                 "lpips_cc": 0.11,
             }
+            layered_absolute = {
+                **absolute,
+                "layer_composition": {
+                    "routing": "sealed_tileplan_validation_visibility_v1"
+                },
+            }
+            layered_seam_absolute = {
+                **seam_absolute,
+                "layer_composition": {
+                    "routing": "sealed_tileplan_validation_visibility_v1"
+                },
+            }
             seam_mask = np.ones((2, 2), dtype=bool)
 
             def export(_params, output, **_kwargs):
@@ -962,6 +985,16 @@ class TileSceneTests(unittest.TestCase):
                     return_value=(params, ownership),
                 ),
                 mock.patch(
+                    "rtk_splat.workflows.tile_scene._load_layer_params_with_core_audit",
+                    return_value=(
+                        {
+                            "tile-0000": params,
+                            "tile-0001": params,
+                        },
+                        ownership,
+                    ),
+                ) as layer_loader,
+                mock.patch(
                     "rtk_splat.workflows.tile_scene._evaluate_combined",
                     side_effect=[
                         absolute,
@@ -970,6 +1003,10 @@ class TileSceneTests(unittest.TestCase):
                         seam_absolute,
                     ],
                 ) as evaluation,
+                mock.patch(
+                    "rtk_splat.workflows.tile_scene._evaluate_depth_projected_layers",
+                    side_effect=[layered_absolute, layered_seam_absolute],
+                ) as layered_evaluation,
                 mock.patch(
                     "rtk_splat.workflows.tile_scene._build_seam_masks",
                     return_value=(
@@ -1032,8 +1069,23 @@ class TileSceneTests(unittest.TestCase):
                     device="cpu",
                     allow_nonproduction_georeferencing_for_diagnostic=True,
                 )
+                layered_result = publish_production_tiled_scene(
+                    segment=segment,
+                    cfg=cfg,
+                    tile_plan_root=plan_root,
+                    pose_root=root / "pose",
+                    tile_runs=runs,
+                    output_root=root / "output",
+                    scene_name="diagnostic-layered-scene-v1",
+                    maximum_combined_gaussians=2,
+                    device="cpu",
+                    allow_nonproduction_georeferencing_for_diagnostic=True,
+                    assembly_policy="depth_projected_context_composite_v1",
+                )
             self.assertEqual(evaluation.call_count, 4)
-            self.assertEqual(plan_verifier.call_count, 4)
+            self.assertEqual(layered_evaluation.call_count, 2)
+            self.assertEqual(layer_loader.call_count, 1)
+            self.assertEqual(plan_verifier.call_count, 6)
             self.assertFalse(
                 mask_builder.call_args_list[0].kwargs[
                     "allow_failed_georeferencing_for_render"
@@ -1044,6 +1096,11 @@ class TileSceneTests(unittest.TestCase):
                     "allow_failed_georeferencing_for_render"
                 ]
             )
+            self.assertTrue(
+                mask_builder.call_args_list[2].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
             self.assertFalse(
                 pose_loader.call_args_list[0].kwargs[
                     "allow_failed_georeferencing_for_render"
@@ -1051,6 +1108,11 @@ class TileSceneTests(unittest.TestCase):
             )
             self.assertTrue(
                 pose_loader.call_args_list[1].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(
+                pose_loader.call_args_list[2].kwargs[
                     "allow_failed_georeferencing_for_render"
                 ]
             )
@@ -1072,6 +1134,32 @@ class TileSceneTests(unittest.TestCase):
                     / "scene.DIAGNOSTIC_ONLY.ply"
                 ).is_file()
             )
+            layered_root = Path(layered_result["scene"])
+            self.assertTrue((layered_root / "layers.json").is_file())
+            self.assertIsNone(layered_result["splat"])
+            self.assertEqual(
+                verify_tiled_scene(layered_root)["representation"],
+                "sealed_tile_layers",
+            )
+            layer_index = json.loads(
+                (layered_root / "layers.json").read_text(encoding="utf-8")
+            )
+            layer_index["layers"][0]["params_sha256"] = "0" * 64
+            _write_json(layered_root / "layers.json", layer_index)
+            layered_scene = json.loads(
+                (layered_root / "scene.json").read_text(encoding="utf-8")
+            )
+            layered_scene["layer_index_sha256"] = _sha(
+                layered_root / "layers.json"
+            )
+            layered_scene["layer_index_size_bytes"] = (
+                layered_root / "layers.json"
+            ).stat().st_size
+            _write_json(layered_root / "scene.json", layered_scene)
+            (layered_root / "manifest.json").unlink()
+            _write_json(layered_root / "manifest.json", _manifest(layered_root))
+            with self.assertRaisesRegex(ValueError, "layer index"):
+                verify_tiled_scene(layered_root)
             metrics = json.loads((scene_root / "metrics.json").read_text())
             self.assertEqual(
                 metrics["evaluation"]["comparison"],

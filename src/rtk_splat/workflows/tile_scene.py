@@ -38,6 +38,8 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _METRICS = ("psnr_masked", "psnr_masked_cc", "ssim", "lpips_cc")
 _PARAMETERS = ("means", "quats", "scales", "opacities", "sh0", "shN")
+HARD_SCENE_ASSEMBLY_POLICY = "hard_half_open_core_v1"
+LAYERED_SCENE_ASSEMBLY_POLICY = "depth_projected_context_composite_v1"
 
 
 def _safe_name(value: str) -> str:
@@ -122,12 +124,56 @@ def verify_tiled_scene(root: str | Path) -> dict[str, Any]:
         is not (not scene.get("metric_georeferencing_claim_eligible"))
     ):
         raise ArtifactError("tiled-scene status claims disagree")
-    output = root / str(scene.get("splat_file", ""))
-    if _record(output) != {
-        "sha256": scene.get("splat_sha256"),
-        "size_bytes": scene.get("splat_size_bytes"),
-    }:
-        raise ArtifactError("tiled-scene PLY evidence is invalid")
+    representation = scene.get("representation", "combined_ply")
+    layer_index = None
+    if representation == "combined_ply":
+        output = root / str(scene.get("splat_file", ""))
+        if _record(output) != {
+            "sha256": scene.get("splat_sha256"),
+            "size_bytes": scene.get("splat_size_bytes"),
+        }:
+            raise ArtifactError("tiled-scene PLY evidence is invalid")
+    elif representation == "sealed_tile_layers":
+        index_path = root / str(scene.get("layer_index_file", ""))
+        if _record(index_path) != {
+            "sha256": scene.get("layer_index_sha256"),
+            "size_bytes": scene.get("layer_index_size_bytes"),
+        }:
+            raise ArtifactError("tiled-scene layer-index evidence is invalid")
+        layer_index = _json(index_path)
+        indexed_layers = layer_index.get("layers") if isinstance(
+            layer_index, dict
+        ) else None
+        source_runs = provenance.get("tile_runs")
+        if (
+            not isinstance(layer_index, dict)
+            or layer_index.get("schema_version") != SCHEMA_VERSION
+            or layer_index.get("assembly_policy")
+            != scene.get("assembly_policy")
+            or provenance.get("assembly_policy") != scene.get("assembly_policy")
+            or not isinstance(indexed_layers, list)
+            or not isinstance(source_runs, list)
+            or len(indexed_layers) != len(source_runs)
+            or any(
+                not isinstance(layer, dict)
+                or not isinstance(run, dict)
+                or layer.get("tile_id") != run.get("tile_id")
+                or layer.get("run") != run.get("run")
+                or layer.get("params_sha256") != run.get("params_sha256")
+                or layer.get("source_splat_file")
+                != run.get("source_splat_file")
+                or layer.get("source_splat_sha256")
+                != run.get("source_splat_sha256")
+                for layer, run in zip(indexed_layers, source_runs)
+            )
+            or any(
+                key in scene
+                for key in ("splat_file", "splat_sha256", "splat_size_bytes")
+            )
+        ):
+            raise ArtifactError("tiled-scene layer index is invalid")
+    else:
+        raise ArtifactError("tiled-scene representation is invalid")
     checks = quality.get("checks")
     if not isinstance(checks, dict) or not all(
         isinstance(value, bool) for value in checks.values()
@@ -135,9 +181,12 @@ def verify_tiled_scene(root: str | Path) -> dict[str, Any]:
         raise ArtifactError("tiled-scene quality checks are invalid")
     if quality.get("passed") is not all(checks.values()):
         raise ArtifactError("tiled-scene quality result disagrees with its checks")
-    if metrics.get("evaluation", {}).get("aggregation") != (
+    expected_aggregation = (
         "single_render_of_concatenated_core_owned_gaussians"
-    ):
+        if representation == "combined_ply"
+        else "depth_projected_context_composite_v1"
+    )
+    if metrics.get("evaluation", {}).get("aggregation") != expected_aggregation:
         raise ArtifactError("tiled-scene evaluation aggregation is invalid")
     publication_mode = scene.get("publication_mode", "controlled_ab")
     if publication_mode not in {"controlled_ab", "production"}:
@@ -224,6 +273,12 @@ def verify_tiled_scene(root: str | Path) -> dict[str, Any]:
             != sum(
                 int(item.get("outside_or_other_core_gaussians", -1))
                 for item in tiles
+            )
+            or (
+                representation == "sealed_tile_layers"
+                and [
+                    item.get("tile_id") for item in layer_index["layers"]
+                ] != planned
             )
         ):
             raise ArtifactError("production tiled-scene completeness is invalid")
@@ -572,6 +627,56 @@ def _concatenate_core_params(
         })
     combined = {name: torch.cat(values, dim=0) for name, values in pieces.items()}
     return combined, records
+
+
+def _load_layer_params_with_core_audit(
+    plan: Mapping[str, Any],
+    completed: Sequence[tuple[Mapping[str, Any], Path, str]],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Load complete tile layers while auditing unique core ownership."""
+    import torch
+    from rtk_splat.backends.gsplat import _load_checkpoint_gaussians
+
+    plan_indices = {
+        str(tile["tile_id"]): index
+        for index, tile in enumerate(plan["tiles"])
+    }
+    completed_ids = [str(tile["tile_id"]) for tile, _, _ in completed]
+    if (
+        len(plan_indices) != len(plan["tiles"])
+        or len(completed_ids) != len(set(completed_ids))
+        or any(tile_id not in plan_indices for tile_id in completed_ids)
+    ):
+        raise ArtifactError("layer inputs disagree with unique TilePlan IDs")
+    layers = {}
+    records = []
+    for tile, params_path, expected_hash in completed:
+        tile_id = str(tile["tile_id"])
+        params = _load_checkpoint_gaussians(params_path, "cpu")
+        if sha256_file(params_path) != expected_hash:
+            raise ArtifactError(f"tile params changed while loading: {params_path}")
+        means = params["means"].detach().cpu().numpy()
+        if means.ndim != 2 or means.shape[1] != 3 or not np.isfinite(means).all():
+            raise ArtifactError(f"tile means are invalid: {params_path}")
+        for name in _PARAMETERS:
+            tensor = params[name].detach().cpu()
+            if len(tensor) != len(means) or not bool(torch.isfinite(tensor).all()):
+                raise ArtifactError(f"invalid {name} tensor in {params_path}")
+        owners = owner_tile_indices(plan, means)
+        retained = int(np.sum(owners == plan_indices[tile_id]))
+        if retained <= 0:
+            raise ArtifactError(f"{tile_id} owns no auditable core Gaussians")
+        layers[tile_id] = params
+        records.append({
+            "tile_id": tile_id,
+            "source_params": str(params_path.resolve()),
+            "source_params_sha256": expected_hash,
+            "source_gaussians": len(means),
+            "core_owned_gaussians": retained,
+            "outside_or_other_core_gaussians": int(len(means) - retained),
+            "retained_layer_gaussians": len(means),
+        })
+    return layers, records
 
 
 def _core_feather_raw_weight(
@@ -1324,6 +1429,7 @@ def _evaluate_depth_projected_layers(
         viewmats, dtype=torch.float32, device=device
     ))
     geometry = {}
+    validation_routes = {}
     for tile_id in tile_ids:
         params = component_params[tile_id]
         means = params["means"].detach().cpu().numpy().astype(
@@ -1337,6 +1443,10 @@ def _evaluate_depth_projected_layers(
             * float(frustum_sigma)
         )
         geometry[tile_id] = (means, radii)
+    for tile in tiles:
+        tile_id = str(tile["tile_id"])
+        frame_ids = tile.get("frame_ids", {}).get("val", [])
+        validation_routes[tile_id] = {int(value) for value in frame_ids}
     planes = np.asarray([
         [intr[0, 0], 0.0, intr[0, 2]],
         [-intr[0, 0], 0.0, width - intr[0, 2]],
@@ -1359,6 +1469,15 @@ def _evaluate_depth_projected_layers(
         raise ValueError("evaluation mask dilation must be positive")
     for frame_id in validation_ids:
         frame_id = int(frame_id)
+        active_tiles = [
+            tile
+            for tile in tiles
+            if frame_id in validation_routes[str(tile["tile_id"])]
+        ]
+        if not active_tiles:
+            raise ArtifactError(
+                f"TilePlan routes no validation layer for frame {frame_id}"
+            )
         rgb_gt, _, _, supervision = _load_frame(
             reader.root,
             reader.frames,
@@ -1373,7 +1492,8 @@ def _evaluate_depth_projected_layers(
         layers = []
         selected_by_tile = {}
         with torch.no_grad():
-            for tile_id in tile_ids:
+            for tile in active_tiles:
+                tile_id = str(tile["tile_id"])
                 params = component_params[tile_id]
                 means, radii = geometry[tile_id]
                 camera_points = means @ viewmat[:3, :3].T + viewmat[:3, 3]
@@ -1420,7 +1540,7 @@ def _evaluate_depth_projected_layers(
                 selected_by_tile[tile_id] = selected
                 del device_params
             rgb, composition = _compose_depth_projected_layers(
-                layers, tiles, plan, c2ws[frame_id], k_mat
+                layers, active_tiles, plan, c2ws[frame_id], k_mat
             )
             full = torch.ones_like(supervision)
             near = torch.zeros_like(supervision)
@@ -1477,6 +1597,7 @@ def _evaluate_depth_projected_layers(
             "uses_reference_image": False,
             "uses_heldout_evidence_for_weights": False,
             "tile_ids": tile_ids,
+            "routing": "sealed_tileplan_validation_visibility_v1",
             "views": view_records,
         },
         "frustum_culling": {
@@ -1905,6 +2026,7 @@ def publish_production_tiled_scene(
     maximum_combined_gaussians: int | None = None,
     device: str = "cuda",
     allow_nonproduction_georeferencing_for_diagnostic: bool = False,
+    assembly_policy: str = HARD_SCENE_ASSEMBLY_POLICY,
 ) -> dict[str, Any]:
     """Publish an absolute-evidence tiled scene without a monolithic control.
 
@@ -1932,6 +2054,12 @@ def publish_production_tiled_scene(
         maximum_combined_gaussians = int(configured_capacity)
     if maximum_combined_gaussians <= 0:
         raise ValueError("maximum_combined_gaussians must be positive")
+    assembly_policy = str(assembly_policy)
+    if assembly_policy not in {
+        HARD_SCENE_ASSEMBLY_POLICY,
+        LAYERED_SCENE_ASSEMBLY_POLICY,
+    }:
+        raise ValueError(f"unknown scene assembly policy: {assembly_policy}")
 
     destination = Path(output_root).expanduser() / "scene_artifacts" / name
     if destination.exists():
@@ -2020,8 +2148,36 @@ def publish_production_tiled_scene(
         })
         completed.append((tile, params, params_hash))
 
-    params, ownership_records = _concatenate_core_params(plan, completed)
-    total = int(len(params["means"]))
+    if assembly_policy == HARD_SCENE_ASSEMBLY_POLICY:
+        params, ownership_records = _concatenate_core_params(plan, completed)
+        component_params = None
+        assembly_record = {
+            "name": HARD_SCENE_ASSEMBLY_POLICY,
+            "materialization": "single_core_owned_tensor",
+            "uses_heldout_evidence": False,
+        }
+    else:
+        params = None
+        component_params, ownership_records = _load_layer_params_with_core_audit(
+            plan, completed
+        )
+        context_halo = float(plan["partition"]["context_halo_m"])
+        if not math.isfinite(context_halo) or context_halo <= 0:
+            raise ArtifactError("layered scene needs a positive TilePlan halo")
+        assembly_record = {
+            "name": LAYERED_SCENE_ASSEMBLY_POLICY,
+            "materialization": "separate_immutable_tile_layers",
+            "uses_heldout_evidence": False,
+            "weight_source": "sealed_tileplan_core_context_geometry",
+            "position_source": "rendered_expected_depth",
+            "coverage_confidence": "rendered_alpha",
+            "composition": "normalized_complete_layer_radiance_crossfade_v1",
+            "routing": "sealed_tileplan_validation_visibility_v1",
+            "tile_context_halo_m": context_halo,
+        }
+    total = int(sum(
+        item["core_owned_gaussians"] for item in ownership_records
+    ))
     source_total = int(sum(
         item["source_gaussians"] for item in ownership_records
     ))
@@ -2052,17 +2208,36 @@ def publish_production_tiled_scene(
     staging.mkdir()
     try:
         (staging / "renders").mkdir()
-        absolute = _evaluate_combined(
-            params,
-            reader,
-            cfg,
-            staging,
-            validation_ids,
-            device=device,
-            maximum_visible_gaussians=int(maximum_combined_gaussians),
-            maximum_render_depth_m=None,
-            allow_failed_georeferencing_for_render=diagnostic_render_permission,
-        )
+        if assembly_policy == LAYERED_SCENE_ASSEMBLY_POLICY:
+            absolute = _evaluate_depth_projected_layers(
+                component_params,
+                tiles,
+                plan,
+                reader,
+                cfg,
+                staging,
+                validation_ids,
+                device=device,
+                maximum_visible_gaussians=int(maximum_combined_gaussians),
+                maximum_render_depth_m=None,
+                allow_failed_georeferencing_for_render=(
+                    diagnostic_render_permission
+                ),
+            )
+        else:
+            absolute = _evaluate_combined(
+                params,
+                reader,
+                cfg,
+                staging,
+                validation_ids,
+                device=device,
+                maximum_visible_gaussians=int(maximum_combined_gaussians),
+                maximum_render_depth_m=None,
+                allow_failed_georeferencing_for_render=(
+                    diagnostic_render_permission
+                ),
+            )
         seam_masks, seam_evidence = _build_seam_masks(
             reader,
             cfg,
@@ -2074,19 +2249,40 @@ def publish_production_tiled_scene(
         seam_ids = sorted(seam_masks)
         seam_root = staging / "seam_absolute"
         (seam_root / "renders").mkdir(parents=True)
-        seam_absolute = _evaluate_combined(
-            params,
-            reader,
-            cfg,
-            seam_root,
-            seam_ids,
-            device=device,
-            maximum_visible_gaussians=int(maximum_combined_gaussians),
-            maximum_render_depth_m=None,
-            context_masks=seam_masks,
-            context_mask_dilate_px=1,
-            allow_failed_georeferencing_for_render=diagnostic_render_permission,
-        )
+        if assembly_policy == LAYERED_SCENE_ASSEMBLY_POLICY:
+            seam_absolute = _evaluate_depth_projected_layers(
+                component_params,
+                tiles,
+                plan,
+                reader,
+                cfg,
+                seam_root,
+                seam_ids,
+                device=device,
+                maximum_visible_gaussians=int(maximum_combined_gaussians),
+                maximum_render_depth_m=None,
+                context_masks=seam_masks,
+                context_mask_dilate_px=1,
+                allow_failed_georeferencing_for_render=(
+                    diagnostic_render_permission
+                ),
+            )
+        else:
+            seam_absolute = _evaluate_combined(
+                params,
+                reader,
+                cfg,
+                seam_root,
+                seam_ids,
+                device=device,
+                maximum_visible_gaussians=int(maximum_combined_gaussians),
+                maximum_render_depth_m=None,
+                context_masks=seam_masks,
+                context_mask_dilate_px=1,
+                allow_failed_georeferencing_for_render=(
+                    diagnostic_render_permission
+                ),
+            )
         expected_fingerprint = plan["source_binding"]["pose_fingerprint"]
         if (
             absolute["pose_fingerprint"] != expected_fingerprint
@@ -2118,6 +2314,8 @@ def publish_production_tiled_scene(
                 == common_training_identity["comparable_training_config_sha256"]
                 for item in run_records
             ),
+            "assembly_policy_is_sealed": assembly_record["name"]
+            == assembly_policy,
             "exact_half_open_core_ownership": True,
             "every_tile_contributes_core_gaussians": all(
                 item["core_owned_gaussians"] > 0 for item in ownership_records
@@ -2125,9 +2323,14 @@ def publish_production_tiled_scene(
             "ownership_accounting_is_exact": (
                 source_total == total + outside_total
             ),
-            "combined_evaluation_uses_source_validation_once": (
+            "scene_evaluation_uses_source_validation_once": (
                 absolute["eval_ids"] == validation_ids
                 and absolute.get("n_eval") == len(validation_ids)
+            ),
+            "layered_evaluation_uses_sealed_plan_routing": (
+                assembly_policy != LAYERED_SCENE_ASSEMBLY_POLICY
+                or absolute.get("layer_composition", {}).get("routing")
+                == "sealed_tileplan_validation_visibility_v1"
             ),
             "whole_scene_absolute_metrics_are_finite": absolute_metrics_finite,
             "seam_metric_depth_evidence_is_sufficient": (
@@ -2140,22 +2343,51 @@ def publish_production_tiled_scene(
         if not quality_passed:
             raise ArtifactError("production scene failed integrity/completeness checks")
 
-        splat_name = (
-            "scene.ply"
-            if production_georeferencing
-            else "scene.DIAGNOSTIC_ONLY.ply"
-        )
-        from rtk_splat.backends.gsplat import export_splat_tensors
+        splat_name = None
+        splat_record = None
+        layer_index_record = None
+        if assembly_policy == LAYERED_SCENE_ASSEMBLY_POLICY:
+            retained = source_total
+            layer_index = {
+                "schema_version": SCHEMA_VERSION,
+                "assembly_policy": assembly_record,
+                "tile_plan_name": plan["name"],
+                "layers": [
+                    {
+                        "tile_id": str(tile["tile_id"]),
+                        "core_bounds_uv_m": tile["core_bounds_uv_m"],
+                        "context_bounds_uv_m": tile["context_bounds_uv_m"],
+                        "run": run_record["run"],
+                        "params_sha256": run_record["params_sha256"],
+                        "source_splat_file": run_record["source_splat_file"],
+                        "source_splat_sha256": run_record[
+                            "source_splat_sha256"
+                        ],
+                    }
+                    for tile, run_record in zip(tiles, run_records)
+                ],
+            }
+            _write_json(staging / "layers.json", layer_index)
+            layer_index_record = _record(staging / "layers.json")
+        else:
+            splat_name = (
+                "scene.ply"
+                if production_georeferencing
+                else "scene.DIAGNOSTIC_ONLY.ply"
+            )
+            from rtk_splat.backends.gsplat import export_splat_tensors
 
-        exported_total, retained = export_splat_tensors(
-            params,
-            staging / splat_name,
-            opacity_threshold=threshold,
-            crop_bounds=None,
-        )
-        if exported_total != total:
-            raise ArtifactError("Gaussian exporter changed the combined core count")
-        splat_record = _record(staging / splat_name)
+            exported_total, retained = export_splat_tensors(
+                params,
+                staging / splat_name,
+                opacity_threshold=threshold,
+                crop_bounds=None,
+            )
+            if exported_total != total:
+                raise ArtifactError(
+                    "Gaussian exporter changed the combined core count"
+                )
+            splat_record = _record(staging / splat_name)
         completeness = {
             "planned_tile_ids": tile_ids,
             "completed_tile_ids": [item["tile_id"] for item in run_records],
@@ -2174,7 +2406,9 @@ def publish_production_tiled_scene(
             "publication_mode": "production",
             "evaluation": {
                 "aggregation": (
-                    "single_render_of_concatenated_core_owned_gaussians"
+                    "depth_projected_context_composite_v1"
+                    if assembly_policy == LAYERED_SCENE_ASSEMBLY_POLICY
+                    else "single_render_of_concatenated_core_owned_gaussians"
                 ),
                 "comparison": "absolute_only_no_monolithic_reference",
                 "validation_split": "source_manifest_val",
@@ -2213,6 +2447,12 @@ def publish_production_tiled_scene(
             "quality_passed": quality_passed,
             "provisional": diagnostic_nonproduction,
             "metric_georeferencing_claim_eligible": production_georeferencing,
+            "representation": (
+                "sealed_tile_layers"
+                if assembly_policy == LAYERED_SCENE_ASSEMBLY_POLICY
+                else "combined_ply"
+            ),
+            "assembly_policy": assembly_record,
             "coordinate_frame": plan["coordinate_frame"],
             "partition": plan["partition"],
             "tile_plan": {
@@ -2227,12 +2467,21 @@ def publish_production_tiled_scene(
                 "core_owned_gaussians": total,
                 "tiles": ownership_records,
             },
-            "opacity_threshold": threshold,
             "retained_gaussians": retained,
-            "splat_file": splat_name,
-            "splat_sha256": splat_record["sha256"],
-            "splat_size_bytes": splat_record["size_bytes"],
         }
+        if assembly_policy == LAYERED_SCENE_ASSEMBLY_POLICY:
+            scene_record.update({
+                "layer_index_file": "layers.json",
+                "layer_index_sha256": layer_index_record["sha256"],
+                "layer_index_size_bytes": layer_index_record["size_bytes"],
+            })
+        else:
+            scene_record.update({
+                "opacity_threshold": threshold,
+                "splat_file": splat_name,
+                "splat_sha256": splat_record["sha256"],
+                "splat_size_bytes": splat_record["size_bytes"],
+            })
         provenance_record = {
             "schema_version": SCHEMA_VERSION,
             "publication_mode": "production",
@@ -2243,6 +2492,7 @@ def publish_production_tiled_scene(
             "source_contract_files": inventory["segment"]["contract_files"],
             "pose": inventory["pose"],
             "georeferencing": copy.deepcopy(georeferencing),
+            "assembly_policy": copy.deepcopy(assembly_record),
             "common_training_identity": common_training_identity,
             "tile_runs": run_records,
             "package": collect_package_state(),
@@ -2283,7 +2533,14 @@ def publish_production_tiled_scene(
         verify_tiled_scene(destination)
         return {
             "scene": str(destination),
-            "splat": str(destination / splat_name),
+            "splat": (
+                None if splat_name is None else str(destination / splat_name)
+            ),
+            "layer_index": (
+                str(destination / "layers.json")
+                if layer_index_record is not None
+                else None
+            ),
             "publication_mode": "production",
             "quality_passed": quality_passed,
             "provisional": diagnostic_nonproduction,

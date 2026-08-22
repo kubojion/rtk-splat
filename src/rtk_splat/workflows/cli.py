@@ -640,6 +640,9 @@ def cmd_scene_publish(cfg, args) -> None:
             allow_nonproduction_georeferencing_for_diagnostic=(
                 bool(args.diagnostic_scene)
             ),
+            assembly_policy=(
+                args.scene_assembly_policy or "hard_half_open_core_v1"
+            ),
         )
     else:
         from rtk_splat.workflows.tile_scene import publish_tiled_scene
@@ -851,6 +854,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--scene-assembly-policy",
+        choices=(
+            "hard_half_open_core_v1",
+            "depth_projected_context_composite_v1",
+        ),
+        help=(
+            "production scene representation; layered composition keeps each "
+            "sealed tile intact and routes only by TilePlan geometry"
+        ),
+    )
+    parser.add_argument(
         "--scene-mode",
         choices=("controlled-ab", "production"),
         help=(
@@ -907,7 +921,7 @@ def _stage_overrides(args) -> dict[str, Any]:
         "tile_min_visibility_fraction",
         "tile_plan", "tile_id",
         "scene_tile_run", "scene_name", "seam_anchor_tile_id",
-        "seam_assembly_policy", "scene_mode",
+        "seam_assembly_policy", "scene_assembly_policy", "scene_mode",
         "reference_run",
         "reference_params_sha256", "reference_metrics_sha256",
         "reference_provenance_sha256", "scene_opacity_threshold",
@@ -1009,7 +1023,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     scene_options = (
         "scene_tile_run", "scene_name", "seam_anchor_tile_id",
-        "seam_assembly_policy", "scene_mode",
+        "seam_assembly_policy", "scene_assembly_policy", "scene_mode",
         "reference_run",
         "reference_params_sha256", "reference_metrics_sha256",
         "reference_provenance_sha256", "scene_opacity_threshold",
@@ -1038,6 +1052,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--seam-anchor-tile-id requires seam-probe")
         if args.seam_assembly_policy is not None:
             raise ValueError("--seam-assembly-policy requires seam-probe")
+        if mode != "production" and args.scene_assembly_policy is not None:
+            raise ValueError(
+                "--scene-assembly-policy requires --scene-mode production"
+            )
         if mode == "controlled-ab" and args.diagnostic_scene:
             raise ValueError("--diagnostic-scene requires --scene-mode production")
         if mode == "production":
@@ -1073,6 +1091,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.tile_id is not None:
             raise ValueError("seam-probe selects a pair, not --tile-id")
+        if args.scene_assembly_policy is not None:
+            raise ValueError("--scene-assembly-policy requires scene-publish")
         unsupported = (
             "scene_mode",
             "reference_run",
