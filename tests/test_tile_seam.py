@@ -268,8 +268,13 @@ class TileSeamTests(unittest.TestCase):
                     side_effect=[
                         candidate, first, second,
                         candidate, first, second,
+                        first, second,
                     ],
                 ) as evaluator,
+                mock.patch(
+                    "rtk_splat.workflows.tile_seam._evaluate_depth_projected_layers",
+                    return_value=candidate,
+                ) as layered_evaluator,
                 mock.patch(
                     "rtk_splat.workflows.tile_seam.load_pose_artifact",
                     return_value=(viewmats, np.zeros((2, 3))),
@@ -306,9 +311,32 @@ class TileSeamTests(unittest.TestCase):
                     allow_nonproduction_georeferencing_for_diagnostic=True,
                     assembly_policy="normalized_core_distance_feather_v1",
                 )
+                layered_result = publish_tile_seam_probe(
+                    segment=root / "segment",
+                    cfg=cfg,
+                    tile_plan_root=root / "plan",
+                    pose_root=root / "pose",
+                    tile_runs=runs,
+                    anchor_tile_id="tile-0000",
+                    output_root=root / "output",
+                    probe_name="probe-layered-v1",
+                    maximum_visible_gaussians=10,
+                    device="cpu",
+                    allow_nonproduction_georeferencing_for_diagnostic=True,
+                    assembly_policy="depth_projected_context_composite_v1",
+                )
             self.assertTrue(result["quality_passed"])
             self.assertTrue(feather_result["quality_passed"])
+            self.assertTrue(layered_result["quality_passed"])
             self.assertEqual(feathered_assembly.call_count, 1)
+            self.assertEqual(layered_evaluator.call_count, 1)
+            layered_probe = verify_tile_seam_probe(
+                Path(layered_result["probe"])
+            )
+            self.assertEqual(
+                layered_probe["assembly_policy"]["name"],
+                "depth_projected_context_composite_v1",
+            )
             feather_probe = Path(feather_result["probe"])
             feather_record = verify_tile_seam_probe(feather_probe)
             self.assertEqual(

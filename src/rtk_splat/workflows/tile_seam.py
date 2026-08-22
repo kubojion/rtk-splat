@@ -34,6 +34,7 @@ from rtk_splat.workflows.tile_scene import (
     _concatenate_core_params,
     _concatenate_feathered_params,
     _evaluate_combined,
+    _evaluate_depth_projected_layers,
     _expected_tile_binding,
     _training_identity,
     _verify_training_source_binding,
@@ -49,6 +50,7 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 HARD_CORE_POLICY = "hard_half_open_core_v1"
 FEATHERED_POLICY = "normalized_core_distance_feather_v1"
+LAYERED_POLICY = "depth_projected_context_composite_v1"
 
 
 def _safe_name(value: str) -> str:
@@ -219,7 +221,8 @@ def _recomputed_checks(metrics: Mapping[str, Any]) -> dict[str, bool]:
         valid = bool(
             isinstance(assembly, dict)
             and assembly.get("uses_heldout_evidence") is False
-            and assembly.get("name") in {HARD_CORE_POLICY, FEATHERED_POLICY}
+            and assembly.get("name")
+            in {HARD_CORE_POLICY, FEATHERED_POLICY, LAYERED_POLICY}
         )
         if isinstance(assembly, dict) and assembly.get("name") == FEATHERED_POLICY:
             try:
@@ -252,6 +255,27 @@ def _recomputed_checks(metrics: Mapping[str, Any]) -> dict[str, bool]:
                     == "normalized_optical_thickness_v1"
                     and assembly.get("width_source")
                     == "configured_maximum_gaussian_scale_times_fixed_3sigma"
+                )
+        if isinstance(assembly, dict) and assembly.get("name") == LAYERED_POLICY:
+            try:
+                context_halo = float(assembly["tile_context_halo_m"])
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            else:
+                valid = bool(
+                    valid
+                    and math.isfinite(context_halo)
+                    and context_halo > 0
+                    and assembly.get("weight_source")
+                    == "sealed_tileplan_core_context_geometry"
+                    and assembly.get("position_source")
+                    == "rendered_expected_depth"
+                    and assembly.get("coverage_confidence")
+                    == "rendered_alpha"
+                    and assembly.get("composition")
+                    == "normalized_complete_layer_radiance_crossfade_v1"
+                    and assembly.get("materialization")
+                    == "separate_immutable_tile_layers"
                 )
         checks["assembly_policy_is_sealed_and_valid"] = valid
     return checks
@@ -294,6 +318,16 @@ def verify_tile_seam_probe(root: str | Path) -> dict[str, Any]:
         else []
     )
     georeferencing = provenance.get("georeferencing", {})
+    assembly_name = metrics.get("assembly_policy", {}).get("name")
+    aggregation = metrics.get("evaluation", {}).get("aggregation")
+    legacy_aggregation = (
+        "hard_half_open_core_ownership_on_shared_heldout_seam"
+    )
+    aggregation_valid = (
+        aggregation == assembly_name
+        if assembly_name == LAYERED_POLICY
+        else aggregation in {legacy_aggregation, assembly_name}
+    )
     eligible = bool(
         georeferencing.get("artifact_class") == "production"
         and georeferencing.get("georeferencing_status") == "PASSED"
@@ -330,8 +364,7 @@ def verify_tile_seam_probe(root: str | Path) -> dict[str, Any]:
         or checks != recomputed
         or quality.get("passed") is not all(checks.values())
         or probe.get("quality_passed") is not quality.get("passed")
-        or metrics.get("evaluation", {}).get("aggregation")
-        != "hard_half_open_core_ownership_on_shared_heldout_seam"
+        or not aggregation_valid
     ):
         raise ArtifactError("tile-seam status or quality claims disagree")
     for record in tile_run_records:
@@ -386,7 +419,11 @@ def publish_tile_seam_probe(
     if maximum_visible_gaussians <= 0:
         raise ValueError("maximum_visible_gaussians must be positive")
     assembly_policy = str(assembly_policy)
-    if assembly_policy not in {HARD_CORE_POLICY, FEATHERED_POLICY}:
+    if assembly_policy not in {
+        HARD_CORE_POLICY,
+        FEATHERED_POLICY,
+        LAYERED_POLICY,
+    }:
         raise ValueError(f"unknown seam assembly policy: {assembly_policy}")
 
     destination = (
@@ -495,7 +532,7 @@ def publish_tile_seam_probe(
             "uses_heldout_evidence": False,
             "ownership_rule": plan["partition"]["boundary_rule"],
         }
-    else:
+    elif assembly_policy == FEATHERED_POLICY:
         maximum_scale = float(getattr(cfg.train, "max_scale_m", float("nan")))
         sigma_multiplier = 3.0
         feather_width = maximum_scale * sigma_multiplier
@@ -534,6 +571,24 @@ def publish_tile_seam_probe(
             "weighting": "normalized_exterior_core_distance_linear_v1",
             "opacity_composition": "normalized_optical_thickness_v1",
         }
+    else:
+        combined = None
+        ownership = []
+        context_halo = float(plan["partition"]["context_halo_m"])
+        if not math.isfinite(context_halo) or context_halo <= 0:
+            raise ArtifactError(
+                "layered seam composition needs a positive TilePlan halo"
+            )
+        assembly_record = {
+            "name": LAYERED_POLICY,
+            "uses_heldout_evidence": False,
+            "weight_source": "sealed_tileplan_core_context_geometry",
+            "position_source": "rendered_expected_depth",
+            "coverage_confidence": "rendered_alpha",
+            "composition": "normalized_complete_layer_radiance_crossfade_v1",
+            "materialization": "separate_immutable_tile_layers",
+            "tile_context_halo_m": context_halo,
+        }
     from rtk_splat.backends.gsplat import _load_checkpoint_gaussians
 
     component_params = {}
@@ -543,12 +598,27 @@ def publish_tile_seam_probe(
         )
         if sha256_file(params_path) != params_hash:
             raise ArtifactError("tile params changed while loading seam components")
+    if assembly_policy == LAYERED_POLICY:
+        ownership = [
+            {
+                "tile_id": tile_id,
+                "source_params": str(params_path.resolve()),
+                "source_params_sha256": params_hash,
+                "source_gaussians": int(len(component_params[tile_id]["means"])),
+                "retained_layer_gaussians": int(
+                    len(component_params[tile_id]["means"])
+                ),
+            }
+            for tile_id, (_, params_path, params_hash) in zip(
+                tile_ids, completed
+            )
+        ]
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.parent / f".{name}.writing-{uuid.uuid4().hex}"
     staging.mkdir()
     try:
-        candidate_root = staging / "hard_ownership"
+        candidate_root = staging / "candidate"
         candidate_root.mkdir()
         (candidate_root / "renders").mkdir()
         component_root = staging / "components"
@@ -565,19 +635,40 @@ def publish_tile_seam_probe(
             allow_failed_georeferencing_for_render=diagnostic_render_permission,
         )
         seam_ids = sorted(seam_masks)
-        candidate = _evaluate_combined(
-            combined,
-            reader,
-            cfg,
-            candidate_root,
-            seam_ids,
-            device=device,
-            maximum_visible_gaussians=int(maximum_visible_gaussians),
-            maximum_render_depth_m=None,
-            context_masks=seam_masks,
-            context_mask_dilate_px=1,
-            allow_failed_georeferencing_for_render=diagnostic_render_permission,
-        )
+        if assembly_policy == LAYERED_POLICY:
+            candidate = _evaluate_depth_projected_layers(
+                component_params,
+                tiles,
+                plan,
+                reader,
+                cfg,
+                candidate_root,
+                seam_ids,
+                device=device,
+                maximum_visible_gaussians=int(maximum_visible_gaussians),
+                maximum_render_depth_m=None,
+                context_masks=seam_masks,
+                context_mask_dilate_px=1,
+                allow_failed_georeferencing_for_render=(
+                    diagnostic_render_permission
+                ),
+            )
+        else:
+            candidate = _evaluate_combined(
+                combined,
+                reader,
+                cfg,
+                candidate_root,
+                seam_ids,
+                device=device,
+                maximum_visible_gaussians=int(maximum_visible_gaussians),
+                maximum_render_depth_m=None,
+                context_masks=seam_masks,
+                context_mask_dilate_px=1,
+                allow_failed_georeferencing_for_render=(
+                    diagnostic_render_permission
+                ),
+            )
         components = {}
         for tile_id in tile_ids:
             components[tile_id] = _evaluate_combined(
@@ -620,9 +711,7 @@ def publish_tile_seam_probe(
         metrics_record = {
             "schema_version": SCHEMA_VERSION,
             "evaluation": {
-                "aggregation": (
-                    "hard_half_open_core_ownership_on_shared_heldout_seam"
-                ),
+                "aggregation": assembly_record["name"],
                 "comparison": "component_arithmetic_mean_no_model_selection",
                 "validation_split": "intersection_of_sealed_tile_val_selections",
                 "eval_ids": seam_ids,
@@ -650,7 +739,7 @@ def publish_tile_seam_probe(
             "passed": quality_passed,
             "checks": checks,
             "interpretation": (
-                "accepted adjacent-tile hard-ownership seam"
+                f"accepted adjacent-tile {assembly_record['name']} seam"
                 if quality_passed
                 else "diagnostic seam regression; inspect before field expansion"
             ),
@@ -673,7 +762,19 @@ def publish_tile_seam_probe(
             "ownership": {
                 "rule": assembly_record["name"],
                 "tiles": ownership,
-                "assembled_gaussians": int(len(combined["means"])),
+                "materialization": (
+                    "separate_layers"
+                    if assembly_policy == LAYERED_POLICY
+                    else "single_tensor"
+                ),
+                "assembled_gaussians": (
+                    None
+                    if combined is None
+                    else int(len(combined["means"]))
+                ),
+                "source_layer_gaussians": int(sum(
+                    item["source_gaussians"] for item in ownership
+                )),
             },
         }
         viewmats, _ = load_pose_artifact(

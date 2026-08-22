@@ -843,6 +843,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "hard_half_open_core_v1",
             "normalized_core_distance_feather_v1",
+            "depth_projected_context_composite_v1",
         ),
         help=(
             "seam-probe assembly; feather width is derived from the configured "

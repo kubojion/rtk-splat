@@ -1126,6 +1126,371 @@ def _evaluate_combined(
     return result
 
 
+def _compose_depth_projected_layers(
+    layers: Sequence[Mapping[str, Any]],
+    tiles: Sequence[Mapping[str, Any]],
+    plan: Mapping[str, Any],
+    c2w: Any,
+    k_mat: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Cross-fade complete tile renders using only sealed spatial evidence.
+
+    Each tile keeps its independently optimized opacity field intact.  The
+    rendered expected depth projects a pixel into TilePlan UV coordinates;
+    core distance and the sealed context halo provide its spatial weight, and
+    rendered alpha is coverage confidence.  The reference image is not an
+    input to this operation.
+    """
+    import torch
+
+    if len(layers) != len(tiles) or not layers:
+        raise ValueError("layer composition needs one non-empty layer per tile")
+    halo = float(plan["partition"]["context_halo_m"])
+    tolerance = float(plan["partition"]["ownership_tolerance_m"])
+    if not math.isfinite(halo) or halo <= 0:
+        raise ArtifactError("TilePlan context halo must be finite and positive")
+    first_rgb = layers[0]["rgb"]
+    if first_rgb.ndim != 3 or first_rgb.shape[-1] != 3:
+        raise ValueError("rendered tile RGB must have shape (H,W,3)")
+    height, width = first_rgb.shape[:2]
+    dtype, device = first_rgb.dtype, first_rgb.device
+    c2w = torch.as_tensor(c2w, dtype=dtype, device=device)
+    k_mat = torch.as_tensor(k_mat, dtype=dtype, device=device)
+    if c2w.shape != (4, 4) or k_mat.shape != (3, 3):
+        raise ValueError("layer composition needs 4x4 c2w and 3x3 intrinsics")
+    origin = torch.as_tensor(
+        plan["coordinate_frame"]["partition_origin_enu_m"],
+        dtype=dtype,
+        device=device,
+    )
+    basis = torch.as_tensor(
+        plan["coordinate_frame"]["R_enu_from_partition"],
+        dtype=dtype,
+        device=device,
+    )
+    if origin.shape != (3,) or basis.shape != (3, 3):
+        raise ArtifactError("TilePlan composition frame is invalid")
+    rows, columns = torch.meshgrid(
+        torch.arange(height, dtype=dtype, device=device),
+        torch.arange(width, dtype=dtype, device=device),
+        indexing="ij",
+    )
+    numerator = torch.zeros_like(first_rgb)
+    denominator = torch.zeros((height, width), dtype=dtype, device=device)
+    records = []
+    epsilon = torch.finfo(dtype).eps
+    for layer, tile in zip(layers, tiles):
+        rgb = layer["rgb"]
+        depth = layer["depth"]
+        alpha = layer["alpha"]
+        if (
+            rgb.shape != (height, width, 3)
+            or depth.shape != (height, width)
+            or alpha.shape != (height, width)
+            or rgb.dtype != dtype
+            or depth.dtype != dtype
+            or alpha.dtype != dtype
+            or rgb.device != device
+            or depth.device != device
+            or alpha.device != device
+        ):
+            raise ValueError("rendered tile layers have inconsistent tensors")
+        if not bool(
+            torch.isfinite(rgb).all()
+            and torch.isfinite(depth).all()
+            and torch.isfinite(alpha).all()
+        ):
+            raise ArtifactError("rendered tile layer contains NaN or Inf")
+        if bool((alpha < -epsilon).any() or (alpha > 1.0 + epsilon).any()):
+            raise ArtifactError("rendered tile alpha is outside [0,1]")
+        camera_points = torch.stack((
+            (columns - k_mat[0, 2]) * depth / k_mat[0, 0],
+            (rows - k_mat[1, 2]) * depth / k_mat[1, 1],
+            depth,
+        ), dim=-1)
+        world = camera_points @ c2w[:3, :3].T + c2w[:3, 3]
+        uv = ((world - origin) @ basis)[:, :, :2]
+        core = torch.as_tensor(
+            tile["core_bounds_uv_m"], dtype=dtype, device=device
+        )
+        context = torch.as_tensor(
+            tile["context_bounds_uv_m"], dtype=dtype, device=device
+        )
+        if core.shape != (2, 2) or context.shape != (2, 2):
+            raise ArtifactError("TilePlan layer bounds are invalid")
+        outside = torch.maximum(
+            torch.maximum(core[0] - uv, uv - core[1]),
+            torch.zeros((), dtype=dtype, device=device),
+        )
+        raw = (1.0 - torch.linalg.vector_norm(outside, dim=-1) / halo).clamp(
+            0.0, 1.0
+        )
+        valid_depth = depth > 0
+        in_context = torch.all(uv >= context[0] - tolerance, dim=-1) & torch.all(
+            uv <= context[1] + tolerance, dim=-1
+        )
+        raw = torch.where(valid_depth & in_context, raw, torch.zeros_like(raw))
+        confidence = raw * alpha.clamp(0.0, 1.0)
+        numerator += confidence[:, :, None] * rgb
+        denominator += confidence
+        records.append({
+            "tile_id": str(tile["tile_id"]),
+            "pixels_with_spatial_support": int((raw > 0).sum().item()),
+            "pixels_with_alpha_support": int((confidence > epsilon).sum().item()),
+            "mean_raw_weight": float(raw.mean().item()),
+            "mean_alpha_confidence": float(confidence.mean().item()),
+        })
+    covered = denominator > epsilon
+    composed = torch.zeros_like(numerator)
+    composed[covered] = numerator[covered] / denominator[covered][:, None]
+    return composed.clamp(0.0, 1.0), {
+        "policy": "depth_projected_core_context_alpha_crossfade_v1",
+        "uses_reference_image": False,
+        "uses_heldout_evidence_for_weights": False,
+        "tile_context_halo_m": halo,
+        "covered_pixels": int(covered.sum().item()),
+        "total_pixels": int(height * width),
+        "layers": records,
+    }
+
+
+def _evaluate_depth_projected_layers(
+    component_params: Mapping[str, Mapping[str, Any]],
+    tiles: Sequence[Mapping[str, Any]],
+    plan: Mapping[str, Any],
+    reader: SegmentReader,
+    cfg: Any,
+    staging: Path,
+    validation_ids: Sequence[int],
+    *,
+    device: str,
+    maximum_visible_gaussians: int,
+    maximum_render_depth_m: float | None = None,
+    frustum_sigma: float = 3.0,
+    context_masks: Mapping[int, np.ndarray] | None = None,
+    context_mask_dilate_px: int | None = None,
+    allow_failed_georeferencing_for_render: bool = False,
+) -> dict[str, Any]:
+    """Evaluate a spatial cross-fade without merging independent splat fields."""
+    import cv2
+    import torch
+    from rtk_splat.backends.gsplat import (
+        _color_correct,
+        _load_frame,
+        _masked_lpips,
+        _masked_psnr,
+        render,
+        tm_ssim,
+    )
+
+    tile_ids = [str(tile["tile_id"]) for tile in tiles]
+    if set(component_params) != set(tile_ids) or len(tile_ids) != len(set(tile_ids)):
+        raise ArtifactError("layer evaluator needs exactly one model per tile")
+    if not validation_ids:
+        raise ValueError("layer evaluator needs validation frames")
+    if maximum_visible_gaussians <= 0:
+        raise ValueError("maximum_visible_gaussians must be positive")
+    if (
+        (
+            maximum_render_depth_m is not None
+            and (
+                not math.isfinite(maximum_render_depth_m)
+                or maximum_render_depth_m <= 0
+            )
+        )
+        or not math.isfinite(frustum_sigma)
+        or frustum_sigma < 3.0
+    ):
+        raise ValueError("invalid conservative layer-evaluation frustum policy")
+    viewmats, _ = load_pose_artifact(
+        reader.root,
+        cfg,
+        allow_failed_georeferencing_for_render=bool(
+            allow_failed_georeferencing_for_render
+        ),
+    )
+    expected_fingerprint = pose_fingerprint(viewmats)
+    camera_record = reader.calibration["cameras"]["left"]
+    intr = np.asarray(camera_record["K"], dtype=np.float64)
+    width, height = int(camera_record["width"]), int(camera_record["height"])
+    k_mat = torch.tensor(
+        [[intr[0, 0], 0, intr[0, 2]],
+         [0, intr[1, 1], intr[1, 2]],
+         [0, 0, 1]],
+        dtype=torch.float32,
+        device=device,
+    )
+    c2ws = torch.linalg.inv(torch.tensor(
+        viewmats, dtype=torch.float32, device=device
+    ))
+    geometry = {}
+    for tile_id in tile_ids:
+        params = component_params[tile_id]
+        means = params["means"].detach().cpu().numpy().astype(
+            np.float64, copy=False
+        )
+        radii = (
+            torch.exp(params["scales"].detach().cpu())
+            .amax(dim=1)
+            .numpy()
+            .astype(np.float64, copy=False)
+            * float(frustum_sigma)
+        )
+        geometry[tile_id] = (means, radii)
+    planes = np.asarray([
+        [intr[0, 0], 0.0, intr[0, 2]],
+        [-intr[0, 0], 0.0, width - intr[0, 2]],
+        [0.0, intr[1, 1], intr[1, 2]],
+        [0.0, -intr[1, 1], height - intr[1, 2]],
+    ], dtype=np.float64)
+    plane_norms = np.linalg.norm(planes, axis=1)
+    metric_names = (
+        "psnr", "psnr_masked", "psnr_near", "psnr_masked_cc",
+        "lpips", "lpips_cc", "ssim",
+    )
+    observations = []
+    view_records = []
+    evaluation_dilate = (
+        int(cfg.train.mask_dilate_px)
+        if context_mask_dilate_px is None
+        else int(context_mask_dilate_px)
+    )
+    if evaluation_dilate <= 0:
+        raise ValueError("evaluation mask dilation must be positive")
+    for frame_id in validation_ids:
+        frame_id = int(frame_id)
+        rgb_gt, _, _, supervision = _load_frame(
+            reader.root,
+            reader.frames,
+            frame_id,
+            evaluation_dilate,
+            device,
+            context_mask=(
+                context_masks[frame_id] if context_masks is not None else None
+            ),
+        )
+        viewmat = np.asarray(viewmats[frame_id], dtype=np.float64)
+        layers = []
+        selected_by_tile = {}
+        with torch.no_grad():
+            for tile_id in tile_ids:
+                params = component_params[tile_id]
+                means, radii = geometry[tile_id]
+                camera_points = means @ viewmat[:3, :3].T + viewmat[:3, 3]
+                signed = camera_points @ planes.T
+                visible = (
+                    (camera_points[:, 2] + radii > 1e-3)
+                    & np.all(
+                        signed >= -(radii[:, None] * plane_norms), axis=1
+                    )
+                )
+                if maximum_render_depth_m is not None:
+                    visible &= (
+                        camera_points[:, 2] - radii < maximum_render_depth_m
+                    )
+                selected = int(visible.sum())
+                if selected <= 0:
+                    raise ArtifactError(
+                        f"no {tile_id} Gaussians see validation frame {frame_id}"
+                    )
+                if selected > maximum_visible_gaussians:
+                    raise ArtifactError(
+                        f"{tile_id} frame {frame_id} needs {selected:,} "
+                        f"Gaussians, above cap {maximum_visible_gaussians:,}"
+                    )
+                keep = torch.from_numpy(visible)
+                device_params = {
+                    name: tensor[keep].to(device)
+                    for name, tensor in params.items()
+                }
+                rendered, alpha, _ = render(
+                    device_params,
+                    torch.linalg.inv(c2ws[frame_id]),
+                    k_mat,
+                    width,
+                    height,
+                    cfg.train.sh_degree,
+                    cfg.train.rasterize_mode,
+                )
+                layers.append({
+                    "rgb": rendered[0, :, :, :3].clamp(0.0, 1.0),
+                    "depth": rendered[0, :, :, 3],
+                    "alpha": alpha[0, :, :, 0],
+                })
+                selected_by_tile[tile_id] = selected
+                del device_params
+            rgb, composition = _compose_depth_projected_layers(
+                layers, tiles, plan, c2ws[frame_id], k_mat
+            )
+            full = torch.ones_like(supervision)
+            near = torch.zeros_like(supervision)
+            near[height // 2:, :] = True
+            corrected = _color_correct(rgb, rgb_gt, supervision)
+            observation = {
+                "psnr": _masked_psnr(rgb, rgb_gt, full),
+                "psnr_masked": _masked_psnr(rgb, rgb_gt, supervision),
+                "psnr_near": _masked_psnr(rgb, rgb_gt, near),
+                "psnr_masked_cc": _masked_psnr(
+                    corrected, rgb_gt, supervision
+                ),
+                "lpips": _masked_lpips(
+                    rgb, rgb_gt, supervision, device
+                ),
+                "lpips_cc": _masked_lpips(
+                    corrected, rgb_gt, supervision, device
+                ),
+                "ssim": float(tm_ssim(
+                    rgb.permute(2, 0, 1)[None],
+                    rgb_gt.permute(2, 0, 1)[None],
+                )),
+            }
+        side_by_side = torch.cat([rgb_gt, rgb], dim=1).cpu().numpy()
+        target = staging / "renders" / f"eval_{frame_id:05d}.jpg"
+        if not cv2.imwrite(
+            str(target),
+            cv2.cvtColor(
+                (side_by_side * 255).astype(np.uint8), cv2.COLOR_RGB2BGR
+            ),
+        ):
+            raise OSError(f"failed to write layered seam render: {target}")
+        observations.append(observation)
+        view_records.append({
+            "frame_id": frame_id,
+            "selected_gaussians_by_tile": selected_by_tile,
+            "composition": composition,
+            **{key: float(observation[key]) for key in metric_names},
+        })
+        del layers
+    result = {
+        key: float(np.mean([float(item[key]) for item in observations]))
+        for key in metric_names
+    }
+    for key in _METRICS:
+        if not math.isfinite(float(result.get(key, float("nan")))):
+            raise ArtifactError(f"layered scene metric {key} is non-finite")
+    result.update({
+        "n_eval": len(validation_ids),
+        "eval_ids": [int(value) for value in validation_ids],
+        "pose_fingerprint": expected_fingerprint,
+        "layer_composition": {
+            "policy": "depth_projected_core_context_alpha_crossfade_v1",
+            "uses_reference_image": False,
+            "uses_heldout_evidence_for_weights": False,
+            "tile_ids": tile_ids,
+            "views": view_records,
+        },
+        "frustum_culling": {
+            "policy": "per_layer_camera_frustum_sphere_bound_v1",
+            "gaussian_radius_sigma": float(frustum_sigma),
+            "maximum_render_depth_m": maximum_render_depth_m,
+            "maximum_visible_gaussians_per_layer": int(
+                maximum_visible_gaussians
+            ),
+        },
+    })
+    return result
+
+
 def publish_tiled_scene(
     *,
     segment: str | Path,

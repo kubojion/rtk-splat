@@ -15,6 +15,7 @@ from rtk_splat.workflows.cli import _scene_tile_runs, build_parser, cmd_scene_pu
 from rtk_splat.workflows.tile_scene import (
     _concatenate_core_params,
     _concatenate_feathered_params,
+    _compose_depth_projected_layers,
     _evaluate_combined,
     _expected_tile_binding,
     _reference_run_evidence,
@@ -505,6 +506,33 @@ class TileSceneTests(unittest.TestCase):
                 records[1]["contributing_core_ids"],
                 ["tile-0000", "tile-0001"],
             )
+
+    def test_depth_projected_layers_crossfade_without_reference_image(self):
+        plan = _plan()
+        red = torch.zeros((1, 3, 3), dtype=torch.float32)
+        red[:, :, 0] = 1.0
+        blue = torch.zeros((1, 3, 3), dtype=torch.float32)
+        blue[:, :, 2] = 1.0
+        depth = torch.ones((1, 3), dtype=torch.float32)
+        alpha = torch.ones((1, 3), dtype=torch.float32)
+        composed, evidence = _compose_depth_projected_layers(
+            [
+                {"rgb": red, "depth": depth, "alpha": alpha},
+                {"rgb": blue, "depth": depth, "alpha": alpha},
+            ],
+            plan["tiles"],
+            plan,
+            torch.eye(4),
+            torch.eye(3),
+        )
+        self.assertTrue(torch.allclose(composed[0, 0], red[0, 0]))
+        self.assertTrue(torch.allclose(composed[0, 2], blue[0, 2]))
+        self.assertTrue(torch.allclose(
+            composed[0, 1], torch.tensor([0.5, 0.0, 0.5])
+        ))
+        self.assertFalse(evidence["uses_reference_image"])
+        self.assertFalse(evidence["uses_heldout_evidence_for_weights"])
+        self.assertEqual(evidence["covered_pixels"], 3)
 
     def test_frozen_reference_requires_hashes_and_exact_source_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
