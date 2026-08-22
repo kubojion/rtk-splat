@@ -161,6 +161,39 @@ class TileSceneTests(unittest.TestCase):
         ][0]["sha256"] = "c" * 64
         self.assertNotEqual(_training_identity(first), _training_identity(second))
 
+    def test_training_identity_ignores_optional_plan_only_derivation(self):
+        base = {
+            "training_implementation_sha256": "a" * 64,
+            "effective_training_config": {
+                "train": {"run_name": "old", "iterations": 65_000},
+                "runtime_resolution": {
+                    "origins": {
+                        "tile_max_training_frames": {
+                            "authored_value": "auto",
+                            "source_sha256": "b" * 64,
+                        }
+                    },
+                    "derivations": {
+                        "tile_max_training_frames": {
+                            "chosen_value": 1300,
+                            "formula_version": 1,
+                        }
+                    },
+                },
+            },
+        }
+        fresh = json.loads(json.dumps(base))
+        fresh["effective_training_config"]["train"]["run_name"] = "new"
+        fresh["effective_training_config"]["runtime_resolution"][
+            "origins"
+        ].clear()
+        fresh["effective_training_config"]["runtime_resolution"][
+            "derivations"
+        ].clear()
+        self.assertEqual(_training_identity(base), _training_identity(fresh))
+        fresh["effective_training_config"]["train"]["iterations"] = 64_000
+        self.assertNotEqual(_training_identity(base), _training_identity(fresh))
+
     def test_scene_cli_accepts_explicit_repeatable_tile_runs(self):
         args = build_parser().parse_args([
             "scene-publish", "--config", "/tmp/config.yaml",

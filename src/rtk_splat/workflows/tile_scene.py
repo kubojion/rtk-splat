@@ -338,11 +338,17 @@ def _training_identity(provenance: Mapping[str, Any]) -> dict[str, str]:
                     record.pop("path", None)
         origins = runtime.get("origins")
         if isinstance(origins, dict):
+            # The selected frame IDs and complete TilePlan binding are checked
+            # independently.  A historical tiles-plan stage may leave this
+            # planning-only origin in a later training snapshot, while a fresh
+            # execution that consumes the same sealed plan does not.
+            origins.pop("tile_max_training_frames", None)
             for record in origins.values():
                 if isinstance(record, dict):
                     record.pop("source_path", None)
         derivations = runtime.get("derivations")
         if isinstance(derivations, dict):
+            derivations.pop("tile_max_training_frames", None)
             for record in derivations.values():
                 if not isinstance(record, dict):
                     continue
