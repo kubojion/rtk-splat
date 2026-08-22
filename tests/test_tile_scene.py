@@ -14,6 +14,7 @@ from rtk_splat.frontends.artifact import canonical_hash
 from rtk_splat.workflows.cli import _scene_tile_runs, build_parser, cmd_scene_publish
 from rtk_splat.workflows.tile_scene import (
     _concatenate_core_params,
+    _concatenate_feathered_params,
     _evaluate_combined,
     _expected_tile_binding,
     _reference_run_evidence,
@@ -227,6 +228,20 @@ class TileSceneTests(unittest.TestCase):
         self.assertTrue(production.diagnostic_scene)
         self.assertIsNone(production.reference_run)
 
+        seam = build_parser().parse_args([
+            "seam-probe", "--config", "/tmp/config.yaml",
+            "--tile-plan", "/tmp/plan", "--pose-artifact-root", "/tmp/poses",
+            "--scene-tile-run", "tile-0000=/tmp/run-a",
+            "--scene-tile-run", "tile-0001=/tmp/run-b",
+            "--scene-name", "seam-v1", "--seam-anchor-tile-id", "tile-0000",
+            "--seam-assembly-policy", "normalized_core_distance_feather_v1",
+            "--diagnostic-scene",
+        ])
+        self.assertEqual(
+            seam.seam_assembly_policy,
+            "normalized_core_distance_feather_v1",
+        )
+
     def test_scene_cli_dispatches_reference_free_production_mode(self):
         args = build_parser().parse_args([
             "scene-publish", "--config", "/tmp/config.yaml",
@@ -405,6 +420,90 @@ class TileSceneTests(unittest.TestCase):
             )
             self.assertEqual(
                 [item["core_owned_gaussians"] for item in records], [1, 1]
+            )
+
+    def test_feathered_concatenation_normalizes_optical_thickness(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            paths = [root / "a.pt", root / "b.pt"]
+            for path in paths:
+                path.write_bytes(path.name.encode())
+            first = _params([
+                [0.5, 0.5, 0],
+                [1.0, 0.5, 0],
+                [1.25, 0.5, 0],
+            ])
+            second = _params([
+                [0.75, 0.5, 0],
+                [1.0, 0.5, 0],
+                [1.5, 0.5, 0],
+            ])
+            loaded = {paths[0]: first, paths[1]: second}
+            completed = [
+                (plan["tiles"][0], paths[0], _sha(paths[0])),
+                (plan["tiles"][1], paths[1], _sha(paths[1])),
+            ]
+            with mock.patch(
+                "rtk_splat.backends.gsplat._load_checkpoint_gaussians",
+                side_effect=lambda path, _device: loaded[Path(path)],
+            ):
+                combined, records = _concatenate_feathered_params(
+                    plan, completed, feather_width_m=0.5
+                )
+            self.assertEqual(len(combined["means"]), 6)
+            self.assertEqual(
+                [item["retained_gaussians"] for item in records], [3, 3]
+            )
+            alphas = torch.sigmoid(combined["opacities"]).numpy()
+            expected_half = 1.0 - np.sqrt(0.5)
+            self.assertAlmostEqual(float(alphas[0]), 0.5, places=6)
+            self.assertAlmostEqual(float(alphas[1]), expected_half, places=6)
+            self.assertAlmostEqual(float(alphas[4]), expected_half, places=6)
+            self.assertAlmostEqual(float(alphas[5]), 0.5, places=6)
+            # Coincident half-weight contributors exactly reproduce alpha 0.5.
+            self.assertAlmostEqual(
+                float(1.0 - (1.0 - alphas[1]) * (1.0 - alphas[4])),
+                0.5,
+                places=6,
+            )
+
+    def test_feathered_subset_ignores_unloaded_plan_neighbor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            plan["partition"]["scene_bounds_uv_m"] = [[0.0, 0.0], [3.0, 1.0]]
+            plan["tiles"].append({
+                "tile_id": "tile-0002",
+                "core_bounds_uv_m": [[2.0, 0.0], [3.0, 1.0]],
+                "context_bounds_uv_m": [[1.75, -0.25], [3.25, 1.25]],
+                "frame_ids": {"train": [4], "val": [8], "test": []},
+            })
+            paths = [root / "a.pt", root / "b.pt"]
+            for path in paths:
+                path.write_bytes(path.name.encode())
+            loaded = {
+                paths[0]: _params([[0.5, 0.5, 0.0]]),
+                paths[1]: _params([[1.9, 0.5, 0.0]]),
+            }
+            completed = [
+                (plan["tiles"][0], paths[0], _sha(paths[0])),
+                (plan["tiles"][1], paths[1], _sha(paths[1])),
+            ]
+            with mock.patch(
+                "rtk_splat.backends.gsplat._load_checkpoint_gaussians",
+                side_effect=lambda path, _device: loaded[Path(path)],
+            ):
+                combined, records = _concatenate_feathered_params(
+                    plan, completed, feather_width_m=0.25
+                )
+            self.assertEqual(len(combined["means"]), 2)
+            self.assertAlmostEqual(
+                float(torch.sigmoid(combined["opacities"][-1])), 0.5, places=6
+            )
+            self.assertEqual(
+                records[1]["contributing_core_ids"],
+                ["tile-0000", "tile-0001"],
             )
 
     def test_frozen_reference_requires_hashes_and_exact_source_validation(self):

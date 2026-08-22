@@ -56,6 +56,7 @@ def _plan() -> dict:
         },
         "partition": {
             "scene_bounds_uv_m": [[0.0, 0.0], [2.0, 1.0]],
+            "context_halo_m": 0.25,
             "boundary_rule": "lower_closed_upper_open_global_max_closed",
             "ownership_tolerance_m": 1e-9,
         },
@@ -148,7 +149,7 @@ class TileSeamTests(unittest.TestCase):
         reader.validate = lambda: reader
         cfg = SimpleNamespace(
             pose=SimpleNamespace(artifact="pose-v1"),
-            train=SimpleNamespace(max_gaussians=10),
+            train=SimpleNamespace(max_gaussians=10, max_scale_m=0.05),
         )
         return plan, inventory, georeferencing, runs, reader, cfg
 
@@ -168,6 +169,13 @@ class TileSeamTests(unittest.TestCase):
                 }
                 for tile_id in ("tile-0000", "tile-0001")
             ]
+            feather_ownership = [{
+                "tile_id": tile_id,
+                "source_gaussians": 2,
+                "retained_gaussians": 1,
+                "strict_core_gaussians": 1,
+                "feather_support_gaussians": 0,
+            } for tile_id in ("tile-0000", "tile-0001")]
 
             def completed(run, binding, _georeferencing, **_kwargs):
                 run = Path(run)
@@ -232,6 +240,10 @@ class TileSeamTests(unittest.TestCase):
                     return_value=(params, ownership),
                 ),
                 mock.patch(
+                    "rtk_splat.workflows.tile_seam._concatenate_feathered_params",
+                    return_value=(params, feather_ownership),
+                ) as feathered_assembly,
+                mock.patch(
                     "rtk_splat.backends.gsplat._load_checkpoint_gaussians",
                     return_value=params,
                 ),
@@ -253,7 +265,10 @@ class TileSeamTests(unittest.TestCase):
                 ) as mask_builder,
                 mock.patch(
                     "rtk_splat.workflows.tile_seam._evaluate_combined",
-                    side_effect=[candidate, first, second],
+                    side_effect=[
+                        candidate, first, second,
+                        candidate, first, second,
+                    ],
                 ) as evaluator,
                 mock.patch(
                     "rtk_splat.workflows.tile_seam.load_pose_artifact",
@@ -277,7 +292,44 @@ class TileSeamTests(unittest.TestCase):
                     device="cpu",
                     allow_nonproduction_georeferencing_for_diagnostic=True,
                 )
+                feather_result = publish_tile_seam_probe(
+                    segment=root / "segment",
+                    cfg=cfg,
+                    tile_plan_root=root / "plan",
+                    pose_root=root / "pose",
+                    tile_runs=runs,
+                    anchor_tile_id="tile-0000",
+                    output_root=root / "output",
+                    probe_name="probe-feather-v1",
+                    maximum_visible_gaussians=10,
+                    device="cpu",
+                    allow_nonproduction_georeferencing_for_diagnostic=True,
+                    assembly_policy="normalized_core_distance_feather_v1",
+                )
             self.assertTrue(result["quality_passed"])
+            self.assertTrue(feather_result["quality_passed"])
+            self.assertEqual(feathered_assembly.call_count, 1)
+            feather_probe = Path(feather_result["probe"])
+            feather_record = verify_tile_seam_probe(feather_probe)
+            self.assertEqual(
+                feather_record["assembly_policy"]["name"],
+                "normalized_core_distance_feather_v1",
+            )
+            self.assertAlmostEqual(
+                feather_record["assembly_policy"]["feather_width_m"],
+                0.15,
+            )
+            feather_metrics = json.loads(
+                (feather_probe / "metrics.json").read_text(encoding="utf-8")
+            )
+            feather_metrics["assembly_policy"]["feather_width_m"] = 0.14
+            _write_json(feather_probe / "metrics.json", feather_metrics)
+            (feather_probe / "manifest.json").unlink()
+            _write_json(
+                feather_probe / "manifest.json", _manifest(feather_probe)
+            )
+            with self.assertRaisesRegex(ValueError, "status or quality"):
+                verify_tile_seam_probe(feather_probe)
             self.assertTrue(
                 mask_builder.call_args.kwargs[
                     "allow_failed_georeferencing_for_render"

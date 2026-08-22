@@ -700,6 +700,9 @@ def cmd_seam_probe(cfg, args) -> None:
         allow_nonproduction_georeferencing_for_diagnostic=bool(
             args.diagnostic_scene
         ),
+        assembly_policy=(
+            args.seam_assembly_policy or "hard_half_open_core_v1"
+        ),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
@@ -836,6 +839,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--seam-assembly-policy",
+        choices=(
+            "hard_half_open_core_v1",
+            "normalized_core_distance_feather_v1",
+        ),
+        help=(
+            "seam-probe assembly; feather width is derived from the configured "
+            "maximum Gaussian scale and is not a tunable CLI value"
+        ),
+    )
+    parser.add_argument(
         "--scene-mode",
         choices=("controlled-ab", "production"),
         help=(
@@ -891,7 +905,8 @@ def _stage_overrides(args) -> dict[str, Any]:
         "pose_artifact_root", "tile_plan_name", "tile_count", "tile_max_tiles",
         "tile_min_visibility_fraction",
         "tile_plan", "tile_id",
-        "scene_tile_run", "scene_name", "seam_anchor_tile_id", "scene_mode",
+        "scene_tile_run", "scene_name", "seam_anchor_tile_id",
+        "seam_assembly_policy", "scene_mode",
         "reference_run",
         "reference_params_sha256", "reference_metrics_sha256",
         "reference_provenance_sha256", "scene_opacity_threshold",
@@ -992,7 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
             "seam-probe, and scene-publish"
         )
     scene_options = (
-        "scene_tile_run", "scene_name", "seam_anchor_tile_id", "scene_mode",
+        "scene_tile_run", "scene_name", "seam_anchor_tile_id",
+        "seam_assembly_policy", "scene_mode",
         "reference_run",
         "reference_params_sha256", "reference_metrics_sha256",
         "reference_provenance_sha256", "scene_opacity_threshold",
@@ -1019,6 +1035,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("scene-publish consumes the whole plan, not --tile-id")
         if args.seam_anchor_tile_id is not None:
             raise ValueError("--seam-anchor-tile-id requires seam-probe")
+        if args.seam_assembly_policy is not None:
+            raise ValueError("--seam-assembly-policy requires seam-probe")
         if mode == "controlled-ab" and args.diagnostic_scene:
             raise ValueError("--diagnostic-scene requires --scene-mode production")
         if mode == "production":

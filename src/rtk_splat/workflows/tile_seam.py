@@ -32,6 +32,7 @@ from rtk_splat.workflows.tile_scene import (
     _METRICS,
     _completed_tile_run,
     _concatenate_core_params,
+    _concatenate_feathered_params,
     _evaluate_combined,
     _expected_tile_binding,
     _training_identity,
@@ -46,6 +47,8 @@ SCHEMA_VERSION = 1
 ARTIFACT_TYPE = "rtk_splat_tile_seam_probe"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+HARD_CORE_POLICY = "hard_half_open_core_v1"
+FEATHERED_POLICY = "normalized_core_distance_feather_v1"
 
 
 def _safe_name(value: str) -> str:
@@ -177,7 +180,7 @@ def _recomputed_checks(metrics: Mapping[str, Any]) -> dict[str, bool]:
     )
     selected_segment = metrics.get("selection", {}).get("selected_segment_uv")
     evidence_segments = evidence.get("internal_segments_uv")
-    return {
+    checks = {
         "two_edge_adjacent_tiles_selected_without_heldout": (
             metrics.get("selection", {}).get("uses_heldout_evidence") is False
             and isinstance(selected_segment, list)
@@ -211,6 +214,47 @@ def _recomputed_checks(metrics: Mapping[str, Any]) -> dict[str, bool]:
             and lpips_increase <= maximum_lpips_increase
         ),
     }
+    assembly = metrics.get("assembly_policy")
+    if assembly is not None:
+        valid = bool(
+            isinstance(assembly, dict)
+            and assembly.get("uses_heldout_evidence") is False
+            and assembly.get("name") in {HARD_CORE_POLICY, FEATHERED_POLICY}
+        )
+        if isinstance(assembly, dict) and assembly.get("name") == FEATHERED_POLICY:
+            try:
+                width = float(assembly["feather_width_m"])
+                maximum_scale = float(assembly["maximum_gaussian_scale_m"])
+                sigma_multiplier = float(assembly["support_sigma_multiplier"])
+                context_halo = float(assembly["tile_context_halo_m"])
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            else:
+                valid = bool(
+                    valid
+                    and all(
+                        math.isfinite(value) and value > 0
+                        for value in (
+                            width,
+                            maximum_scale,
+                            sigma_multiplier,
+                            context_halo,
+                        )
+                    )
+                    and math.isclose(
+                        width,
+                        maximum_scale * sigma_multiplier,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    and width <= context_halo
+                    and assembly.get("opacity_composition")
+                    == "normalized_optical_thickness_v1"
+                    and assembly.get("width_source")
+                    == "configured_maximum_gaussian_scale_times_fixed_3sigma"
+                )
+        checks["assembly_policy_is_sealed_and_valid"] = valid
+    return checks
 
 
 def verify_tile_seam_probe(root: str | Path) -> dict[str, Any]:
@@ -268,6 +312,12 @@ def verify_tile_seam_probe(root: str | Path) -> dict[str, Any]:
         or selection.get("selected_tile_id") != tile_ids[1]
         or provenance.get("neighbor_selection") != selection
         or provenance.get("tile_plan") != probe.get("tile_plan")
+        or provenance.get("assembly_policy")
+        != probe.get("assembly_policy", metrics.get("assembly_policy"))
+        or (
+            metrics.get("assembly_policy") is not None
+            and metrics.get("assembly_policy") != probe.get("assembly_policy")
+        )
         or metrics.get("evaluation", {}).get("eval_ids")
         != [
             item.get("frame_id")
@@ -312,6 +362,7 @@ def publish_tile_seam_probe(
     maximum_visible_gaussians: int | None = None,
     device: str = "cuda",
     allow_nonproduction_georeferencing_for_diagnostic: bool = False,
+    assembly_policy: str = HARD_CORE_POLICY,
 ) -> dict[str, Any]:
     """Evaluate and atomically publish one deterministic adjacent-tile seam."""
     name = _safe_name(probe_name)
@@ -334,6 +385,9 @@ def publish_tile_seam_probe(
         maximum_visible_gaussians = configured
     if maximum_visible_gaussians <= 0:
         raise ValueError("maximum_visible_gaussians must be positive")
+    assembly_policy = str(assembly_policy)
+    if assembly_policy not in {HARD_CORE_POLICY, FEATHERED_POLICY}:
+        raise ValueError(f"unknown seam assembly policy: {assembly_policy}")
 
     destination = (
         Path(output_root).expanduser() / "seam_probe_artifacts" / name
@@ -432,9 +486,54 @@ def publish_tile_seam_probe(
         })
         completed.append((tile, params, params_hash))
 
-    combined, ownership = _concatenate_core_params(plan, completed)
-    if any(item["core_owned_gaussians"] <= 0 for item in ownership):
-        raise ArtifactError("each seam tile must contribute core-owned Gaussians")
+    if assembly_policy == HARD_CORE_POLICY:
+        combined, ownership = _concatenate_core_params(plan, completed)
+        if any(item["core_owned_gaussians"] <= 0 for item in ownership):
+            raise ArtifactError("each seam tile must contribute core-owned Gaussians")
+        assembly_record = {
+            "name": HARD_CORE_POLICY,
+            "uses_heldout_evidence": False,
+            "ownership_rule": plan["partition"]["boundary_rule"],
+        }
+    else:
+        maximum_scale = float(getattr(cfg.train, "max_scale_m", float("nan")))
+        sigma_multiplier = 3.0
+        feather_width = maximum_scale * sigma_multiplier
+        context_halo = float(plan["partition"]["context_halo_m"])
+        if (
+            not math.isfinite(maximum_scale)
+            or maximum_scale <= 0
+            or not math.isfinite(context_halo)
+            or context_halo <= 0
+            or feather_width > context_halo
+        ):
+            raise ArtifactError(
+                "configured Gaussian support is incompatible with the TilePlan halo"
+            )
+        combined, ownership = _concatenate_feathered_params(
+            plan,
+            completed,
+            feather_width_m=feather_width,
+        )
+        if any(
+            item["retained_gaussians"] <= 0
+            or item["strict_core_gaussians"] <= 0
+            for item in ownership
+        ):
+            raise ArtifactError("each seam tile must contribute feathered support")
+        assembly_record = {
+            "name": FEATHERED_POLICY,
+            "uses_heldout_evidence": False,
+            "width_source": (
+                "configured_maximum_gaussian_scale_times_fixed_3sigma"
+            ),
+            "maximum_gaussian_scale_m": maximum_scale,
+            "support_sigma_multiplier": sigma_multiplier,
+            "feather_width_m": feather_width,
+            "tile_context_halo_m": context_halo,
+            "weighting": "normalized_exterior_core_distance_linear_v1",
+            "opacity_composition": "normalized_optical_thickness_v1",
+        }
     from rtk_splat.backends.gsplat import _load_checkpoint_gaussians
 
     component_params = {}
@@ -529,6 +628,7 @@ def publish_tile_seam_probe(
                 "eval_ids": seam_ids,
             },
             "selection": selection,
+            "assembly_policy": assembly_record,
             "evidence": seam_evidence,
             "components": {
                 tile_id: {key: components[tile_id][key] for key in _METRICS}
@@ -563,6 +663,7 @@ def publish_tile_seam_probe(
             "provisional": diagnostic_nonproduction,
             "metric_georeferencing_claim_eligible": production_georeferencing,
             "tile_ids": tile_ids,
+            "assembly_policy": assembly_record,
             "tile_plan": {
                 "name": plan["name"],
                 "manifest_sha256": sha256_file(plan_root / "manifest.json"),
@@ -570,9 +671,9 @@ def publish_tile_seam_probe(
                 "source_inventory_sha256": canonical_hash(inventory),
             },
             "ownership": {
-                "rule": plan["partition"]["boundary_rule"],
+                "rule": assembly_record["name"],
                 "tiles": ownership,
-                "core_owned_gaussians": int(len(combined["means"])),
+                "assembled_gaussians": int(len(combined["means"])),
             },
         }
         viewmats, _ = load_pose_artifact(
@@ -594,6 +695,7 @@ def publish_tile_seam_probe(
             "pose": inventory["pose"],
             "georeferencing": copy.deepcopy(georeferencing),
             "neighbor_selection": copy.deepcopy(selection),
+            "assembly_policy": copy.deepcopy(assembly_record),
             "common_training_identity": common_training_identity,
             "tile_runs": run_records,
             "package": collect_package_state(),

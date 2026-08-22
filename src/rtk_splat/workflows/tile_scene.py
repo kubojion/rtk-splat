@@ -574,6 +574,165 @@ def _concatenate_core_params(
     return combined, records
 
 
+def _core_feather_raw_weight(
+    uv: np.ndarray,
+    core: np.ndarray,
+    width_m: float,
+) -> np.ndarray:
+    """Linear exterior-core weight used to form a partition of unity."""
+    outside = np.maximum(np.maximum(core[0] - uv, uv - core[1]), 0.0)
+    distance = np.linalg.norm(outside, axis=1)
+    return np.clip(1.0 - distance / float(width_m), 0.0, 1.0)
+
+
+def _concatenate_feathered_params(
+    plan: Mapping[str, Any],
+    completed: Sequence[tuple[Mapping[str, Any], Path, str]],
+    *,
+    feather_width_m: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Blend overlapping tile support with normalized optical thickness.
+
+    A tile has raw weight one inside its core and linearly decreasing weight
+    outside it.  All raw core-distance weights are normalized at each Gaussian
+    centre, so the spatial weights form a partition of unity.  Opacity is
+    scaled in optical-thickness space, where coincident weighted contributors
+    reproduce the transmittance of one contributor instead of double-darkening
+    the seam.
+    """
+    import torch
+    from rtk_splat.backends.gsplat import _load_checkpoint_gaussians
+
+    width = float(feather_width_m)
+    if not math.isfinite(width) or width <= 0:
+        raise ValueError("feather_width_m must be finite and positive")
+    plan_tiles = list(plan.get("tiles", []))
+    plan_indices = {
+        str(tile["tile_id"]): index for index, tile in enumerate(plan_tiles)
+    }
+    if not plan_tiles or len(plan_indices) != len(plan_tiles):
+        raise ArtifactError("TilePlan contains missing or duplicate tile IDs")
+    completed_ids = [str(tile["tile_id"]) for tile, _, _ in completed]
+    if len(completed_ids) != len(set(completed_ids)):
+        raise ArtifactError("completed tile inputs contain duplicate tile IDs")
+    origin = np.asarray(
+        plan["coordinate_frame"]["partition_origin_enu_m"], dtype=np.float64
+    )
+    basis = np.asarray(
+        plan["coordinate_frame"]["R_enu_from_partition"], dtype=np.float64
+    )
+    scene = np.asarray(plan["partition"]["scene_bounds_uv_m"], dtype=np.float64)
+    tolerance = float(plan["partition"]["ownership_tolerance_m"])
+    all_cores = {
+        str(tile["tile_id"]): np.asarray(
+            tile["core_bounds_uv_m"], dtype=np.float64
+        )
+        for tile in plan_tiles
+    }
+    cores = {tile_id: all_cores[tile_id] for tile_id in completed_ids}
+    if (
+        origin.shape != (3,)
+        or basis.shape != (3, 3)
+        or scene.shape != (2, 2)
+        or not np.isfinite(origin).all()
+        or not np.isfinite(basis).all()
+        or not np.isfinite(scene).all()
+        or np.any(scene[1] <= scene[0])
+    ):
+        raise ArtifactError("TilePlan feather geometry is invalid")
+
+    pieces: dict[str, list[Any]] = {name: [] for name in _PARAMETERS}
+    records = []
+    for tile, params_path, expected_hash in completed:
+        tile_id = str(tile["tile_id"])
+        if tile_id not in plan_indices:
+            raise ArtifactError(f"completed tile is absent from TilePlan: {tile_id}")
+        params = _load_checkpoint_gaussians(params_path, "cpu")
+        if sha256_file(params_path) != expected_hash:
+            raise ArtifactError(f"tile params changed while loading: {params_path}")
+        means = params["means"].detach().cpu().numpy()
+        if means.ndim != 2 or means.shape[1] != 3 or not np.isfinite(means).all():
+            raise ArtifactError(f"tile means are invalid: {params_path}")
+        uv = ((means.astype(np.float64, copy=False) - origin) @ basis)[:, :2]
+        core = cores[tile_id]
+        source_raw = _core_feather_raw_weight(uv, core, width)
+        inside_scene = np.all(uv >= scene[0] - tolerance, axis=1) & np.all(
+            uv <= scene[1] + tolerance, axis=1
+        )
+        keep_np = (source_raw > 0.0) & inside_scene
+        if not np.any(keep_np):
+            raise ArtifactError(f"{tile_id} contributes no feathered Gaussians")
+        selected_uv = uv[keep_np]
+        denominator = np.zeros(len(selected_uv), dtype=np.float64)
+        source_expanded = np.stack((core[0] - width, core[1] + width))
+        contributing_cores = []
+        for other_id, other_core in cores.items():
+            other_expanded = np.stack((
+                other_core[0] - width,
+                other_core[1] + width,
+            ))
+            if np.any(
+                np.minimum(source_expanded[1], other_expanded[1])
+                < np.maximum(source_expanded[0], other_expanded[0])
+            ):
+                continue
+            denominator += _core_feather_raw_weight(
+                selected_uv, other_core, width
+            )
+            contributing_cores.append(other_id)
+        selected_raw = source_raw[keep_np]
+        if (
+            np.any(~np.isfinite(denominator))
+            or np.any(denominator <= 0)
+            or np.any(selected_raw > denominator + 1e-12)
+        ):
+            raise ArtifactError("TilePlan feather normalization is invalid")
+        weights_np = selected_raw / denominator
+        if np.any(weights_np <= 0) or np.any(weights_np > 1 + 1e-12):
+            raise ArtifactError("normalized feather weights are invalid")
+        keep = torch.from_numpy(keep_np)
+        weights = torch.from_numpy(weights_np).to(dtype=params["opacities"].dtype)
+        for parameter_name in _PARAMETERS:
+            tensor = params[parameter_name].detach().cpu()
+            if len(tensor) != len(means) or not bool(torch.isfinite(tensor).all()):
+                raise ArtifactError(
+                    f"invalid {parameter_name} tensor in {params_path}"
+                )
+            selected = tensor[keep].contiguous()
+            if parameter_name == "opacities":
+                alpha = torch.sigmoid(selected)
+                epsilon = torch.finfo(alpha.dtype).eps
+                alpha = alpha.clamp(epsilon, 1.0 - epsilon)
+                optical_thickness = -torch.log1p(-alpha)
+                weighted_alpha = -torch.expm1(-optical_thickness * weights)
+                weighted_alpha = weighted_alpha.clamp(epsilon, 1.0 - epsilon)
+                selected = torch.logit(weighted_alpha).contiguous()
+            pieces[parameter_name].append(selected)
+        strict_core = np.all(uv >= core[0], axis=1) & np.all(
+            uv <= core[1], axis=1
+        )
+        retained = int(keep_np.sum())
+        strict_retained = int(np.sum(keep_np & strict_core))
+        records.append({
+            "tile_id": tile_id,
+            "source_params": str(params_path.resolve()),
+            "source_params_sha256": expected_hash,
+            "source_gaussians": len(means),
+            "retained_gaussians": retained,
+            "strict_core_gaussians": strict_retained,
+            "feather_support_gaussians": retained - strict_retained,
+            "discarded_gaussians": int(len(means) - retained),
+            "minimum_normalized_weight": float(np.min(weights_np)),
+            "maximum_normalized_weight": float(np.max(weights_np)),
+            "mean_normalized_weight": float(np.mean(weights_np)),
+            "contributing_core_ids": sorted(contributing_cores),
+        })
+    combined = {name: torch.cat(values, dim=0) for name, values in pieces.items()}
+    if not len(combined["means"]):
+        raise ArtifactError("feathered assembly is empty")
+    return combined, records
+
+
 def _shared_core_seam_segment(
     first: Mapping[str, Any],
     second: Mapping[str, Any],
