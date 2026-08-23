@@ -22,6 +22,7 @@ from rtk_splat.workflows.tiles import (
     verify_tile_plan,
 )
 from rtk_splat.workflows.cloud import (
+    _stored_points_inside_context,
     construct_initial_cloud,
     load_tile_context_masks,
     verify_tile_cloud,
@@ -281,6 +282,31 @@ def _diagnostic_pose(reader: SegmentReader, parent: Path, name: str) -> Path:
 
 
 class TilePlanTests(unittest.TestCase):
+    def test_context_check_allows_storage_roundoff_but_not_real_leakage(self):
+        binding = {
+            "partition_origin_enu_m": [0.0, 0.0, 0.0],
+            "R_enu_from_partition": np.eye(3).tolist(),
+            "context_bounds_uv_m": [[-1.0, -1.0], [1.0, 1.0]],
+        }
+        upper_roundoff = np.nextafter(
+            np.float32(1.0), np.float32(2.0)
+        )
+        lower_roundoff = np.nextafter(
+            np.float32(-1.0), np.float32(-2.0)
+        )
+        points = np.asarray([
+            [upper_roundoff, 0.0, 0.0],
+            [lower_roundoff, 0.0, 0.0],
+            [1.001, 0.0, 0.0],
+            [-1.001, 0.0, 0.0],
+        ], dtype=np.float32)
+        self.assertEqual(
+            _stored_points_inside_context(points, binding).tolist(),
+            [True, True, False, False],
+        )
+        with self.assertRaisesRegex(ValueError, "storage type"):
+            _stored_points_inside_context(points.astype(np.int32), binding)
+
     def test_training_coverage_excludes_heldout_only_support(self):
         support = [
             np.asarray([[0.5, 0.5]], dtype=np.float64),
