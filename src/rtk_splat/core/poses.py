@@ -228,13 +228,22 @@ def pose_frames_from_extrinsic(
     pose_cfg,
     T_camera_primary_antenna,
     tilts=None,
+    *,
+    primary_to_secondary_baseline_camera_m=None,
 ) -> list[PosedFrame | None]:
     """Construct camera poses from the one declared antenna-camera transform.
 
     ``T_camera_primary_antenna`` maps coordinates in the primary-antenna
     frame into the left optical-camera frame. The antenna frame is assumed
-    body-aligned (x forward, y left, z up); its world orientation comes from
-    the measured/derived yaw plus optional terrain tilt.
+    body-aligned (x forward, y left, z up).  When the calibrated
+    primary-to-secondary vector is supplied, the measured dual-antenna yaw is
+    converted from *baseline yaw* to antenna-frame yaw before the fixed
+    extrinsic is applied.  Omitting the vector preserves the historical
+    assumption that the measured baseline is exactly antenna-frame +X.
+
+    A single antenna baseline does not observe twist about itself, so this
+    function deliberately continues to use only its horizontal direction;
+    optional terrain tilt remains an explicit, separate input.
     """
     camera_from_antenna = np.asarray(
         T_camera_primary_antenna, dtype=np.float64
@@ -259,6 +268,29 @@ def pose_frames_from_extrinsic(
     antenna_from_camera = np.linalg.inv(camera_from_antenna)
     r_ac = antenna_from_camera[:3, :3]
     t_ac = antenna_from_camera[:3, 3]
+    baseline_yaw_in_antenna = 0.0
+    if primary_to_secondary_baseline_camera_m is not None:
+        baseline_camera = np.asarray(
+            primary_to_secondary_baseline_camera_m, dtype=np.float64
+        )
+        if (
+            baseline_camera.shape != (3,)
+            or not np.isfinite(baseline_camera).all()
+        ):
+            raise ValueError(
+                "primary_to_secondary_baseline_camera_m must be a finite "
+                "three-vector"
+            )
+        baseline_antenna = camera_from_antenna[:3, :3].T @ baseline_camera
+        horizontal_norm = float(np.linalg.norm(baseline_antenna[:2]))
+        if not np.isfinite(horizontal_norm) or horizontal_norm <= 1.0e-8:
+            raise ValueError(
+                "declared antenna baseline has no observable horizontal "
+                "direction"
+            )
+        baseline_yaw_in_antenna = float(
+            np.arctan2(baseline_antenna[1], baseline_antenna[0])
+        )
     yaw_smoothed = smooth_yaw(track, pose_cfg.yaw_smooth_window)
     output = []
     for index, stamp in enumerate(frame_stamps):
@@ -266,7 +298,8 @@ def pose_frames_from_extrinsic(
         if measured is None:
             output.append(None)
             continue
-        antenna_center, yaw = measured
+        antenna_center, measured_baseline_yaw = measured
+        yaw = measured_baseline_yaw - baseline_yaw_in_antenna
         roll_dev, pitch_dev = (
             tuple(tilts[index]) if tilts is not None else (0.0, 0.0)
         )

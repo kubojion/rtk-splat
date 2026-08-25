@@ -253,6 +253,7 @@ def load_raw_colmap_rig_trajectory(
         database_path: Path,
         *,
         left_prefix: str = "zed/left/",
+        left_image_frame_ids: Mapping[str, int] | None = None,
         expected_frame_count: int | None = None,
 ) -> RawColmapRigTrajectory:
     """Load raw chronological left poses from ``frames.txt`` and the database.
@@ -261,6 +262,26 @@ def load_raw_colmap_rig_trajectory(
     immutable read-only mode and is used only to map image IDs to names.
     """
     model = Path(model_dir)
+    explicit_left: dict[str, int] | None = None
+    if left_image_frame_ids is not None:
+        explicit_left = {}
+        for raw_name, raw_index in left_image_frame_ids.items():
+            name = str(raw_name).replace("\\", "/")
+            if not name or name.startswith("/") or name in explicit_left:
+                raise ValueError("left image assignment contains an invalid name")
+            if isinstance(raw_index, bool) or not isinstance(
+                    raw_index, (int, np.integer)):
+                raise ValueError(
+                    "left image assignment frame IDs must be integers")
+            index = int(raw_index)
+            if index < 0:
+                raise ValueError(
+                    "left image assignment frame IDs cannot be negative")
+            explicit_left[name] = index
+        if not explicit_left:
+            raise ValueError("left image assignment cannot be empty")
+        if len(set(explicit_left.values())) != len(explicit_left):
+            raise ValueError("left image assignment contains duplicate frame IDs")
     rigs = _parse_rigs(model / "rigs.txt")
     images = _read_database_images(database_path)
     records = []
@@ -286,7 +307,12 @@ def load_raw_colmap_rig_trajectory(
                 raise ValueError(
                     f"frame {frame_id} references missing image {image_id}")
             name, camera_id = images[image_id]
-            if sensor_type == "CAMERA" and name.startswith(left_prefix):
+            is_left = (
+                name in explicit_left
+                if explicit_left is not None
+                else name.startswith(left_prefix)
+            )
+            if sensor_type == "CAMERA" and is_left:
                 if camera_id != sensor_id:
                     raise ValueError(
                         f"image {image_id} camera id {camera_id} disagrees "
@@ -304,7 +330,11 @@ def load_raw_colmap_rig_trajectory(
                 f"frame {frame_id} uses sensor {sensor_key} absent from rig")
         camera_from_world = (
             rig.sensor_from_rig[sensor_key] @ rig_from_world)
-        index = _frame_index_from_name(name, left_prefix)
+        index = (
+            explicit_left[name]
+            if explicit_left is not None
+            else _frame_index_from_name(name, left_prefix)
+        )
         rotation = camera_from_world[:3, :3]
         center = -rotation.T @ camera_from_world[:3, 3]
         records.append((index, frame_id, image_id, name,

@@ -147,6 +147,42 @@ def _context_mask(
     return result
 
 
+def _stored_points_inside_context(
+    stored_xyz: np.ndarray,
+    binding: dict,
+) -> np.ndarray:
+    """Classify stored points with tolerance bounded by storage precision."""
+    stored_xyz = np.asarray(stored_xyz)
+    if stored_xyz.dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("tile cloud xyz storage type is invalid")
+    xyz = stored_xyz.astype(np.float64, copy=False)
+    origin = np.asarray(binding["partition_origin_enu_m"], dtype=np.float64)
+    basis = np.asarray(binding["R_enu_from_partition"], dtype=np.float64)
+    bounds = np.asarray(binding["context_bounds_uv_m"], dtype=np.float64)
+    uv = ((xyz - origin) @ basis)[:, :2]
+
+    # Context membership is computed before publication, then xyz is sealed as
+    # float32.  A point on a boundary can therefore move by a few micrometres.
+    # Derive the allowance from the stored dtype and coordinate magnitude; the
+    # fixed term only covers float64 projection arithmetic.  The resulting
+    # allowance remains tied to storage roundoff, not a physical scene limit.
+    coordinate_scale = np.maximum(
+        np.maximum(np.abs(np.min(xyz, axis=0)), np.abs(np.max(xyz, axis=0))),
+        np.maximum(np.abs(origin), 1.0),
+    )
+    coordinate_roundoff = (
+        np.finfo(stored_xyz.dtype).eps * coordinate_scale
+    )
+    uv_tolerance = (
+        1e-6 + coordinate_roundoff @ np.abs(basis[:, :2])
+    )
+    return np.all(
+        (uv >= bounds[0] - uv_tolerance)
+        & (uv <= bounds[1] + uv_tolerance),
+        axis=1,
+    )
+
+
 def load_tile_context_masks(
     cloud_file: str | Path,
     execution: TileExecution,
@@ -221,13 +257,15 @@ def verify_tile_cloud(
         )
     masks = load_tile_context_masks(cloud_file, execution)
     with np.load(cloud_file, allow_pickle=False) as cloud:
-        xyz = np.asarray(cloud["xyz"], dtype=np.float64)
+        stored_xyz = np.asarray(cloud["xyz"])
+        xyz = stored_xyz.astype(np.float64, copy=False)
         rgb = np.asarray(cloud["rgb"])
         mask_sha256 = str(cloud["tile_context_mask_sha256"].item())
     if (
         xyz.ndim != 2
         or xyz.shape[1] != 3
         or not len(xyz)
+        or stored_xyz.dtype not in (np.dtype(np.float32), np.dtype(np.float64))
         or not np.isfinite(xyz).all()
         or rgb.shape != (len(xyz), 3)
         or rgb.dtype != np.uint8
@@ -237,11 +275,7 @@ def verify_tile_cloud(
     ):
         raise ValueError("tile cloud point arrays are invalid")
     binding = execution.binding
-    origin = np.asarray(binding["partition_origin_enu_m"], dtype=np.float64)
-    basis = np.asarray(binding["R_enu_from_partition"], dtype=np.float64)
-    bounds = np.asarray(binding["context_bounds_uv_m"], dtype=np.float64)
-    uv = ((xyz - origin) @ basis)[:, :2]
-    if not np.all((uv >= bounds[0] - 1e-6) & (uv <= bounds[1] + 1e-6)):
+    if not np.all(_stored_points_inside_context(stored_xyz, binding)):
         raise ValueError("tile cloud contains points outside its context bounds")
     return len(xyz), len(masks)
 

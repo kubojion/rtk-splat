@@ -50,6 +50,55 @@ class PoseQualityGateTests(unittest.TestCase):
             np.linalg.inv(poses[0].viewmat)[:3, :3], np.eye(3)
         )
 
+    def test_declared_dual_antenna_direction_corrects_baseline_yaw(self):
+        track = _track(heading_kind="carrier")
+        track.relpos_carr[:] = 2
+        body_yaw = np.deg2rad(30.0)
+        baseline_yaw = np.deg2rad(10.0)
+        track.relpos_yaw[:] = body_yaw + baseline_yaw
+        transform = np.eye(4)
+        transform[0, 3] = -1.0
+        baseline_camera = np.array(
+            [np.cos(baseline_yaw), np.sin(baseline_yaw), 0.0]
+        )
+
+        pose = pose_frames_from_extrinsic(
+            track,
+            [0.5],
+            _config(),
+            transform,
+            primary_to_secondary_baseline_camera_m=baseline_camera,
+        )[0]
+
+        self.assertIsNotNone(pose)
+        expected_rotation = np.array(
+            [
+                [np.cos(body_yaw), -np.sin(body_yaw), 0.0],
+                [np.sin(body_yaw), np.cos(body_yaw), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        np.testing.assert_allclose(
+            pose.cam_center,
+            np.array([0.5, 0.0, 0.0]) + expected_rotation[:, 0],
+            atol=1.0e-12,
+        )
+        np.testing.assert_allclose(
+            np.linalg.inv(pose.viewmat)[:3, :3],
+            expected_rotation,
+            atol=1.0e-12,
+        )
+
+    def test_declared_dual_antenna_direction_must_be_observable(self):
+        with self.assertRaisesRegex(ValueError, "horizontal direction"):
+            pose_frames_from_extrinsic(
+                _track(),
+                [0.5],
+                _config(),
+                np.eye(4),
+                primary_to_secondary_baseline_camera_m=[0.0, 0.0, 1.0],
+            )
+
     def test_course_heading_is_not_mislabeled_as_carrier_fixed(self):
         track = _track(heading_kind="course")
         result = base_pose_at(track, track.relpos_yaw, 0.5, _config())

@@ -480,6 +480,12 @@ def cmd_tiles_plan(cfg, args) -> None:
     if getattr(args, "pose_artifact_root", None) is not None:
         cfg.pose.artifact_root = args.pose_artifact_root.expanduser()
     tiles = _section(cfg, "tiles")
+    if getattr(args, "tile_max_tiles", None) is not None:
+        tiles.max_tiles = int(args.tile_max_tiles)
+    if getattr(args, "tile_min_visibility_fraction", None) is not None:
+        tiles.min_visibility_fraction = float(
+            args.tile_min_visibility_fraction
+        )
     name = str(
         args.tile_plan_name
         or getattr(tiles, "name", None)
@@ -491,6 +497,9 @@ def cmd_tiles_plan(cfg, args) -> None:
         name=name,
         output_root=cfg.paths.workdir,
         tile_count=args.tile_count,
+        allow_failed_georeferencing_for_render=bool(
+            getattr(args, "allow_failed_georeferencing_for_render", False)
+        ),
     )
     plan = json.loads((output / "tile_plan.json").read_text())
     print(
@@ -631,6 +640,9 @@ def cmd_scene_publish(cfg, args) -> None:
             allow_nonproduction_georeferencing_for_diagnostic=(
                 bool(args.diagnostic_scene)
             ),
+            assembly_policy=(
+                args.scene_assembly_policy or "hard_half_open_core_v1"
+            ),
         )
     else:
         from rtk_splat.workflows.tile_scene import publish_tiled_scene
@@ -658,6 +670,46 @@ def cmd_scene_publish(cfg, args) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def cmd_seam_probe(cfg, args) -> None:
+    if args.pose_name:
+        cfg.pose.artifact = args.pose_name
+    cfg.pose.artifact_root = args.pose_artifact_root.expanduser()
+    from rtk_splat.workflows.tile_seam import publish_tile_seam_probe
+
+    result = publish_tile_seam_probe(
+        segment=_segment_path(cfg),
+        cfg=cfg,
+        tile_plan_root=args.tile_plan,
+        pose_root=(
+            args.pose_artifact_root.expanduser() / str(cfg.pose.artifact)
+        ),
+        tile_runs=_scene_tile_runs(args.scene_tile_run),
+        anchor_tile_id=args.seam_anchor_tile_id,
+        output_root=cfg.paths.workdir,
+        probe_name=args.scene_name,
+        maximum_psnr_loss_db=(
+            0.30 if args.max_psnr_loss_db is None else args.max_psnr_loss_db
+        ),
+        maximum_ssim_loss=(
+            0.015 if args.max_ssim_loss is None else args.max_ssim_loss
+        ),
+        maximum_lpips_cc_increase=(
+            0.030
+            if args.max_lpips_cc_increase is None
+            else args.max_lpips_cc_increase
+        ),
+        maximum_visible_gaussians=args.max_combined_gaussians,
+        device=("cuda" if args.scene_device is None else args.scene_device),
+        allow_nonproduction_georeferencing_for_diagnostic=bool(
+            args.diagnostic_scene
+        ),
+        assembly_policy=(
+            args.seam_assembly_policy or "hard_half_open_core_v1"
+        ),
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 COMMANDS = {
     "validate": cmd_validate,
     "ingest": cmd_ingest,
@@ -678,6 +730,7 @@ COMMANDS = {
     "tiles-plan": cmd_tiles_plan,
     "cloud": cmd_cloud,
     "train": cmd_train,
+    "seam-probe": cmd_seam_probe,
     "scene-publish": cmd_scene_publish,
 }
 
@@ -740,20 +793,39 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "pose-artifact parent override for tiles-plan, cloud, train, "
-            "or scene-publish"
+            "seam-probe, or scene-publish"
         ),
     )
     parser.add_argument("--tile-plan-name")
     parser.add_argument(
         "--tile-plan",
         type=Path,
-        help="sealed TilePlan artifact to consume during cloud/train/scene-publish",
+        help=(
+            "sealed TilePlan artifact to consume during cloud/train/seam-probe/"
+            "scene-publish"
+        ),
     )
     parser.add_argument("--tile-id")
     parser.add_argument(
         "--tile-count",
         type=int,
         help="explicit tile count for a controlled tiles-plan experiment",
+    )
+    parser.add_argument(
+        "--tile-max-tiles",
+        type=int,
+        help=(
+            "explicit audited ceiling for automatic tiles-plan partitioning; "
+            "does not change per-tile training capacity"
+        ),
+    )
+    parser.add_argument(
+        "--tile-min-visibility-fraction",
+        type=float,
+        help=(
+            "explicit audited minimum fraction of a frame's sampled depth "
+            "support required for automatic tile visibility"
+        ),
     )
     parser.add_argument("--run-name")
     parser.add_argument(
@@ -762,6 +834,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="completed tiled run as TILE_ID=/path; repeat for every tile",
     )
     parser.add_argument("--scene-name")
+    parser.add_argument(
+        "--seam-anchor-tile-id",
+        help=(
+            "seam-probe anchor; its neighbor is selected only from sealed "
+            "TilePlan core geometry"
+        ),
+    )
+    parser.add_argument(
+        "--seam-assembly-policy",
+        choices=(
+            "hard_half_open_core_v1",
+            "normalized_core_distance_feather_v1",
+            "depth_projected_context_composite_v1",
+        ),
+        help=(
+            "seam-probe assembly; feather width is derived from the configured "
+            "maximum Gaussian scale and is not a tunable CLI value"
+        ),
+    )
+    parser.add_argument(
+        "--scene-assembly-policy",
+        choices=(
+            "hard_half_open_core_v1",
+            "depth_projected_context_composite_v1",
+        ),
+        help=(
+            "production scene representation; layered composition keeps each "
+            "sealed tile intact and routes only by TilePlan geometry"
+        ),
+    )
     parser.add_argument(
         "--scene-mode",
         choices=("controlled-ab", "production"),
@@ -796,7 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "explicitly consume or publish a diagnostic-render-only pose "
             "whose held-out georeferencing gate failed; valid only for "
-            "backend-export, cloud, and train"
+            "backend-export, tiles-plan, cloud, and train"
         ),
     )
     parser.add_argument(
@@ -815,9 +917,12 @@ def _stage_overrides(args) -> dict[str, Any]:
         "feature_profile", "keyframe_preset", "backend", "backend_name",
         "refinement_name", "initialization_mode", "prior_position_loss",
         "pose_name", "run_name", "train_iters", "expected_frames",
-        "pose_artifact_root", "tile_plan_name", "tile_count",
+        "pose_artifact_root", "tile_plan_name", "tile_count", "tile_max_tiles",
+        "tile_min_visibility_fraction",
         "tile_plan", "tile_id",
-        "scene_tile_run", "scene_name", "scene_mode", "reference_run",
+        "scene_tile_run", "scene_name", "seam_anchor_tile_id",
+        "seam_assembly_policy", "scene_assembly_policy", "scene_mode",
+        "reference_run",
         "reference_params_sha256", "reference_metrics_sha256",
         "reference_provenance_sha256", "scene_opacity_threshold",
         "max_psnr_loss_db", "max_ssim_loss", "max_lpips_cc_increase",
@@ -880,6 +985,13 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--expected-frames must be positive")
     if args.tile_count is not None and args.tile_count <= 0:
         raise ValueError("--tile-count must be positive")
+    if args.tile_max_tiles is not None and not 1 <= args.tile_max_tiles <= 4096:
+        raise ValueError("--tile-max-tiles must be in [1, 4096]")
+    if (
+        args.tile_min_visibility_fraction is not None
+        and not 0 <= args.tile_min_visibility_fraction <= 1
+    ):
+        raise ValueError("--tile-min-visibility-fraction must be in [0, 1]")
     if args.stage == "segment-materialize" and args.portable_segment is None:
         raise ValueError("segment-materialize requires --portable-segment")
     if args.stage != "segment-materialize" and args.portable_segment is not None:
@@ -888,24 +1000,31 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.stage != "segment-materialize" and args.link_mode is not None:
         raise ValueError("--link-mode is valid only for segment-materialize")
-    plan_only = ("tile_plan_name", "tile_count")
+    plan_only = (
+        "tile_plan_name",
+        "tile_count",
+        "tile_max_tiles",
+        "tile_min_visibility_fraction",
+    )
     if args.stage != "tiles-plan" and any(
         getattr(args, name) is not None for name in plan_only
     ):
         raise ValueError(
-            "--tile-plan-name and --tile-count are "
-            "valid only for tiles-plan"
+            "TilePlan construction overrides are valid only for tiles-plan"
         )
     if (
         args.pose_artifact_root is not None
-        and args.stage not in {"tiles-plan", "cloud", "train", "scene-publish"}
+        and args.stage
+        not in {"tiles-plan", "cloud", "train", "seam-probe", "scene-publish"}
     ):
         raise ValueError(
             "--pose-artifact-root is valid only for tiles-plan, cloud, train, "
-            "and scene-publish"
+            "seam-probe, and scene-publish"
         )
     scene_options = (
-        "scene_tile_run", "scene_name", "scene_mode", "reference_run",
+        "scene_tile_run", "scene_name", "seam_anchor_tile_id",
+        "seam_assembly_policy", "scene_assembly_policy", "scene_mode",
+        "reference_run",
         "reference_params_sha256", "reference_metrics_sha256",
         "reference_provenance_sha256", "scene_opacity_threshold",
         "max_psnr_loss_db", "max_ssim_loss", "max_lpips_cc_increase",
@@ -929,6 +1048,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.tile_id is not None:
             raise ValueError("scene-publish consumes the whole plan, not --tile-id")
+        if args.seam_anchor_tile_id is not None:
+            raise ValueError("--seam-anchor-tile-id requires seam-probe")
+        if args.seam_assembly_policy is not None:
+            raise ValueError("--seam-assembly-policy requires seam-probe")
+        if mode != "production" and args.scene_assembly_policy is not None:
+            raise ValueError(
+                "--scene-assembly-policy requires --scene-mode production"
+            )
         if mode == "controlled-ab" and args.diagnostic_scene:
             raise ValueError("--diagnostic-scene requires --scene-mode production")
         if mode == "production":
@@ -948,6 +1075,38 @@ def main(argv: list[str] | None = None) -> int:
                     "remove "
                     + ", ".join("--" + name.replace("_", "-") for name in supplied)
                 )
+    elif args.stage == "seam-probe":
+        required = (
+            "tile_plan",
+            "pose_artifact_root",
+            "scene_tile_run",
+            "scene_name",
+            "seam_anchor_tile_id",
+        )
+        missing = [name for name in required if getattr(args, name) is None]
+        if missing:
+            raise ValueError(
+                "seam-probe is missing: "
+                + ", ".join("--" + name.replace("_", "-") for name in missing)
+            )
+        if args.tile_id is not None:
+            raise ValueError("seam-probe selects a pair, not --tile-id")
+        if args.scene_assembly_policy is not None:
+            raise ValueError("--scene-assembly-policy requires scene-publish")
+        unsupported = (
+            "scene_mode",
+            "reference_run",
+            "reference_params_sha256",
+            "reference_metrics_sha256",
+            "reference_provenance_sha256",
+            "scene_opacity_threshold",
+        )
+        supplied = [name for name in unsupported if getattr(args, name) is not None]
+        if supplied:
+            raise ValueError(
+                "seam-probe does not accept "
+                + ", ".join("--" + name.replace("_", "-") for name in supplied)
+            )
     else:
         if args.diagnostic_scene or any(
             getattr(args, name) is not None for name in scene_options
@@ -975,11 +1134,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     if (
         args.allow_failed_georeferencing_for_render
-        and args.stage not in {"backend-export", "cloud", "train"}
+        and args.stage not in {
+            "backend-export",
+            "tiles-plan",
+            "cloud",
+            "train",
+        }
     ):
         raise ValueError(
             "--allow-failed-georeferencing-for-render is valid only for "
-            "backend-export, cloud, and train"
+            "backend-export, tiles-plan, cloud, and train"
         )
     cfg = load_config(args.config, config_root=args.config_root)
     _validate_diagnostic_render_names(args, cfg)

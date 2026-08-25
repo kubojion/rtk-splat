@@ -14,12 +14,15 @@ from rtk_splat.core.segment import (
     SegmentWriter,
 )
 from rtk_splat.workflows.tiles import (
+    _complete_core_training_coverage,
+    _training_core_support,
     build_tile_plan,
     load_tile_execution,
     owner_tile_indices,
     verify_tile_plan,
 )
 from rtk_splat.workflows.cloud import (
+    _stored_points_inside_context,
     construct_initial_cloud,
     load_tile_context_masks,
     verify_tile_cloud,
@@ -224,7 +227,172 @@ def _legacy_pose(reader: SegmentReader, parent: Path, name: str) -> Path:
     return root
 
 
+def _diagnostic_pose(reader: SegmentReader, parent: Path, name: str) -> Path:
+    root = parent / name
+    root.mkdir(parents=True)
+    np.save(root / "viewmats.npy", reader.frames["initial_viewmat"])
+    np.save(root / "cam_centers.npy", reader.frames["initial_camera_center_m"])
+    status = {
+        "artifact_class": "diagnostic_render_only",
+        "georeferencing_status": "FAILED",
+        "metric_georeferencing_claim_eligible": False,
+        "diagnostic_export_requested": True,
+        "diagnostic_export_override_used": True,
+    }
+    declaration = {"schema_version": 1, **status}
+    (root / "quality.json").write_text(
+        json.dumps(
+            {**declaration, "rtk_alignment_passed": False},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    for filename in (
+        "alignment.json",
+        "provenance.json",
+        "georeferencing.json",
+        "GEOREFERENCING_FAILED.json",
+    ):
+        (root / filename).write_text(
+            json.dumps(declaration, indent=2, sort_keys=True) + "\n"
+        )
+    files = {}
+    for path in sorted(root.iterdir()):
+        if path.is_file():
+            payload = path.read_bytes()
+            files[path.name] = {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "name": name,
+                **status,
+                "files": files,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return root
+
+
 class TilePlanTests(unittest.TestCase):
+    def test_context_check_allows_storage_roundoff_but_not_real_leakage(self):
+        binding = {
+            "partition_origin_enu_m": [0.0, 0.0, 0.0],
+            "R_enu_from_partition": np.eye(3).tolist(),
+            "context_bounds_uv_m": [[-1.0, -1.0], [1.0, 1.0]],
+        }
+        upper_roundoff = np.nextafter(
+            np.float32(1.0), np.float32(2.0)
+        )
+        lower_roundoff = np.nextafter(
+            np.float32(-1.0), np.float32(-2.0)
+        )
+        points = np.asarray([
+            [upper_roundoff, 0.0, 0.0],
+            [lower_roundoff, 0.0, 0.0],
+            [1.001, 0.0, 0.0],
+            [-1.001, 0.0, 0.0],
+        ], dtype=np.float32)
+        self.assertEqual(
+            _stored_points_inside_context(points, binding).tolist(),
+            [True, True, False, False],
+        )
+        with self.assertRaisesRegex(ValueError, "storage type"):
+            _stored_points_inside_context(points.astype(np.int32), binding)
+
+    def test_training_coverage_excludes_heldout_only_support(self):
+        support = [
+            np.asarray([[0.5, 0.5]], dtype=np.float64),
+            np.asarray([[1.5, 0.5]], dtype=np.float64),
+        ]
+        core = np.asarray([[0.0, 0.0], [2.0, 1.0]], dtype=np.float64)
+        selected = np.asarray([True, True])
+        split_codes = np.asarray([0, 1], dtype=np.uint8)
+        all_core, train_coverable, covered, coverage = (
+            _training_core_support(
+                support, core, selected, split_codes
+            )
+        )
+        self.assertEqual(len(all_core), 2)
+        self.assertEqual(train_coverable.tolist(), [[0.5, 0.5]])
+        self.assertEqual(covered.tolist(), [[0.5, 0.5]])
+        self.assertEqual(coverage, 1.0)
+
+    def test_core_coverage_completion_is_bounded_and_deterministic(self):
+        support = [
+            np.asarray([[0.5, 0.5]], dtype=np.float64),
+            np.asarray([[1.5, 0.5]], dtype=np.float64),
+            np.asarray([[1.5, 0.5]], dtype=np.float64),
+        ]
+        core = np.asarray([[0.0, 0.0], [2.0, 1.0]], dtype=np.float64)
+        selected = np.asarray([True, False, False])
+        split_codes = np.zeros(3, dtype=np.uint8)
+        completed, added = _complete_core_training_coverage(
+            support,
+            core,
+            selected,
+            split_codes,
+            max_training_frames=2,
+            minimum_coverage=1.0,
+        )
+        self.assertEqual(completed.tolist(), [True, True, False])
+        self.assertEqual(added.tolist(), [False, True, False])
+        capped, capped_added = _complete_core_training_coverage(
+            support,
+            core,
+            selected,
+            split_codes,
+            max_training_frames=1,
+            minimum_coverage=1.0,
+        )
+        self.assertEqual(capped.tolist(), selected.tolist())
+        self.assertFalse(capped_added.any())
+
+    def test_diagnostic_pose_requires_permission_and_status_is_propagated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reader = _segment(root / "segment")
+            pose_parent = root / "poses"
+            _diagnostic_pose(reader, pose_parent, "diagnostic")
+            cfg = _cfg(root / "work")
+            cfg.pose.artifact = "diagnostic"
+            cfg.pose.artifact_root = pose_parent
+            with self.assertRaisesRegex(ValueError, "explicit render-only"):
+                build_tile_plan(
+                    reader,
+                    cfg,
+                    name="refused",
+                    output_root=root / "work",
+                    tile_count=2,
+                )
+            artifact = build_tile_plan(
+                reader,
+                cfg,
+                name="diagnostic-plan",
+                output_root=root / "work",
+                tile_count=2,
+                allow_failed_georeferencing_for_render=True,
+            )
+            plan = verify_tile_plan(
+                artifact,
+                segment=reader.root,
+                pose_root=pose_parent / "diagnostic",
+            )
+            self.assertTrue(plan["diagnostic_render_only"])
+            self.assertTrue(plan["provisional"])
+            self.assertFalse(plan["metric_georeferencing_claim_eligible"])
+            self.assertEqual(
+                plan["evidence_tier"],
+                "metric_depth_and_diagnostic_global_pose",
+            )
+
     def test_tile_execution_builds_context_masked_plan_bound_cloud(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -341,6 +509,52 @@ class TilePlanTests(unittest.TestCase):
                     output_root=root / "small", tile_count=1,
                 )
             self.assertFalse((root / "small" / "tile_plan_artifacts" / "too-small").exists())
+
+    def test_resealed_coverage_completion_tampering_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reader = _segment(root / "segment")
+            artifact = build_tile_plan(
+                reader,
+                _cfg(root / "work"),
+                name="coverage-selection",
+                output_root=root / "work",
+                tile_count=2,
+            )
+            visibility_path = artifact / "visibility.npz"
+            with np.load(visibility_path, allow_pickle=False) as archive:
+                arrays = {name: archive[name].copy() for name in archive.files}
+            self.assertIn("coverage_selected", arrays)
+            arrays["coverage_selected"][0] = ~arrays[
+                "coverage_selected"
+            ][0]
+            np.savez_compressed(visibility_path, **arrays)
+            _reseal(artifact, "visibility.npz")
+            with self.assertRaisesRegex(ValueError, "coverage-completion"):
+                verify_tile_plan(artifact)
+
+    def test_resealed_training_coverage_reference_tampering_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reader = _segment(root / "segment")
+            artifact = build_tile_plan(
+                reader,
+                _cfg(root / "work"),
+                name="coverage-reference",
+                output_root=root / "work",
+                tile_count=2,
+            )
+            plan_path = artifact / "tile_plan.json"
+            plan = json.loads(plan_path.read_text())
+            plan["tiles"][0]["summary"][
+                "n_train_coverable_core_support_cells"
+            ] += 1
+            plan_path.write_text(
+                json.dumps(plan, indent=2, sort_keys=True) + "\n"
+            )
+            _reseal(artifact, "tile_plan.json")
+            with self.assertRaisesRegex(ValueError, "tile summary"):
+                verify_tile_plan(artifact)
 
     def test_live_depth_mutation_is_detected(self):
         with tempfile.TemporaryDirectory() as temporary:

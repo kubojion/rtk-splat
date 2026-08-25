@@ -14,8 +14,11 @@ from rtk_splat.frontends.artifact import canonical_hash
 from rtk_splat.workflows.cli import _scene_tile_runs, build_parser, cmd_scene_publish
 from rtk_splat.workflows.tile_scene import (
     _concatenate_core_params,
+    _concatenate_feathered_params,
+    _compose_depth_projected_layers,
     _evaluate_combined,
     _expected_tile_binding,
+    _manifest,
     _reference_run_evidence,
     _training_identity,
     publish_production_tiled_scene,
@@ -122,6 +125,78 @@ class TileSceneTests(unittest.TestCase):
         tile["effective_training_config"]["train"]["iterations"] = 64_000
         self.assertNotEqual(_training_identity(base), _training_identity(tile))
 
+    def test_training_identity_ignores_checkout_locators_but_not_content(self):
+        def provenance(prefix: str):
+            return {
+                "training_implementation_sha256": "a" * 64,
+                "effective_training_config": {
+                    "train": {"run_name": prefix, "iterations": 65_000},
+                    "runtime_resolution": {
+                        "config_sources": {
+                            "profile": f"{prefix}/configs/profile.yaml"
+                        },
+                        "source_files": [{
+                            "path": f"{prefix}/configs/profile.yaml",
+                            "role": "profile",
+                            "sha256": "b" * 64,
+                        }],
+                        "origins": {"train_iterations": {
+                            "source_path": f"{prefix}/configs/profile.yaml",
+                            "source_sha256": "b" * 64,
+                            "authored_value": 65_000,
+                        }},
+                        "derivations": {"train_iterations": {
+                            "chosen_value": 65_000,
+                            "origin": {
+                                "source_path": f"{prefix}/configs/profile.yaml",
+                                "source_sha256": "b" * 64,
+                            },
+                        }},
+                    },
+                },
+            }
+
+        first = provenance("/checkout/one")
+        second = provenance("/checkout/two")
+        self.assertEqual(_training_identity(first), _training_identity(second))
+        second["effective_training_config"]["runtime_resolution"][
+            "source_files"
+        ][0]["sha256"] = "c" * 64
+        self.assertNotEqual(_training_identity(first), _training_identity(second))
+
+    def test_training_identity_ignores_optional_plan_only_derivation(self):
+        base = {
+            "training_implementation_sha256": "a" * 64,
+            "effective_training_config": {
+                "train": {"run_name": "old", "iterations": 65_000},
+                "runtime_resolution": {
+                    "origins": {
+                        "tile_max_training_frames": {
+                            "authored_value": "auto",
+                            "source_sha256": "b" * 64,
+                        }
+                    },
+                    "derivations": {
+                        "tile_max_training_frames": {
+                            "chosen_value": 1300,
+                            "formula_version": 1,
+                        }
+                    },
+                },
+            },
+        }
+        fresh = json.loads(json.dumps(base))
+        fresh["effective_training_config"]["train"]["run_name"] = "new"
+        fresh["effective_training_config"]["runtime_resolution"][
+            "origins"
+        ].clear()
+        fresh["effective_training_config"]["runtime_resolution"][
+            "derivations"
+        ].clear()
+        self.assertEqual(_training_identity(base), _training_identity(fresh))
+        fresh["effective_training_config"]["train"]["iterations"] = 64_000
+        self.assertNotEqual(_training_identity(base), _training_identity(fresh))
+
     def test_scene_cli_accepts_explicit_repeatable_tile_runs(self):
         args = build_parser().parse_args([
             "scene-publish", "--config", "/tmp/config.yaml",
@@ -149,11 +224,30 @@ class TileSceneTests(unittest.TestCase):
             "--scene-tile-run", "tile-0000=/tmp/run-a",
             "--scene-tile-run", "tile-0001=/tmp/run-b",
             "--scene-name", "scene-v2", "--scene-mode", "production",
+            "--scene-assembly-policy", "depth_projected_context_composite_v1",
             "--diagnostic-scene",
         ])
         self.assertEqual(production.scene_mode, "production")
         self.assertTrue(production.diagnostic_scene)
+        self.assertEqual(
+            production.scene_assembly_policy,
+            "depth_projected_context_composite_v1",
+        )
         self.assertIsNone(production.reference_run)
+
+        seam = build_parser().parse_args([
+            "seam-probe", "--config", "/tmp/config.yaml",
+            "--tile-plan", "/tmp/plan", "--pose-artifact-root", "/tmp/poses",
+            "--scene-tile-run", "tile-0000=/tmp/run-a",
+            "--scene-tile-run", "tile-0001=/tmp/run-b",
+            "--scene-name", "seam-v1", "--seam-anchor-tile-id", "tile-0000",
+            "--seam-assembly-policy", "normalized_core_distance_feather_v1",
+            "--diagnostic-scene",
+        ])
+        self.assertEqual(
+            seam.seam_assembly_policy,
+            "normalized_core_distance_feather_v1",
+        )
 
     def test_scene_cli_dispatches_reference_free_production_mode(self):
         args = build_parser().parse_args([
@@ -162,6 +256,7 @@ class TileSceneTests(unittest.TestCase):
             "--scene-tile-run", "tile-0000=/tmp/run-a",
             "--scene-tile-run", "tile-0001=/tmp/run-b",
             "--scene-name", "scene-v2", "--scene-mode", "production",
+            "--scene-assembly-policy", "depth_projected_context_composite_v1",
             "--diagnostic-scene", "--max-combined-gaussians", "123",
             "--scene-device", "cpu",
         ])
@@ -179,6 +274,10 @@ class TileSceneTests(unittest.TestCase):
         self.assertNotIn("reference_hashes", kwargs)
         self.assertTrue(
             kwargs["allow_nonproduction_georeferencing_for_diagnostic"]
+        )
+        self.assertEqual(
+            kwargs["assembly_policy"],
+            "depth_projected_context_composite_v1",
         )
         self.assertEqual(kwargs["maximum_combined_gaussians"], 123)
 
@@ -299,6 +398,152 @@ class TileSceneTests(unittest.TestCase):
             self.assertEqual(
                 [item["core_owned_gaussians"] for item in records], [1, 2]
             )
+
+    def test_core_concatenation_uses_global_indices_for_nonconsecutive_subset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            plan["partition"]["scene_bounds_uv_m"] = [[0.0, 0.0], [3.0, 1.0]]
+            plan["tiles"].append({
+                "tile_id": "tile-0002",
+                "core_bounds_uv_m": [[2.0, 0.0], [3.0, 1.0]],
+                "context_bounds_uv_m": [[1.75, -0.25], [3.25, 1.25]],
+                "frame_ids": {"train": [3], "val": [0], "test": []},
+            })
+            paths = [root / "a.pt", root / "c.pt"]
+            for path in paths:
+                path.write_bytes(path.name.encode())
+            loaded = {
+                paths[0]: _params([[0.5, 0.5, 0], [1.5, 0.5, 0]]),
+                paths[1]: _params([[1.5, 0.5, 0], [2.5, 0.5, 0]]),
+            }
+            completed = [
+                (plan["tiles"][0], paths[0], _sha(paths[0])),
+                (plan["tiles"][2], paths[1], _sha(paths[1])),
+            ]
+            with mock.patch(
+                "rtk_splat.backends.gsplat._load_checkpoint_gaussians",
+                side_effect=lambda path, _device: loaded[Path(path)],
+            ):
+                combined, records = _concatenate_core_params(plan, completed)
+            np.testing.assert_allclose(
+                combined["means"].numpy(),
+                [[0.5, 0.5, 0], [2.5, 0.5, 0]],
+            )
+            self.assertEqual(
+                [item["core_owned_gaussians"] for item in records], [1, 1]
+            )
+
+    def test_feathered_concatenation_normalizes_optical_thickness(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            paths = [root / "a.pt", root / "b.pt"]
+            for path in paths:
+                path.write_bytes(path.name.encode())
+            first = _params([
+                [0.5, 0.5, 0],
+                [1.0, 0.5, 0],
+                [1.25, 0.5, 0],
+            ])
+            second = _params([
+                [0.75, 0.5, 0],
+                [1.0, 0.5, 0],
+                [1.5, 0.5, 0],
+            ])
+            loaded = {paths[0]: first, paths[1]: second}
+            completed = [
+                (plan["tiles"][0], paths[0], _sha(paths[0])),
+                (plan["tiles"][1], paths[1], _sha(paths[1])),
+            ]
+            with mock.patch(
+                "rtk_splat.backends.gsplat._load_checkpoint_gaussians",
+                side_effect=lambda path, _device: loaded[Path(path)],
+            ):
+                combined, records = _concatenate_feathered_params(
+                    plan, completed, feather_width_m=0.5
+                )
+            self.assertEqual(len(combined["means"]), 6)
+            self.assertEqual(
+                [item["retained_gaussians"] for item in records], [3, 3]
+            )
+            alphas = torch.sigmoid(combined["opacities"]).numpy()
+            expected_half = 1.0 - np.sqrt(0.5)
+            self.assertAlmostEqual(float(alphas[0]), 0.5, places=6)
+            self.assertAlmostEqual(float(alphas[1]), expected_half, places=6)
+            self.assertAlmostEqual(float(alphas[4]), expected_half, places=6)
+            self.assertAlmostEqual(float(alphas[5]), 0.5, places=6)
+            # Coincident half-weight contributors exactly reproduce alpha 0.5.
+            self.assertAlmostEqual(
+                float(1.0 - (1.0 - alphas[1]) * (1.0 - alphas[4])),
+                0.5,
+                places=6,
+            )
+
+    def test_feathered_subset_ignores_unloaded_plan_neighbor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            plan["partition"]["scene_bounds_uv_m"] = [[0.0, 0.0], [3.0, 1.0]]
+            plan["tiles"].append({
+                "tile_id": "tile-0002",
+                "core_bounds_uv_m": [[2.0, 0.0], [3.0, 1.0]],
+                "context_bounds_uv_m": [[1.75, -0.25], [3.25, 1.25]],
+                "frame_ids": {"train": [4], "val": [8], "test": []},
+            })
+            paths = [root / "a.pt", root / "b.pt"]
+            for path in paths:
+                path.write_bytes(path.name.encode())
+            loaded = {
+                paths[0]: _params([[0.5, 0.5, 0.0]]),
+                paths[1]: _params([[1.9, 0.5, 0.0]]),
+            }
+            completed = [
+                (plan["tiles"][0], paths[0], _sha(paths[0])),
+                (plan["tiles"][1], paths[1], _sha(paths[1])),
+            ]
+            with mock.patch(
+                "rtk_splat.backends.gsplat._load_checkpoint_gaussians",
+                side_effect=lambda path, _device: loaded[Path(path)],
+            ):
+                combined, records = _concatenate_feathered_params(
+                    plan, completed, feather_width_m=0.25
+                )
+            self.assertEqual(len(combined["means"]), 2)
+            self.assertAlmostEqual(
+                float(torch.sigmoid(combined["opacities"][-1])), 0.5, places=6
+            )
+            self.assertEqual(
+                records[1]["contributing_core_ids"],
+                ["tile-0000", "tile-0001"],
+            )
+
+    def test_depth_projected_layers_crossfade_without_reference_image(self):
+        plan = _plan()
+        red = torch.zeros((1, 3, 3), dtype=torch.float32)
+        red[:, :, 0] = 1.0
+        blue = torch.zeros((1, 3, 3), dtype=torch.float32)
+        blue[:, :, 2] = 1.0
+        depth = torch.ones((1, 3), dtype=torch.float32)
+        alpha = torch.ones((1, 3), dtype=torch.float32)
+        composed, evidence = _compose_depth_projected_layers(
+            [
+                {"rgb": red, "depth": depth, "alpha": alpha},
+                {"rgb": blue, "depth": depth, "alpha": alpha},
+            ],
+            plan["tiles"],
+            plan,
+            torch.eye(4),
+            torch.eye(3),
+        )
+        self.assertTrue(torch.allclose(composed[0, 0], red[0, 0]))
+        self.assertTrue(torch.allclose(composed[0, 2], blue[0, 2]))
+        self.assertTrue(torch.allclose(
+            composed[0, 1], torch.tensor([0.5, 0.0, 0.5])
+        ))
+        self.assertFalse(evidence["uses_reference_image"])
+        self.assertFalse(evidence["uses_heldout_evidence_for_weights"])
+        self.assertEqual(evidence["covered_pixels"], 3)
 
     def test_frozen_reference_requires_hashes_and_exact_source_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -704,6 +949,18 @@ class TileSceneTests(unittest.TestCase):
                 "ssim": 0.58,
                 "lpips_cc": 0.11,
             }
+            layered_absolute = {
+                **absolute,
+                "layer_composition": {
+                    "routing": "sealed_tileplan_validation_visibility_v1"
+                },
+            }
+            layered_seam_absolute = {
+                **seam_absolute,
+                "layer_composition": {
+                    "routing": "sealed_tileplan_validation_visibility_v1"
+                },
+            }
             seam_mask = np.ones((2, 2), dtype=bool)
 
             def export(_params, output, **_kwargs):
@@ -728,9 +985,28 @@ class TileSceneTests(unittest.TestCase):
                     return_value=(params, ownership),
                 ),
                 mock.patch(
+                    "rtk_splat.workflows.tile_scene._load_layer_params_with_core_audit",
+                    return_value=(
+                        {
+                            "tile-0000": params,
+                            "tile-0001": params,
+                        },
+                        ownership,
+                    ),
+                ) as layer_loader,
+                mock.patch(
                     "rtk_splat.workflows.tile_scene._evaluate_combined",
-                    side_effect=[absolute, seam_absolute],
+                    side_effect=[
+                        absolute,
+                        seam_absolute,
+                        absolute,
+                        seam_absolute,
+                    ],
                 ) as evaluation,
+                mock.patch(
+                    "rtk_splat.workflows.tile_scene._evaluate_depth_projected_layers",
+                    side_effect=[layered_absolute, layered_seam_absolute],
+                ) as layered_evaluation,
                 mock.patch(
                     "rtk_splat.workflows.tile_scene._build_seam_masks",
                     return_value=(
@@ -745,11 +1021,11 @@ class TileSceneTests(unittest.TestCase):
                             "frames": [],
                         },
                     ),
-                ),
+                ) as mask_builder,
                 mock.patch(
                     "rtk_splat.workflows.tile_scene.load_pose_artifact",
                     return_value=(viewmats, np.zeros((2, 3))),
-                ),
+                ) as pose_loader,
                 mock.patch(
                     "rtk_splat.backends.gsplat.export_splat_tensors",
                     side_effect=export,
@@ -770,8 +1046,76 @@ class TileSceneTests(unittest.TestCase):
                     maximum_combined_gaussians=2,
                     device="cpu",
                 )
-            self.assertEqual(evaluation.call_count, 2)
-            self.assertEqual(plan_verifier.call_count, 2)
+                plan["provisional"] = True
+                plan["metric_georeferencing_claim_eligible"] = False
+                diagnostic_georeferencing = {
+                    **georeferencing,
+                    "artifact_class": "diagnostic_render_only",
+                    "georeferencing_status": "FAILED",
+                    "metric_georeferencing_claim_eligible": False,
+                }
+                _write_json(plan_root / "provenance.json", {
+                    "georeferencing": diagnostic_georeferencing
+                })
+                diagnostic_result = publish_production_tiled_scene(
+                    segment=segment,
+                    cfg=cfg,
+                    tile_plan_root=plan_root,
+                    pose_root=root / "pose",
+                    tile_runs=runs,
+                    output_root=root / "output",
+                    scene_name="diagnostic-scene-v1",
+                    maximum_combined_gaussians=2,
+                    device="cpu",
+                    allow_nonproduction_georeferencing_for_diagnostic=True,
+                )
+                layered_result = publish_production_tiled_scene(
+                    segment=segment,
+                    cfg=cfg,
+                    tile_plan_root=plan_root,
+                    pose_root=root / "pose",
+                    tile_runs=runs,
+                    output_root=root / "output",
+                    scene_name="diagnostic-layered-scene-v1",
+                    maximum_combined_gaussians=2,
+                    device="cpu",
+                    allow_nonproduction_georeferencing_for_diagnostic=True,
+                    assembly_policy="depth_projected_context_composite_v1",
+                )
+            self.assertEqual(evaluation.call_count, 4)
+            self.assertEqual(layered_evaluation.call_count, 2)
+            self.assertEqual(layer_loader.call_count, 1)
+            self.assertEqual(plan_verifier.call_count, 6)
+            self.assertFalse(
+                mask_builder.call_args_list[0].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(
+                mask_builder.call_args_list[1].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(
+                mask_builder.call_args_list[2].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertFalse(
+                pose_loader.call_args_list[0].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(
+                pose_loader.call_args_list[1].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
+            self.assertTrue(
+                pose_loader.call_args_list[2].kwargs[
+                    "allow_failed_georeferencing_for_render"
+                ]
+            )
             self.assertTrue(result["quality_passed"])
             self.assertFalse(result["provisional"])
             self.assertEqual(result["n_tiles"], 2)
@@ -779,6 +1123,43 @@ class TileSceneTests(unittest.TestCase):
             self.assertTrue((scene_root / "scene.ply").is_file())
             verified = verify_tiled_scene(scene_root)
             self.assertEqual(verified["publication_mode"], "production")
+            self.assertTrue(diagnostic_result["quality_passed"])
+            self.assertTrue(diagnostic_result["provisional"])
+            self.assertFalse(
+                diagnostic_result["metric_georeferencing_claim_eligible"]
+            )
+            self.assertTrue(
+                (
+                    Path(diagnostic_result["scene"])
+                    / "scene.DIAGNOSTIC_ONLY.ply"
+                ).is_file()
+            )
+            layered_root = Path(layered_result["scene"])
+            self.assertTrue((layered_root / "layers.json").is_file())
+            self.assertIsNone(layered_result["splat"])
+            self.assertEqual(
+                verify_tiled_scene(layered_root)["representation"],
+                "sealed_tile_layers",
+            )
+            layer_index = json.loads(
+                (layered_root / "layers.json").read_text(encoding="utf-8")
+            )
+            layer_index["layers"][0]["params_sha256"] = "0" * 64
+            _write_json(layered_root / "layers.json", layer_index)
+            layered_scene = json.loads(
+                (layered_root / "scene.json").read_text(encoding="utf-8")
+            )
+            layered_scene["layer_index_sha256"] = _sha(
+                layered_root / "layers.json"
+            )
+            layered_scene["layer_index_size_bytes"] = (
+                layered_root / "layers.json"
+            ).stat().st_size
+            _write_json(layered_root / "scene.json", layered_scene)
+            (layered_root / "manifest.json").unlink()
+            _write_json(layered_root / "manifest.json", _manifest(layered_root))
+            with self.assertRaisesRegex(ValueError, "layer index"):
+                verify_tiled_scene(layered_root)
             metrics = json.loads((scene_root / "metrics.json").read_text())
             self.assertEqual(
                 metrics["evaluation"]["comparison"],
