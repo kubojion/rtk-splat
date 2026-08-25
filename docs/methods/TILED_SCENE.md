@@ -1,18 +1,20 @@
 # Sealed visibility tile planning
 
 Status: TilePlan schema v3 plus tile-aware cloud construction, GS training,
-half-open core export, controlled scene publication, and seam evaluation are
-implemented and tested. The cached two-tile headland GPU validation completed
-on 2026-08-10 and passed every declared source, ownership, rendering, and seam
-check. A TilePlan remains an input artifact rather than a map; only completed,
-verified tile runs can publish a scene.
+half-open core export, layered scene publication, and seam evaluation are
+implemented and tested. The two-tile headland validation passed on 2026-08-10.
+The first complete 10,227-frame field then automatically planned and trained 32
+tiles and published a sealed diagnostic scene on 2026-08-25. A TilePlan remains
+an input artifact rather than a map; only completed, verified tile runs can
+publish a scene.
 
 ## Purpose
 
 A long field should not be trained as one unbounded Gaussian model. RTK-Splat
-first solves one metric global camera trajectory, then divides only the mapping
-work. Every tile keeps that same ENU coordinate frame and the same camera poses.
-There is no per-tile Sim(3), ICP, or scale correction.
+first seals one complete fixed-scale camera trajectory, either from one solve or
+an audited submap assembly, then divides only the mapping work. Every tile keeps
+that same ENU coordinate frame and the same camera poses. There is no per-tile
+Sim(3), ICP, or scale correction.
 
 Each tile has two different regions:
 
@@ -136,12 +138,14 @@ infeasible full-field monolith exists. Non-production poses are rejected unless
 `--diagnostic-scene` is explicit; that path can publish only a provisional
 `DIAGNOSTIC_ONLY` artifact.
 
-Both modes concatenate exact core-owned tensors on CPU and render each source
-validation view once with conservative frustum-only culling and no arbitrary
-far plane. Quality is measured over all held-out frames and over pixels whose
-metric depth lies within 1 m of an internal core boundary. A controlled gate
-failure still publishes an explicitly named `scene.QUALITY_FAILED.ply` and
-sealed evidence; it never silently becomes an accepted scene.
+The hard-union mode concatenates exact core-owned tensors on CPU. The layered
+mode instead keeps each complete context model sealed and routes a bounded set
+of layers per view, blending rendered colour with depth, alpha confidence, and
+core/context geometry. Each source validation view is evaluated once, with no
+held-out residual used to select layers or weights. Quality is measured over
+all held-out frames and over pixels whose metric depth lies within 1 m of an
+internal core boundary. A controlled gate failure is explicitly labelled and
+sealed; it never silently becomes an accepted scene.
 
 ## Cached headland validation
 
@@ -198,34 +202,28 @@ correctly provisional even though its older RTK audit passed. It is suitable
 for comparing rendering and seams, not for creating a new metric-accuracy
 claim.
 
-## Full 77-minute field analysis
+## Completed 77-minute field result
 
-The recording contains about 4,640 s and 69,088 raw stereo frames. The executed
-route contains six long traversals plus substantial entry, exit, pause, and
-headland motion. Roughly one quarter of the duration is outside the six
-straight intervals. Recording-order traversals alternate direction, but
-physical neighbouring rows include both same- and opposite-heading cases;
-therefore neither “six row tiles” nor “no cross-row visibility” is justified
-without the actual reconstructed support graph.
+The recording contains about 4,640 s and 69,088 raw stereo frames. Stride-five
+ingest retained 10,227 pairs. The planner used reconstructed metric support and
+visibility—not row names, time windows, or a forced count—and produced 32
+tiles. All 32 trained sequentially at the frozen 65k-iteration,
+2.5-million-Gaussian cap on the RTX 4090.
 
-The completed stride-five ingest retained 10,227 frame pairs; the inherited
-7:1 split should yield about 8,949 training views. With the current 1,300-frame
-presentation budget, that implies a lower bound near seven tiles before halo
-duplication and likely roughly 8--12 after visibility context. The sealed plan,
-not this estimate, will be authoritative.
+The sealed layered scene evaluates 1,278 unique held-out frames and 1,265 seam
+frames. Its whole-scene masked/corrected masked PSNR is 21.1594/22.1405 dB,
+SSIM is 0.5085, and corrected LPIPS is 0.4149. Seam-band masked/corrected
+masked PSNR is 21.8609/22.9246 dB, SSIM is 0.5079, and corrected LPIPS is
+0.1619. Every structural, source-binding, ownership, tile-completeness, visual
+overlap, scale, baseline, and seam check passed.
 
-The complete portable contract-v2 depth segment now exists, but no global pose
-artifact does. The server workflow must solve and seal one global pose artifact
-and then run `tiles-plan` without a forced count. The resulting plan—not
-waypoint names—will determine whether headlands become their own cores or
-context for neighbouring tiles.
-
-The successful experiment validates the downstream GS tiling path only. The
-full pose stage is still one global visual solve and has not been exercised at
-10,227 stereo pairs/20,454 images. That frontend, matcher, and mapper
-memory/runtime is now the largest scaling uncertainty. Arbitrary-tile
-production publication is implemented; the remaining prerequisite is to
-create and verify the full pose/TilePlan and tile runs.
+The result is deliberately diagnostic. Its complete synchronized trajectory
+failed independent production georeferencing gates: 366.483 mm held-out RTK
+median versus 120 mm allowed, 279.334 mm inlier p95 versus 200 mm allowed, and
+41.09% robust inliers versus 80% required. The scene is therefore labelled
+`diagnostic_render_only` and may not support survey or metric-georeferencing
+claims. Exact evidence and the distant-ground/horizon finding are in
+`../milestones/FULL_FIELD_DIAGNOSTIC_V1.md`.
 
 ## Cached overnight reproduction
 
@@ -253,30 +251,22 @@ The sealed output is
 The current cached pose is `legacy_unassessed`, so this local A/B remains
 provisional and cannot create a new metric-georeferencing claim.
 
-Before the multi-day server build:
+## Portable viewer export
 
-1. copy and checksum the portable depth segment on server-local storage and
-   inventory CPU RAM,
-   NVMe, CUDA, gsplat, and COLMAP;
-2. build the full global pose and let the planner choose tile
-   count automatically; and
-3. complete one 2.5-million-Gaussian server tile as a resource and quality
-   smoke test before launching the remainder.
+The layered artifact remains authoritative because standard Gaussian PLY has
+no representation for its per-view context routing and blend. For inspection,
+`rtk-splat-scene-export` verifies the sealed scene and every tile binding, then
+streams each opacity-pruned, uniquely core-owned tile PLY into one immutable
+hard-union bundle:
 
-The production launcher accepts restarting only the interrupted tile under a
-new immutable attempt. Exact within-optimizer resume remains deliberately
-unclaimed because the CUDA/MCMC path is not guaranteed bitwise deterministic
-across process restarts.
+```bash
+rtk-splat-scene-export \
+  --source-scene /path/to/sealed/layered-scene \
+  --destination /new/export-bundle
+```
 
-The discovered RTX 4090 and 19 TiB data volume are sufficient for sequential
-tile training at the validated per-tile cap. They do not by themselves prove
-that the upstream
-global pose solve or final arbitrary-tile evaluator scales. Reserve 0.5--1 TB
-of fast working storage. The guarded first run defaults to a 120 GiB physical-
-RAM gate (a 128 GB-class host) because a linear extrapolation of the accepted
-Global Mapper memory is already near 91 GiB before OS/database headroom. A
-provisional end-to-end estimate is 2--4 days, not a single overnight: roughly
-8--12 tiles for the measured 10,227-frame segment, using the conservative
-earlier 1.5--3.5-hour 3090 range until the 4090 smoke measures the real cost,
-plus an uncertain 10--30 hours
-for frontend, matching, pose solve, and final publication.
+The command refuses overwrite, rejects schema or hash disagreement, publishes
+atomically, and preserves the source georeferencing status. A diagnostic source
+therefore produces `scene.DIAGNOSTIC_ONLY.ply`. Because this hard union omits
+context blending, it can show harder seams or worse unsupported distant regions
+than the authoritative evaluation renders.

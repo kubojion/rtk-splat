@@ -13,7 +13,6 @@ readonly SOURCE_SEGMENT="/home/jion_kubo/agromap4d_work/rosario_v2_sequence5_ppk
 readonly SOURCE_POSE="/home/jion_kubo/agromap4d_work/rosario_v2_sequence5_ppk_140_250_overnight_v1/pose_artifacts/rosario-seq5-ppk-140-250-global-v1"
 readonly RGB_OBSERVATIONS="/home/jion_kubo/agromap4d_work/rosario_v2_sequence5_ppk_140_250_v1/segment.rgb_observations"
 readonly DEFAULT_WORKDIR="/home/jion_kubo/agromap4d_work/rosario_v2_sequence5_ppk_140_250_rgbd_diagnostic_v1"
-readonly DEFAULT_PYTHON="/home/jion_kubo/miniconda3/envs/rtk-splat/bin/python"
 
 readonly POSE_NAME="rosario-seq5-ppk-140-250-rgbd-transfer-diagnostic-v1"
 readonly RUN_NAME="rosario-seq5-ppk-140-250-rgb-gs-diagnostic-v1"
@@ -34,7 +33,13 @@ readonly EXPECTED_ITERATIONS=44300
 
 ACTION=plan
 WORKDIR="$DEFAULT_WORKDIR"
-PYTHON="$DEFAULT_PYTHON"
+if [[ -n "${RTK_SPLAT_PYTHON:-}" ]]; then
+    PYTHON="$RTK_SPLAT_PYTHON"
+elif [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
+    PYTHON="$CONDA_PREFIX/bin/python"
+else
+    PYTHON="$(command -v python3 || true)"
+fi
 ACKNOWLEDGED=0
 RESUME=0
 
@@ -107,6 +112,9 @@ while (($#)); do
 done
 
 [[ "$ACTION" == plan ]] && { print_plan; exit 0; }
+if [[ "$ACTION" == run ]] && ((ACKNOWLEDGED == 0)); then
+    die "run requires --acknowledge-diagnostic-render-only before writing anything"
+fi
 [[ -x "$PYTHON" ]] || die "Python environment is unavailable: $PYTHON"
 PYTHON="$(readlink -f "$PYTHON")"
 [[ "$WORKDIR" == /* ]] || WORKDIR="$(pwd -P)/$WORKDIR"
@@ -255,8 +263,6 @@ preflight() {
 
 if [[ "$ACTION" == preflight ]]; then preflight; exit 0; fi
 [[ "$ACTION" == run ]] || die "unsupported action: $ACTION"
-((ACKNOWLEDGED)) || die \
-    "run requires --acknowledge-diagnostic-render-only before writing anything"
 preflight
 
 if [[ -e "$WORKDIR" ]]; then

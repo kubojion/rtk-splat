@@ -1,10 +1,17 @@
 # Full-field 24 GB RTX server run
 
-Last updated: 2026-08-11
+Last updated: 2026-08-25.
 
-This is the operational checklist for the 77-minute field build. It is not a
-generic API specification. The stable method remains the `rtk-splat` CLI; the
-two launchers below are guarded reproductions for this recording and server.
+> **Completed historical execution record.** Do not rerun these commands
+> against the existing server workdir or immutable artifacts. A reproduction
+> must use a fresh workdir and fresh artifact names. The generic interface is
+> the `rtk-splat` CLI; the launchers below remain recording- and
+> machine-specific provenance.
+
+The workflow completed a full 32-tile diagnostic field scene. It did not
+publish a production-georeferenced scene because independent absolute-RTK gates
+failed. Current metrics and artifact paths are in
+[`docs/milestones/FULL_FIELD_DIAGNOSTIC_V1.md`](docs/milestones/FULL_FIELD_DIAGNOSTIC_V1.md).
 
 ## Current state
 
@@ -33,16 +40,17 @@ two launchers below are guarded reproductions for this recording and server.
 - [x] The server workflow restarts only an interrupted tile under a new
   immutable attempt name and preserves completed tiles.
 - [x] Run local ingest/depth and publish the portable segment.
-- [ ] Commit and push the clean tested server-preparation snapshot. The
-  repository is public, but remote `main` is currently behind the local tree.
-- [ ] Finish transferring and verify the portable segment on the server.
+- [x] Merge the tested full-field implementation through GitHub PR #1.
+- [x] Transfer and verify the portable segment on the server.
 - [x] Inventory the server: RTX 4090 24 GB, driver 580.95.05, 125 GiB
   reported RAM, 24 CPU threads, and about 17 TiB free below `/data`.
-- [ ] Install and verify the two isolated project-local Conda environments.
-- [ ] Pass the complete server preflight and run the full pose/TilePlan
-  preparation stage.
-- [ ] Complete one RTX 4090 tile smoke test, inspect it, then run the remaining
-  tiles and publish the production scene.
+- [x] Create and verify the two isolated project-local Conda environments.
+- [x] Pass server preflight, build the complete diagnostic pose, and publish
+  the automatic 32-tile TilePlan.
+- [x] Complete every RTX 4090 tile and publish the sealed layered diagnostic
+  scene.
+- [ ] Publish a production scene. This remains blocked by the unchanged
+  absolute-RTK gates; rendering success does not override that failure.
 
 Exact optimizer-level resume is deliberately not claimed. The CUDA gsplat
 MCMC path is not bitwise deterministic across process restarts and the current
@@ -164,8 +172,10 @@ git rev-parse HEAD
 git status --short       # must be empty
 ```
 
-Record and use the exact tested commit. Do not run a production stage from a
-dirty checkout; the launcher enforces this.
+Record and use the exact tested commit. The completed feature was merged to
+`main` as `a8473ae8b46994a214631b1d4116670cca902ecd`; later maintenance commits
+must be independently tested and recorded. Do not run a production stage from
+a dirty checkout; the launcher enforces this.
 
 Before cloning, verify that the remote actually contains the local full-field
 commit. “Repository is public” and “all commits were pushed” are separate
@@ -177,8 +187,7 @@ git rev-parse HEAD
 git ls-remote --heads origin main
 ```
 
-The last two hashes must agree after the server-preparation changes are
-committed and pushed.
+The last two hashes must agree for a fresh reproduction.
 
 ## 3. Install the server environments
 
@@ -333,12 +342,10 @@ and a Global Mapper process restart repeats that solve; if feature extraction
 is interrupted, preserve the work directory and start a new versioned
 workdir. The launcher never silently deletes partial evidence.
 
-`prepare` is the main uncertainty: the full all-frame visual solve is exactly
-20,454 images (10,227 stereo frames) and has not previously been measured. It
-must register all required frames and pass visual/fixed-scale RTK gates before
-tiling starts.
-The planner chooses tile count from measured depth visibility and workload; it
-does not assume six rows or a fixed interval.
+In the completed run, the reusable geodetic-submap route replaced an infeasible
+single all-frame mapper. It produced a complete 10,227-frame fixed-scale
+diagnostic trajectory. The planner then chose 32 tiles from measured depth
+visibility and workload; it did not assume six rows or a fixed interval.
 
 The first launcher intentionally stops if fixed-scale georeferencing fails; it
 does not silently turn a failed metric map into a production result. The
@@ -366,15 +373,10 @@ tail -f /data/jkobo/rtk-splat/logs/field1_full77_v1_prepare.log
 nvidia-smi
 ```
 
-Expected server time is deliberately broad until the smoke completes:
-
-- full frontend/matching/Global pose: roughly 6--24+ hours;
-- automatic plan: minutes to perhaps an hour, dominated by depth rehash/support;
-- roughly 8--12 tiles before measured halo duplication (the final count is
-  data-derived);
-- each 2.5M/65k tile: provisionally no more than the old 3090 estimate of
-  1.5--3 hours; measure the actual 4090 result in `smoke`; and
-- total: approximately 2--4 days if the Global solve passes.
+The original 2--4 day estimate and 8--12 tile estimate were intentionally
+conservative but did not predict the final support graph: the measured plan had
+32 tiles. Treat the completed receipts and logs—not those pre-run estimates—as
+the resource record for future scheduling.
 
 Reserve 0.5--1 TB of fast working storage. The first profile intentionally
 keeps the accepted 2.5M cap. After the smoke, a separate 4M-cap A/B may test

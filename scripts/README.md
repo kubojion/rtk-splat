@@ -26,8 +26,19 @@ segment preparation for the full recording. It runs no COLMAP or GS stage.
 `runs/field1_0703_full_server.sh` starts from that verified portable segment,
 solves the complete pose/automatic TilePlan, then trains an arbitrary number
 of tiles with immutable per-tile retry attempts and production scene
-publication. These remain recording/site launchers; the generic implementation
-lives in the package CLI. See [`SERVER_RUN.md`](../SERVER_RUN.md).
+publication. The completed server run used a separately labelled diagnostic
+continuation after geodetic rejection, automatically planned 32 tiles, trained
+all of them, and published the full layered diagnostic scene. These remain
+recording/site launchers; the generic implementation lives in the package CLI.
+Do not rerun them against the existing immutable workdir. See
+[`SERVER_RUN.md`](../SERVER_RUN.md) and the
+[milestone record](../docs/milestones/FULL_FIELD_DIAGNOSTIC_V1.md).
+
+`rtk-splat-scene-export` is the generic portable-viewer path for a verified
+layered scene. It streams the already opacity-pruned, uniquely core-owned tile
+PLY bodies into one atomically published, hash-bound PLY bundle. It preserves a
+diagnostic source label and does not claim to reproduce per-view layered
+blending.
 
 `tools/bootstrap_server_env.sh` creates and verifies the pinned Python/gsplat
 and COLMAP Conda prefixes entirely inside a private `/data/.../rtk-splat`
@@ -36,10 +47,9 @@ separate `tools/server_preflight.py` then validates the real GPU/CUDA/COLMAP
 paths and portable segment before a production launcher may write artifacts.
 
 Personal absolute paths, delayed-start wrappers, power/sleep scheduling, and
-one-off experiment names should not ship as the main release workflow. They
-remain in place for now because the current CitrusFarm/Rosario work is
-uncommitted and must be frozen before files are moved or retired. That release
-cleanup is tracked in `../TODO.md`.
+one-off experiment names must not become the public workflow. Historical
+launchers may retain exact paths as reproduction evidence; reusable Python
+package code may not.
 
 New generic behavior belongs in `src/rtk_splat/` with tests. A script may call
 that behavior, but must not become the only implementation of a mapping stage.

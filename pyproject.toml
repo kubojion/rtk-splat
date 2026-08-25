@@ -30,6 +30,7 @@ test = ["pytest>=7.4"]
 [project.scripts]
 rtk-splat = "rtk_splat.workflows.cli:main"
 rtk-splat-export = "rtk_splat.workflows.export_splat:main"
+rtk-splat-scene-export = "rtk_splat.workflows.export_layered_scene:main"
 rtk-splat-verify = "rtk_splat.diagnostics.verify_golden:main"
 
 [tool.setuptools]

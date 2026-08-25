@@ -71,9 +71,7 @@ The Citrus and Rosario work is retained as transfer evidence, not as a new
 production default. Citrus exposed a fixed-scale georeferencing failure and a
 monolithic GS capacity failure. Rosario produced an accepted IR/depth pose and
 GS, while its colour arms remain diagnostic because rolling-shutter RGB timing
-and RGB-to-stereo registration are not independently validated. Current work is
-therefore focused on bounded, georeferenced full-field tiles and their seam
-validation.
+and RGB-to-stereo registration are not independently validated.
 
 The first bounded-map component is now implemented: a sealed, data-driven
 TilePlan derives spatial cores and visibility context from metric depth and one
@@ -91,13 +89,32 @@ two independent 65k/2.5M-cap optimizations. The cached pose is
 `legacy_unassessed`, so the scene is correctly provisional and creates no new
 metric-georeferencing claim. See [TILED_SCENE.md](docs/methods/TILED_SCENE.md).
 
-The 77-minute deployment path is prepared separately: ROS2 ingest spools
-selected payloads to bounded disk rather than retaining the recording in RAM;
-`segment-materialize` creates a self-contained checksum-sealed transfer
-segment; and production scene publication consumes any number of verified
-tiles without requiring a full-scene monolithic control. The local/server
-order, environment pins, transfer verification, and remaining Global-Mapper
-scaling gate are in [SERVER_RUN.md](SERVER_RUN.md).
+The 77-minute field path has now completed as a diagnostic milestone. It
+processed 10,227 selected stereo frames, automatically planned and trained 32
+tiles, and published one sealed layered scene. Every structural, visual,
+ownership, fixed-scale/baseline, inventory, and seam check passed. The result
+is visually useful, but its synchronized trajectory failed unchanged
+independent absolute-RTK gates (366.483 mm held-out median versus 120 mm
+allowed), so it remains `diagnostic_render_only` and makes no production
+georeferencing claim. Current work separates the geodetic root-cause study
+from a frozen-model distant-ground/horizon rendering study. See the
+[full-field milestone](docs/milestones/FULL_FIELD_DIAGNOSTIC_V1.md) for exact
+metrics and [SERVER_RUN.md](SERVER_RUN.md) for the historical execution
+record.
+
+A sealed layered scene can be exported to one portable Gaussian PLY without
+loading all tile tensors into memory:
+
+```bash
+rtk-splat-scene-export \
+  --source-scene /path/to/sealed/layered-scene \
+  --destination /new/immutable/export-bundle
+```
+
+The PLY is the opacity-pruned, uniquely core-owned union for general 3DGS
+viewers. It cannot reproduce the authoritative renderer's per-view depth/alpha
+context blend, and it preserves the source scene's production or diagnostic
+label.
 
 ## Architecture
 
@@ -545,13 +562,15 @@ records remain repository data; they are not hidden inside the wheel.
 - The headland sequence has no independent survey-grade camera trajectory.
 - The modern all-frame frontend has reproduced the headland reference; adaptive
   keyframe density is implemented but has not completed a matched GS A/B.
-- Global Mapper is visual. The optional whole-model sidecar consumes RTK
-  position priors but failed its first real held-out A/B; custom bounded local
-  RTK factors and a submap graph are not implemented.
+- Global Mapper is visual. The generic geodetic-submap sidecar consumes sealed
+  raw-GNSS priors through the pinned pose-prior mapper, and the full submap
+  assembly is implemented. The first complete synchronized field trajectory
+  still fails independent absolute-RTK production gates.
 - Visibility-bounded full-field GS tiles, exact ENU ownership, arbitrary-tile
-  orchestration, and no-monolith production publication are implemented. The
-  77-minute global visual pose solve and final automatic plan remain unrun;
-  cross-session merging is not implemented.
+  orchestration, automatic planning, layered publication, and no-monolith
+  evaluation are implemented and have completed on all 10,227 selected field
+  frames. The 32-tile result is diagnostic because of geodetic failure; the
+  unsupported distant-ground/horizon compositor also needs improvement.
 - CitrusFarm has strong visual reconstructions, rejected full-window
   georeferencing controls, and a completed bounded diagnostic retrace; it has
   no accepted metric GS.

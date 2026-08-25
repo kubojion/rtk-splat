@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +54,20 @@ class RosarioRgbdLauncherTests(unittest.TestCase):
         self.assertIn("--allow-failed-georeferencing-for-render", contents)
         self.assertNotIn("frontend-", contents)
         self.assertNotIn("backend-solve", contents)
+        self.assertIn("RTK_SPLAT_PYTHON", contents)
+        self.assertIn("CONDA_PREFIX", contents)
+        self.assertNotIn(
+            "/home/jion_kubo/miniconda3/envs/rtk-splat/bin/python", contents
+        )
+
+    def test_explicit_python_override_is_portable(self):
+        result = subprocess.run(
+            ["bash", str(SCRIPT), "preflight", "--python", sys.executable],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Python environment is unavailable", result.stderr)
 
 
 if __name__ == "__main__":

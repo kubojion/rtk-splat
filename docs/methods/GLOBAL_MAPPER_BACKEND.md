@@ -228,6 +228,9 @@ Those reduced-density outcomes remain hypotheses until the real A/B completes.
 Global Mapper is an efficient backend, not the paper contribution by itself.
 The implementation establishes clean evidence boundaries and a fair way to
 measure mapper/keyframe choices. CitrusFarm and Rosario source support now
-exist; covariance-weighted RTK factors inside local BA, full-field submaps,
-scene-level seam validation, and production RGB timing refinement remain
+exist. Generic covariance/status-weighted raw-GNSS submaps, synchronized
+full-field assembly, and scene-level seam validation are now implemented around
+the pinned pose-prior mapper. The first complete field remains diagnostic
+because absolute RTK gates failed. Production RGB timing refinement and a
+proven calibration-only resolution of the field geodetic disagreement remain
 future method work.

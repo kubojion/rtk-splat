@@ -1,50 +1,41 @@
-# Codex handoff for the full-field server
+# Archived server-agent handoff
 
-Use this prompt after starting Codex from the clean server checkout. It keeps
-the agent inside RTK-Splat's private project tree and makes the first server
-actions read-only.
+Status: completed and archived 2026-08-25.
 
-```text
-Repository: /data/jkobo/rtk-splat/code/rtk-splat
-Private project root: /data/jkobo/rtk-splat
+This handoff originally bootstrapped the first 77-minute server run. Do not
+paste its historical run commands into the completed project root: the source
+segment, pose attempts, TilePlan, tile runs, scene, and review exports are
+immutable evidence and refuse overwrite.
 
-Read SERVER_RUN.md, TODO.md, PROGRESS.md, and
-scripts/runs/field1_0703_full_server.sh completely before acting.
+The run reached these terminal states:
 
-Goal: validate and then execute the guarded 77-minute full-field pipeline on
-this server. Do not redesign the method, loosen a quality/georeferencing gate,
-or change the frozen stride-5 / 65k / 2.5M first-run settings.
+- all 10,227 selected stereo frames entered a complete diagnostic pose;
+- the data-driven planner produced 32 tiles;
+- all 32 tiles trained on the RTX 4090;
+- the layered scene passed structural, visual, ownership, inventory, and seam
+  checks; and
+- production georeferencing was rejected by unchanged independent RTK gates.
 
-Safety boundaries:
-- Work only inside /data/jkobo/rtk-splat and this Git checkout.
-- Do not use sudo, apt, Docker, system Python, system CUDA, or modify Conda
-  base, shell startup files, GPU drivers, services, or another user's files.
-- Do not kill a process unless it is positively identified as this run and I
-  explicitly authorize it. Check nvidia-smi for other users before GPU work.
-- Never edit the transferred segment or an already published artifact.
-- Preserve failed/partial attempts; use the launcher's immutable retry policy.
-- Keep the Git checkout clean. Stop if HEAD, configuration, environment,
-  segment hashes, or server inventory disagree with the sealed run identity.
-- Do not start a long stage merely because preflight passed. Report the
-  evidence and wait for my approval between preflight, prepare, smoke, and run.
-- Update TODO.md at the end of each completed request.
+Use `../../SERVER_RUN.md` only as a historical reproduction record. Current
+metrics, artifact paths, and limitations are in
+`../milestones/FULL_FIELD_DIAGNOSTIC_V1.md`. The provenance-linked retention
+set is in `ARTIFACT_RETENTION.md`.
 
-First, perform read-only checks only:
-1. git status --short and git rev-parse HEAD;
-2. inspect ownership and free space below /data/jkobo/rtk-splat;
-3. run scripts/tools/bootstrap_server_env.sh verify;
-4. activate /data/jkobo/rtk-splat/envs/rtk-splat-server and export
-   COLMAP_BIN=/data/jkobo/rtk-splat/envs/colmap-rtk/bin/colmap;
-5. inspect transfer progress/status, without changing it;
-6. after transfer completes, run field1_0703_full_server.sh preflight;
-7. report exact GPU, driver, RAM, mount, segment frame count/hash, package
-   versions, COLMAP CUDA smoke result, and any blocker. Do not start prepare.
+## Template for a genuinely fresh reproduction
 
-Long stages must use the checked launcher and an external nohup log under
-/data/jkobo/rtk-splat/logs. Codex/VS Code connectivity must not own the job.
-```
+Before any write, an operator or agent must:
 
-Codex should run in a terminal on the server—either directly over SSH or in a
-VS Code Remote-SSH integrated terminal—so it sees the server filesystem and
-GPU. The production job itself remains a launcher/nohup process independent of
-Codex and the editor session.
+1. use a new isolated Git worktree at an exact reviewed commit;
+2. use a new workdir and new artifact names;
+3. verify the immutable segment, environment, GPU, COLMAP, and free-space
+   receipts without modifying them;
+4. run the recording-specific launcher's preflight and report its evidence;
+5. start long stages independently of the chat/editor session;
+6. preserve every partial or failed attempt; and
+7. stop fail-closed on a production gate rather than relabelling diagnostic
+   output.
+
+Dataset paths belong only in the recording configuration or launcher. Generic
+changes belong under `src/rtk_splat/` with focused, tampering, and complete-suite
+tests. Do not weaken held-out RTK, fixed-scale, calibration, baseline, visual,
+track, ownership, or seam gates during reproduction.

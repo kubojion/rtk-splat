@@ -14,10 +14,17 @@ An ordered ROS 1 CitrusFarm adapter, robot/sequence profiles, and a staged
 543--735 s reproduction launcher are also implemented. The full window has
 completed ingest, SGBM, sealed frontend, and a 2,990-image visual model. A
 separately named position-prior refinement sidecar is implemented and was run
-with 897 calibration priors and 598 priors absent from its factors. It improved but failed
-the RTK gates, so no pose or GS artifact was published.
-Phase 2 was deliberately skipped; custom RTK-factor submaps and
-rendering-quality changes remain outside the current implementation.
+with 897 calibration priors and 598 priors absent from its factors. It improved
+but failed the RTK gates, so no pose or GS artifact was published. Phase 2 was
+deliberately skipped.
+
+A generic sealed geodetic-submap sidecar now materializes
+raw-GNSS-filtered private databases and invokes the pinned COLMAP pose-prior
+mapper without changing the historical refinement implementation. It enabled
+one complete 10,227-frame diagnostic pose, automatic 32-tile plan, and layered
+full-field render. The render is a scaling milestone, but the synchronized pose
+failed independent RTK production gates. See
+`../milestones/FULL_FIELD_DIAGNOSTIC_V1.md`.
 
 ## Artifact graph
 
@@ -31,12 +38,12 @@ immutable contract-v2 segment
 sealed mapper-neutral frontend
   images + rig + features + priors + verified pairs
         |
-        +-------------------------+
-        |                         |
-        v                         v
-private Global snapshot     private incremental snapshot
-        |                         |
-        +-----------+-------------+
+        +----------------------+------------------------+
+        |                      |                        |
+        v                      v                        v
+private Global snapshot  private incremental    sealed geodetic submaps
+        |                 snapshot               + synchronized assembly
+        +----------------------+------------------------+
                     v
        optional RTK position-refinement sidecar
           calibration priors only; heldouts removed
@@ -44,8 +51,16 @@ private Global snapshot     private incremental snapshot
                     v
           named metric pose artifact
                     |
-                    v
-        pose-matched cloud -> GS run
+           +---------+---------+
+           |                   |
+           v                   v
+  pose-matched cloud     sealed visibility TilePlan
+           |                   |
+           v                   v
+       GS run          tile clouds -> tile GS runs
+                               |
+                               v
+                    layered scene + seam evaluation
 ```
 
 Each expensive or scientifically meaningful boundary is a named artifact.
@@ -313,6 +328,8 @@ backend-export
 tiles-plan
 cloud
 train
+seam-probe
+scene-publish
 ```
 
 Every command requires `--config`. Artifact names, expected frame counts,
@@ -320,11 +337,12 @@ frontend profile, keyframe preset, backend, and run name can be overridden
 explicitly. There is no `all` command and no normal training path silently
 launches COLMAP, calibration, or an experimental sidecar.
 
-`tiles-plan` is the implemented boundary between one global pose solution and
-future bounded GS training. It content-seals the segment, images, depth, pose,
-measured visibility, disjoint ENU cores, and overlapping camera context. It
-does not yet make `cloud` or `train` tile-aware and does not publish a merged
-scene. See [TILED_SCENE.md](../methods/TILED_SCENE.md).
+`tiles-plan` is the implemented boundary between one complete pose solution and
+bounded GS training. It content-seals the segment, images, depth, pose, measured
+visibility, disjoint ENU cores, and overlapping camera context. `cloud` and
+`train` consume one sealed tile execution; `scene-publish` verifies all tile
+runs, preserves diagnostic/production georeferencing status, and evaluates the
+whole scene and seams. See [TILED_SCENE.md](../methods/TILED_SCENE.md).
 
 `scripts/runs/citrusfarm_05_13d_uturn.sh` is a reproduction launcher, not a
 second workflow API. It invokes the explicit commands above in order, requires

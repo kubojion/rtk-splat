@@ -25,6 +25,11 @@ These files record measured evidence; they are not an active task list. Use
   PSNR by 0.305/0.380 dB. It is accepted rendering/seam evidence but remains
   provisional and metric-claim ineligible because its historical source pose
   is `legacy_unassessed` under the current evidence schema.
+- `../milestones/FULL_FIELD_DIAGNOSTIC_V1.md`: completed 10,227-frame,
+  automatically planned 32-tile field result. The bounded layered renderer and
+  seams pass, while unchanged independent RTK gates reject production
+  georeferencing. It is accepted as a diagnostic rendering/scaling milestone,
+  not as a metric map.
 
 ## Transfer and diagnostic evidence
 
